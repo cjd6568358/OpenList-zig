@@ -5,7 +5,7 @@ on:
     types: [ published ]
 
 jobs:
-  release_arm:
+  release_linux_musl_arm:
     strategy:
       matrix:
         platform: [ ubuntu-latest ]
