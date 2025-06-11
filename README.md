@@ -39,6 +39,20 @@
 
 ---
 
+> [!IMPORTANT]
+>
+> 本 Fork 尚未稳定, 大量外部链接指向的内容尚未得到审计, 存在投毒风险, 含相关文档网站等. 切勿盲目信任!
+>
+> This fork is not yet stable. A large number of external links point to unaudited content, posing a supply chain attack risk, including related documentation websites, etc. Do not trust!
+>
+> 目前仅移除了确认非原作者控制的相关链接 (如 `alistgo.com`)
+>
+> Currently, only links confirmed to be outside the original author's control (such as `alistgo.com`) have been removed.
+>
+> 请您为确认本 Fork 新名字投票: https://github.com/AlistTeam/alist/issues/4
+>
+> Please vote to determine the name: https://github.com/AlistTeam/alist/issues/4
+
 English | [中文](./README_cn.md) | [日本語](./README_ja.md) | [Contributing](./CONTRIBUTING.md) | [CODE_OF_CONDUCT](./CODE_OF_CONDUCT.md)
 
 ## Features
@@ -99,11 +113,11 @@ English | [中文](./README_cn.md) | [日本語](./README_ja.md) | [Contributing
 
 ## Document
 
-<https://alistgo.com/>
+N/A
 
 ## Demo
 
-<https://al.nn.ci>
+N/A
 
 ## Discussion
 
