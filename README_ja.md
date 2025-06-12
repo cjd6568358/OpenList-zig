@@ -1,5 +1,5 @@
 <div align="center">
-  <img width="100px" alt="logo" src="https://cdn.jsdelivr.net/gh/alist-org/logo@main/logo.svg"/></a>
+  <img width="100px" alt="logo" src="https://raw.githubusercontent.com/OpenListTeam/Logo/main/OpenList.svg"/></a>
   <p><em>🗂複数のストレージをサポートするファイルリストプログラムで、Gin と Solidjs を使用し、alist プロジェクトをフォークして開発されました。</em></p>
 <div>
   <a href="https://goreportcard.com/report/github.com/OpenListTeam/OpenList/v3">

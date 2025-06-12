@@ -177,5 +177,5 @@ func (u *User) WebAuthnCredentials() []webauthn.Credential {
 }
 
 func (u *User) WebAuthnIcon() string {
-	return "https://jsd.nn.ci/gh/alist-org/logo@main/logo.svg"
+	return "https://cdn.statically.io/gh/OpenListTeam/Logo/main/OpenList.svg"
 }
