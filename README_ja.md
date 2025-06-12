@@ -112,7 +112,7 @@ N/A
 
 これらの素晴らしい人々に感謝します:
 
-[![Contributors](https://contrib.rocks/image?repo=AlistTeam/openlist)](https://github.com/OpenListTeam/OpenList/graphs/contributors)
+[![Contributors](https://contrib.rocks/image?repo=openlistteam/openlist)](https://github.com/OpenListTeam/OpenList/graphs/contributors)
 
 ## ライセンス
 

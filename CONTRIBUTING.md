@@ -103,5 +103,5 @@ The rest of the commit message is then used for this.
 
 ## Submit a pull request
 
-Push your branch to your `alist` fork and open a pull request against the
+Push your branch to your `openlist` fork and open a pull request against the
 `main` branch.
