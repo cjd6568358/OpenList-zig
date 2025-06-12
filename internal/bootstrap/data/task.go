@@ -1,8 +1,8 @@
 package data
 
 import (
-	"github.com/alist-org/alist/v3/internal/db"
-	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/OpenListTeam/OpenList/internal/db"
+	"github.com/OpenListTeam/OpenList/internal/model"
 )
 
 var initialTaskItems []model.TaskItem

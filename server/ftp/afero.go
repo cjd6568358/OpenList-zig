@@ -3,13 +3,14 @@ package ftp
 import (
 	"context"
 	"errors"
-	ftpserver "github.com/KirCute/ftpserverlib-pasvportmap"
-	"github.com/alist-org/alist/v3/internal/errs"
-	"github.com/alist-org/alist/v3/internal/fs"
-	"github.com/alist-org/alist/v3/internal/model"
-	"github.com/spf13/afero"
 	"os"
 	"time"
+
+	ftpserver "github.com/KirCute/ftpserverlib-pasvportmap"
+	"github.com/OpenListTeam/OpenList/internal/errs"
+	"github.com/OpenListTeam/OpenList/internal/fs"
+	"github.com/OpenListTeam/OpenList/internal/model"
+	"github.com/spf13/afero"
 )
 
 type AferoAdapter struct {

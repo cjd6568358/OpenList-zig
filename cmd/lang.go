@@ -11,12 +11,12 @@ import (
 	"reflect"
 	"strings"
 
-	_ "github.com/alist-org/alist/v3/drivers"
-	"github.com/alist-org/alist/v3/internal/bootstrap"
-	"github.com/alist-org/alist/v3/internal/bootstrap/data"
-	"github.com/alist-org/alist/v3/internal/conf"
-	"github.com/alist-org/alist/v3/internal/op"
-	"github.com/alist-org/alist/v3/pkg/utils"
+	_ "github.com/OpenListTeam/OpenList/drivers"
+	"github.com/OpenListTeam/OpenList/internal/bootstrap"
+	"github.com/OpenListTeam/OpenList/internal/bootstrap/data"
+	"github.com/OpenListTeam/OpenList/internal/conf"
+	"github.com/OpenListTeam/OpenList/internal/op"
+	"github.com/OpenListTeam/OpenList/pkg/utils"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
