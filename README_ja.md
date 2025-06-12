@@ -35,7 +35,7 @@
 > 
 > 本フォークはまだ安定していません。多数の外部リンクが未検証のコンテンツを指しており、ドキュメントサイトなどを含め、サプライチェーン攻撃のリスクがあります。信頼しないでください！
 > 
-> 現時点では、オリジナル作者の管理下にないことが確認されているリンク（例：`alistgo.com`）のみ削除されています。
+> 現時点では、オリジナル作者の管理下にないことが確認されているリンク（例：`alistgo.com`）のみ削除されています，本プロジェクトの具体的な移行進捗状況は、[OpenList 移行作業報告書](https://github.com/OpenListTeam/OpenList/issues/6)でご確認いただけます。
 
 [English](./README.md) | [中文](./README_cn.md) | 日本語 | [Contributing](./CONTRIBUTING.md) | [CODE_OF_CONDUCT](./CODE_OF_CONDUCT.md)
 

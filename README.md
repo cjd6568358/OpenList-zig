@@ -35,7 +35,7 @@
 >
 > This fork is not yet stable. A large number of external links point to unaudited content, posing a supply chain attack risk, including related documentation websites, etc. Do not trust!
 >
-> Currently, only links confirmed to be outside the original author's control (such as `alistgo.com`) have been removed.
+> Currently, only links confirmed to be outside the original author's control (such as `alistgo.com`) have been removed, The detailed migration progress of the project can be viewed in the [OpenList Migration Summary](https://github.com/OpenListTeam/OpenList/issues/6).
 
 English | [中文](./README_cn.md) | [日本語](./README_ja.md) | [Contributing](./CONTRIBUTING.md) | [CODE_OF_CONDUCT](./CODE_OF_CONDUCT.md)
 

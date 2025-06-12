@@ -34,6 +34,8 @@
 > 我们诚挚地感谢原作者 [xhofe/alist](https://github.com/xhofe/alist) 为原项目做出的重大贡献。
 >
 > 本 Fork 尚未稳定, 大量外部链接指向的内容尚未得到审计, 存在投毒风险, 含相关文档网站等. 切勿盲目信任!
+>
+> 当前仅移除了被确认超出原作者控制范围的外部链接（如`alistgo.com`），项目具体迁移进度可在[OpenList 迁移工作总结](https://github.com/OpenListTeam/OpenList/issues/6)中查看
 
 [English](./README.md) | 中文 | [日本語](./README_ja.md) | [Contributing](./CONTRIBUTING.md) | [CODE_OF_CONDUCT](./CODE_OF_CONDUCT.md)
 
