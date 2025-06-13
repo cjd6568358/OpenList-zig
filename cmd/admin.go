@@ -26,8 +26,8 @@ var AdminCmd = &cobra.Command{
 		} else {
 			utils.Log.Infof("Admin user's username: %s", admin.Username)
 			utils.Log.Infof("The password can only be output at the first startup, and then stored as a hash value, which cannot be reversed")
-			utils.Log.Infof("You can reset the password with a random string by running [alist admin random]")
-			utils.Log.Infof("You can also set a new password by running [alist admin set NEW_PASSWORD]")
+			utils.Log.Infof("You can reset the password with a random string by running [openlist admin random]")
+			utils.Log.Infof("You can also set a new password by running [openlist admin set NEW_PASSWORD]")
 		}
 	},
 }
