@@ -100,7 +100,7 @@ jobs:
           musl-target-format: $os-$musl-$arch
           out-dir: build
           output: openlist-$target$ext
-          musl-base-url: "https://github.com/OpenListTeam/musl-compilers/releases/download/2025-06-12/"
+          musl-base-url: "https://github.com/OpenListTeam/musl-compilers/releases/latest/download/"
           x-flags: |
             github.com/alist-org/alist/v3/internal/conf.BuiltAt=$built_at
             github.com/alist-org/alist/v3/internal/conf.GitAuthor=OpenList

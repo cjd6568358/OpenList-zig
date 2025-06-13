@@ -65,7 +65,7 @@ BuildDev() {
   rm -rf .git/
   mkdir -p "dist"
   muslflags="--extldflags '-static -fpic' $ldflags"
-  BASE="https://github.com/OpenListTeam/musl-compilers/releases/download/2025-06-12/"
+  BASE="https://github.com/OpenListTeam/musl-compilers/releases/latest/download/"
   FILES=(x86_64-linux-musl-cross aarch64-linux-musl-cross)
   for i in "${FILES[@]}"; do
     url="${BASE}${i}.tgz"
@@ -99,7 +99,7 @@ BuildDocker() {
 
 PrepareBuildDockerMusl() {
   mkdir -p build/musl-libs
-  BASE="https://github.com/OpenListTeam/musl-compilers/releases/download/2025-06-12/"
+  BASE="https://github.com/OpenListTeam/musl-compilers/releases/latest/download/"
   FILES=(x86_64-linux-musl-cross aarch64-linux-musl-cross i486-linux-musl-cross s390x-linux-musl-cross armv6-linux-musleabihf-cross armv7l-linux-musleabihf-cross riscv64-linux-musl-cross powerpc64le-linux-musl-cross)
   for i in "${FILES[@]}"; do
     url="${BASE}${i}.tgz"
@@ -164,7 +164,7 @@ BuildReleaseLinuxMusl() {
   rm -rf .git/
   mkdir -p "build"
   muslflags="--extldflags '-static -fpic' $ldflags"
-  BASE="https://github.com/OpenListTeam/musl-compilers/releases/download/2025-06-12/"
+  BASE="https://github.com/OpenListTeam/musl-compilers/releases/latest/download/"
   FILES=(x86_64-linux-musl-cross aarch64-linux-musl-cross mips-linux-musl-cross mips64-linux-musl-cross mips64el-linux-musl-cross mipsel-linux-musl-cross powerpc64le-linux-musl-cross s390x-linux-musl-cross)
   for i in "${FILES[@]}"; do
     url="${BASE}${i}.tgz"
@@ -190,7 +190,7 @@ BuildReleaseLinuxMuslArm() {
   rm -rf .git/
   mkdir -p "build"
   muslflags="--extldflags '-static -fpic' $ldflags"
-  BASE="https://github.com/OpenListTeam/musl-compilers/releases/download/2025-06-12/"
+  BASE="https://github.com/OpenListTeam/musl-compilers/releases/latest/download/"
 #  FILES=(arm-linux-musleabi-cross arm-linux-musleabihf-cross armeb-linux-musleabi-cross armeb-linux-musleabihf-cross armel-linux-musleabi-cross armel-linux-musleabihf-cross armv5l-linux-musleabi-cross armv5l-linux-musleabihf-cross armv6-linux-musleabi-cross armv6-linux-musleabihf-cross armv7l-linux-musleabihf-cross armv7m-linux-musleabi-cross armv7r-linux-musleabihf-cross)
   FILES=(arm-linux-musleabi-cross arm-linux-musleabihf-cross armel-linux-musleabi-cross armel-linux-musleabihf-cross armv5l-linux-musleabi-cross armv5l-linux-musleabihf-cross armv6-linux-musleabi-cross armv6-linux-musleabihf-cross armv7l-linux-musleabihf-cross armv7m-linux-musleabi-cross armv7r-linux-musleabihf-cross)
   for i in "${FILES[@]}"; do
