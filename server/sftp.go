@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/KirCute/sftpd-alist"
 	"github.com/OpenListTeam/OpenList/internal/conf"
 	"github.com/OpenListTeam/OpenList/internal/model"
 	"github.com/OpenListTeam/OpenList/internal/op"
@@ -13,6 +12,7 @@ import (
 	"github.com/OpenListTeam/OpenList/pkg/utils"
 	"github.com/OpenListTeam/OpenList/server/ftp"
 	"github.com/OpenListTeam/OpenList/server/sftp"
+	"github.com/OpenListTeam/sftpd-openlist"
 	"github.com/pkg/errors"
 	"golang.org/x/crypto/ssh"
 )
