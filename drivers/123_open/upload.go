@@ -82,6 +82,7 @@ func (d *Open123) Upload(ctx context.Context, file model.FileStreamer, createRes
 		retry.Attempts(3),
 		retry.Delay(time.Second),
 		retry.DelayType(retry.BackOffDelay))
+	threadG.SetLimit(3)
 
 	for partIndex := int64(0); partIndex < uploadNums; partIndex++ {
 		if utils.IsCanceled(uploadCtx) {
@@ -97,6 +98,7 @@ func (d *Open123) Upload(ctx context.Context, file model.FileStreamer, createRes
 		if err != nil {
 			return err
 		}
+		limitedReader = driver.NewLimitedUploadStream(ctx, limitedReader)
 
 		threadG.Go(func(ctx context.Context) error {
 			uploadPartUrl, err := d.url(createResp.Data.PreuploadID, partNumber)
