@@ -25,6 +25,8 @@ type KV[V any] map[string]V
 
 type Drivers KV[KV[interface{}]]
 
+var frontendPath string
+
 func firstUpper(s string) string {
 	if s == "" {
 		return ""
@@ -39,7 +41,7 @@ func convert(s string) string {
 }
 
 func writeFile(name string, data interface{}) {
-	f, err := os.Open(fmt.Sprintf("../OpenList-Frontend/src/lang/en/%s.json", name))
+	f, err := os.Open(fmt.Sprintf("%s/src/lang/en/%s.json", frontendPath, name))
 	if err != nil {
 		log.Errorf("failed to open %s.json: %+v", name, err)
 		return
@@ -138,6 +140,7 @@ var LangCmd = &cobra.Command{
 	Use:   "lang",
 	Short: "Generate language json file",
 	Run: func(cmd *cobra.Command, args []string) {
+		frontendPath, _ = cmd.Flags().GetString("frontend-path")
 		bootstrap.InitConfig()
 		err := os.MkdirAll("lang", 0777)
 		if err != nil {
@@ -150,6 +153,9 @@ var LangCmd = &cobra.Command{
 
 func init() {
 	RootCmd.AddCommand(LangCmd)
+
+	// Add frontend-path flag
+	LangCmd.Flags().String("frontend-path", "../OpenList-Frontend", "Path to the frontend project directory")
 
 	// Here you will define your flags and configuration settings.
 
