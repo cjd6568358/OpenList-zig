@@ -20,10 +20,38 @@ import (
 // do others that not defined in Driver interface
 
 func (d *AliyundriveOpen) _refreshToken() (string, string, error) {
-	url := API_URL + "/oauth/access_token"
-	if d.OauthTokenURL != "" && d.ClientID == "" {
-		url = d.OauthTokenURL
+	// 使用在线API刷新Token，无需ClientID和ClientSecret
+	if d.UseOnlineAPI && len(d.APIAddress) > 0 {
+		u := d.APIAddress
+		var resp struct {
+			RefreshToken string `json:"refresh_token"`
+			AccessToken  string `json:"access_token"`
+		}
+		_, err := base.RestyClient.R().
+			SetResult(&resp).
+			SetQueryParams(map[string]string{
+				"refresh_ui": d.RefreshToken,
+				"server_use": "true",
+				"driver_txt": "alicloud_qr",
+			}).
+			Get(u)
+		if err != nil {
+			return "", "", err
+		}
+		if resp.RefreshToken == "" || resp.AccessToken == "" {
+			return "", "", fmt.Errorf("empty token returned from official API")
+		}
+		d.AccessToken = resp.AccessToken
+		d.RefreshToken = resp.RefreshToken
+		op.MustSaveDriverStorage(d)
+		return "", "", nil
 	}
+	// 使用本地客户端的情况下检查是否为空
+	if d.ClientID == "" || d.ClientSecret == "" {
+		return "", "", fmt.Errorf("empty ClientID or ClientSecret")
+	}
+	// 走原有的刷新逻辑
+	url := API_URL + "/oauth/access_token"
 	//var resp base.TokenResp
 	var e ErrResp
 	res, err := base.RestyClient.R().

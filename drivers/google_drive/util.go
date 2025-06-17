@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"github.com/OpenListTeam/OpenList/internal/op"
 	"net/http"
 	"os"
 	"regexp"
@@ -37,6 +38,38 @@ type googleDriveServiceAccount struct {
 }
 
 func (d *GoogleDrive) refreshToken() error {
+	// 使用在线API刷新Token，无需ClientID和ClientSecret
+	if d.UseOnlineAPI && len(d.APIAddress) > 0 {
+		u := d.APIAddress
+		var resp struct {
+			RefreshToken string `json:"refresh_token"`
+			AccessToken  string `json:"access_token"`
+		}
+		_, err := base.RestyClient.R().
+			SetResult(&resp).
+			SetQueryParams(map[string]string{
+				"refresh_ui": d.RefreshToken,
+				"server_use": "true",
+				"driver_txt": "googleui_go",
+			}).
+			Get(u)
+		if err != nil {
+			return err
+		}
+		if resp.RefreshToken == "" || resp.AccessToken == "" {
+			return fmt.Errorf("empty token returned from official API")
+		}
+		d.AccessToken = resp.AccessToken
+		d.RefreshToken = resp.RefreshToken
+		op.MustSaveDriverStorage(d)
+		return nil
+	}
+	// 使用本地客户端的情况下检查是否为空
+	if d.ClientID == "" || d.ClientSecret == "" {
+		return fmt.Errorf("empty ClientID or ClientSecret")
+	}
+	// 走原有的刷新逻辑
+
 	// googleDriveServiceAccountFile gdsaFile
 	gdsaFile, gdsaFileErr := os.Stat(d.RefreshToken)
 	if gdsaFileErr == nil {
