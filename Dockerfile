@@ -17,7 +17,7 @@ WORKDIR /opt/openlist/
 
 RUN apk update && \
     apk upgrade --no-cache && \
-    apk add --no-cache bash ca-certificates su-exec tzdata; \
+    apk add --no-cache bash jq ca-certificates su-exec tzdata; \
     [ "$INSTALL_FFMPEG" = "true" ] && apk add --no-cache ffmpeg; \
     [ "$INSTALL_ARIA2" = "true" ] && apk add --no-cache curl aria2 && \
         mkdir -p /opt/aria2/.aria2 && \
