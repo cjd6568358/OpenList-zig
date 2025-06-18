@@ -1,7 +1,7 @@
-FROM docker.io/library/alpine:edge as builder
+FROM docker.io/library/alpine:edge AS builder
 LABEL stage=go-builder
 WORKDIR /app/
-RUN apk add --no-cache bash curl gcc git go musl-dev
+RUN apk add --no-cache bash curl jq gcc git go musl-dev
 COPY go.mod go.sum ./
 RUN go mod download
 COPY ./ ./
@@ -17,7 +17,7 @@ WORKDIR /opt/openlist/
 
 RUN apk update && \
     apk upgrade --no-cache && \
-    apk add --no-cache bash jq ca-certificates su-exec tzdata; \
+    apk add --no-cache bash ca-certificates su-exec tzdata; \
     [ "$INSTALL_FFMPEG" = "true" ] && apk add --no-cache ffmpeg; \
     [ "$INSTALL_ARIA2" = "true" ] && apk add --no-cache curl aria2 && \
         mkdir -p /opt/aria2/.aria2 && \
