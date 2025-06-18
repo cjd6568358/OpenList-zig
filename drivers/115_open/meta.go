@@ -14,8 +14,8 @@ type Addition struct {
 	LimitRate      float64 `json:"limit_rate" type:"float" default:"1" help:"limit all api request rate ([limit]r/1s)"`
 	UseOnlineAPI   bool    `json:"use_online_api" default:"true"`
 	APIAddress     string  `json:"api_url_address" default:"https://api.oplist.org/115cloud/renewapi"`
-	RefreshToken   string  `json:"refresh_token" required:"true"`
 	AccessToken    string  `json:"access_token" required:"true"`
+	RefreshToken   string  `json:"refresh_token" required:"true"`
 }
 
 var config = driver.Config{
