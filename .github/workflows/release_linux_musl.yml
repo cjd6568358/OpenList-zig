@@ -27,6 +27,8 @@ jobs:
       - name: Build
         run: |
           bash build.sh release linux_musl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload assets
         uses: softprops/action-gh-release@v2

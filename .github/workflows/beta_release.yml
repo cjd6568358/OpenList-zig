@@ -92,6 +92,8 @@ jobs:
 
       - name: Setup web
         run: bash build.sh dev web
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build
         uses: OpenListTeam/cgo-actions@v1.1.2
@@ -111,6 +113,8 @@ jobs:
       - name: Compress
         run: |
           bash build.sh zip ${{ matrix.hash }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # See above           
       - name: Upload assets to beta release
