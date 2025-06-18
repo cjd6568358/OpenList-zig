@@ -94,7 +94,7 @@ jobs:
         run: bash build.sh dev web
 
       - name: Build
-        uses: OpenListTeam/cgo-actions@v1.1.1
+        uses: OpenListTeam/cgo-actions@v1.1.2
         with:
           targets: ${{ matrix.target }}
           musl-target-format: $os-$musl-$arch
