@@ -245,15 +245,37 @@ BuildReleaseAndroid() {
 BuildReleaseFreeBSD() {
   rm -rf .git/
   mkdir -p "build/freebsd"
+  
+  # Get latest FreeBSD 14.x release version from GitHub
+  github_auth=""
+  if [ -n "$GITHUB_TOKEN" ]; then
+    github_auth="--header 'Authorization: Bearer $GITHUB_TOKEN'"
+  fi
+  
+  freebsd_version=$(curl -fsSL $github_auth "https://api.github.com/repos/freebsd/freebsd-src/tags" | \
+    jq -r '.[].name' | \
+    grep '^release/14\.' | \
+    sort -V | \
+    tail -1 | \
+    sed 's/release\///' | \
+    sed 's/\.0$//')
+  
+  if [ -z "$freebsd_version" ]; then
+    echo "Failed to get FreeBSD version, falling back to 14.3"
+    freebsd_version="14.3"
+  fi
+
+  echo "Using FreeBSD version: $freebsd_version"
+  
   OS_ARCHES=(amd64 arm64 i386)
   GO_ARCHES=(amd64 arm64 386)
-  CGO_ARGS=(x86_64-unknown-freebsd14.1 aarch64-unknown-freebsd14.1 i386-unknown-freebsd14.1)
+  CGO_ARGS=(x86_64-unknown-freebsd${freebsd_version} aarch64-unknown-freebsd${freebsd_version} i386-unknown-freebsd${freebsd_version})
   for i in "${!OS_ARCHES[@]}"; do
     os_arch=${OS_ARCHES[$i]}
     cgo_cc="clang --target=${CGO_ARGS[$i]} --sysroot=/opt/freebsd/${os_arch}"
     echo building for freebsd-${os_arch}
     sudo mkdir -p "/opt/freebsd/${os_arch}"
-    wget -q https://download.freebsd.org/releases/${os_arch}/14.1-RELEASE/base.txz
+    wget -q https://download.freebsd.org/releases/${os_arch}/${freebsd_version}-RELEASE/base.txz
     sudo tar -xf ./base.txz -C /opt/freebsd/${os_arch}
     rm base.txz
     export GOOS=freebsd
