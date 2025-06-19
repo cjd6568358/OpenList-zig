@@ -26,6 +26,7 @@ func (d *AliyundriveOpen) _refreshToken() (string, string, error) {
 		var resp struct {
 			RefreshToken string `json:"refresh_token"`
 			AccessToken  string `json:"access_token"`
+			ErrorMessage string `json:"text"`
 		}
 		_, err := base.RestyClient.R().
 			SetResult(&resp).
@@ -39,6 +40,9 @@ func (d *AliyundriveOpen) _refreshToken() (string, string, error) {
 			return "", "", err
 		}
 		if resp.RefreshToken == "" || resp.AccessToken == "" {
+			if resp.ErrorMessage != "" {
+				return "", "", fmt.Errorf("failed to refresh token: %s", resp.ErrorMessage)
+			}
 			return "", "", fmt.Errorf("empty token returned from official API")
 		}
 		d.AccessToken = resp.AccessToken
