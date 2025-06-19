@@ -120,17 +120,17 @@ func InitialSettings() []model.SettingItem {
 		{Key: conf.ProxyIgnoreHeaders, Value: "authorization,referer", Type: conf.TypeText, Group: model.PREVIEW, Flag: model.PRIVATE},
 		{Key: "external_previews", Value: `{}`, Type: conf.TypeText, Group: model.PREVIEW},
 		{Key: "iframe_previews", Value: `{
-			"doc,docx,xls,xlsx,ppt,pptx": {
-				"Microsoft":"https://view.officeapps.live.com/op/view.aspx?src=$e_url",
-				"Google":"https://docs.google.com/gview?url=$e_url&embedded=true"
-			},
-			"pdf": {
-				"PDF.js":https://mozilla.github.io/pdf.js/web/viewer.html?url=$e_url" 
-			},
-			// "epub": {
-			// 	"EPUB.js":"https://alist-org.github.io/static/epub.js/viewer.html?url=$e_url"
-			// }
-		}`, Type: conf.TypeText, Group: model.PREVIEW},
+	"doc,docx,xls,xlsx,ppt,pptx": {
+		"Microsoft":"https://view.officeapps.live.com/op/view.aspx?src=$e_url",
+		"Google":"https://docs.google.com/gview?url=$e_url&embedded=true"
+	},
+	"pdf": {
+		"PDF.js":"//res.oplist.org/pdf.js/web/viewer.html?url=$e_url"
+	},
+	"epub": {
+		"EPUB.js":"//res.oplist.org/epub.js/viewer.html?url=$e_url"
+	}
+}`, Type: conf.TypeText, Group: model.PREVIEW},
 		//		{Key: conf.OfficeViewers, Value: `{
 		//	"Microsoft":"https://view.officeapps.live.com/op/view.aspx?src=$url",
 		//	"Google":"https://docs.google.com/gview?url=$url&embedded=true",
