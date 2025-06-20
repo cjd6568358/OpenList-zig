@@ -51,6 +51,9 @@ func FsStream(c *gin.Context) {
 	}
 	dir, name := stdpath.Split(path)
 	sizeStr := c.GetHeader("Content-Length")
+	if sizeStr == "" {
+		sizeStr = "0"
+	}
 	size, err := strconv.ParseInt(sizeStr, 10, 64)
 	if err != nil {
 		common.ErrorResp(c, err, 400)
