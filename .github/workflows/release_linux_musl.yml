@@ -3,7 +3,7 @@ name: release_linux_musl
 on:
   release:
     types: [ published ]
-
+permissions: write-all
 jobs:
   release_linux_musl:
     strategy:

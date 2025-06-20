@@ -3,6 +3,8 @@ name: release_android
 on:
   release:
     types: [ published ]
+    
+permissions: write-all
 
 jobs:
   release_android:

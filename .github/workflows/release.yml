@@ -3,6 +3,7 @@ name: release
 on:
   release:
     types: [ published ]
+permissions: write-all
 
 jobs:
   release:
@@ -33,7 +34,7 @@ jobs:
       - name: Prerelease
         uses: irongut/EditRelease@v1.2.0
         with:
-          token: ${{ secrets.MY_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           id: ${{ github.event.release.id }}
           prerelease: true
 
