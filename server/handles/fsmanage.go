@@ -96,14 +96,24 @@ func FsMove(c *gin.Context) {
 			}
 		}
 	}
+	var addedTasks []task.TaskExtensionInfo
 	for i, name := range req.Names {
-		err := fs.Move(c, stdpath.Join(srcDir, name), dstDir, len(req.Names) > i+1)
+		t, err := fs.MoveWithTask(c, stdpath.Join(srcDir, name), dstDir, len(req.Names) > i+1)
+		if t != nil {
+			addedTasks = append(addedTasks, t)
+		}
 		if err != nil {
 			common.ErrorResp(c, err, 500)
 			return
 		}
 	}
-	common.SuccessResp(c)
+	if len(addedTasks) > 0 {
+		common.SuccessResp(c, gin.H{
+			"tasks": getTaskInfos(addedTasks),
+		})
+	} else {
+		common.SuccessResp(c)
+	}
 }
 
 func FsCopy(c *gin.Context) {

@@ -74,6 +74,14 @@ func Move(ctx context.Context, srcPath, dstDirPath string, lazyCache ...bool) er
 	return err
 }
 
+func MoveWithTask(ctx context.Context, srcPath, dstDirPath string, lazyCache ...bool) (task.TaskExtensionInfo, error) {
+	res, err := _move(ctx, srcPath, dstDirPath, lazyCache...)
+	if err != nil {
+		log.Errorf("failed move %s to %s: %+v", srcPath, dstDirPath, err)
+	}
+	return res, err
+}
+
 func Copy(ctx context.Context, srcObjPath, dstDirPath string, lazyCache ...bool) (task.TaskExtensionInfo, error) {
 	res, err := _copy(ctx, srcObjPath, dstDirPath, lazyCache...)
 	if err != nil {
