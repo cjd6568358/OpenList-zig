@@ -6,6 +6,8 @@ on:
   issues:
     types: [opened]
 
+permissions: write-all
+
 jobs:
   translate:
     runs-on: ubuntu-latest
