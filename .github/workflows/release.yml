@@ -77,7 +77,7 @@ jobs:
   #     - name: Checkout repo
   #       uses: actions/checkout@v4
   #       with:
-  #         repository: alist-org/desktop-release
+  #         repository: openlistteam/desktop-release
   #         ref: main
   #         persist-credentials: false
   #         fetch-depth: 0
@@ -86,7 +86,7 @@ jobs:
   #       run: |
   #         git config --local user.email "bot@nn.ci"
   #         git config --local user.name "IlaBot"
-  #         version=$(wget -qO- -t1 -T2 "https://api.github.com/repos/alist-org/alist/releases/latest" | grep "tag_name" | head -n 1 | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')
+  #         version=$(wget -qO- -t1 -T2 "https://api.github.com/repos/openlistteam/openlist/releases/latest" | grep "tag_name" | head -n 1 | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')
   #         git tag -a $version -m "release $version"
 
   #     - name: Push tags
@@ -94,4 +94,4 @@ jobs:
   #       with:
   #         github_token: ${{ secrets.MY_TOKEN }}
   #         branch: main
-  #         repository: alist-org/desktop-release
+  #         repository: openlistteam/desktop-release
