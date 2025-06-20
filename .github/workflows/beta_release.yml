@@ -46,7 +46,7 @@ jobs:
       - name: Upload assets to beta release
         uses: softprops/action-gh-release@v2
         with:
-          body: "See CHANGELOG.md"
+          body_path: CHANGELOG.md
           files: CHANGELOG.md
           prerelease: true
           tag_name: beta
