@@ -25,8 +25,10 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	streamPkg "github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils/random"
+	"github.com/avast/retry-go"
 	"github.com/go-resty/resty/v2"
 	jsoniter "github.com/json-iterator/go"
 	log "github.com/sirupsen/logrus"
@@ -39,7 +41,11 @@ const (
 
 // do others that not defined in Driver interface
 func (d *Yun139) isFamily() bool {
-	return d.Type == "family"
+	return d.Type == MetaFamily
+}
+
+func (d *Yun139) isGroup() bool {
+	return d.Type == MetaGroup
 }
 
 func encodeURIComponent(str string) string {
@@ -339,15 +345,18 @@ func (d *Yun139) familyGetFiles(catalogID string) ([]model.Obj, error) {
 			},
 			"sortDirection": 1,
 		})
+		// 传入 catalogID 是文件夹的ID，而不是完整路径
+		// 当传入catalogID为家庭云根目录时，直接留空
+		if catalogID == d.ProviderRoot {
+			data["catalogID"] = ""
+		}
 		var resp QueryContentListResp
 		_, err := d.post("/orchestration/familyCloud-rebuild/content/v1.2/queryContentList", data, &resp)
 		if err != nil {
 			return nil, err
 		}
+		// 返回的是完整的Path: root:/<UserRootID>/<CatalogID>/.../<CatalogID>
 		path := resp.Data.Path
-		if catalogID == d.RootFolderID {
-			d.RootPath = path
-		}
 		for _, catalog := range resp.Data.CloudCatalogList {
 			f := model.Object{
 				ID:       catalog.CatalogID,
@@ -403,9 +412,6 @@ func (d *Yun139) groupGetFiles(catalogID string) ([]model.Obj, error) {
 			return nil, err
 		}
 		path := resp.Data.GetGroupContentResult.ParentCatalogID
-		if catalogID == d.RootFolderID {
-			d.RootPath = path
-		}
 		for _, catalog := range resp.Data.GetGroupContentResult.CatalogList {
 			f := model.Object{
 				ID:       catalog.CatalogID,
@@ -491,8 +497,7 @@ func unicode(str string) string {
 	return textUnquoted
 }
 
-func (d *Yun139) personalRequest(pathname string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
-	url := d.getPersonalCloudHost() + pathname
+func (d *Yun139) newRequest(url string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
 	req := base.RestyClient.R()
 	randStr := random.String(16)
 	ts := time.Now().Format("2006-01-02 15:04:05")
@@ -554,7 +559,21 @@ func (d *Yun139) personalRequest(pathname string, method string, callback base.R
 }
 
 func (d *Yun139) personalPost(pathname string, data interface{}, resp interface{}) ([]byte, error) {
-	return d.personalRequest(pathname, http.MethodPost, func(req *resty.Request) {
+	return d.newRequest(d.getPersonalCloudHost()+pathname, http.MethodPost, func(req *resty.Request) {
+		req.SetBody(data)
+	}, resp)
+}
+
+func (d *Yun139) newPost(pathname string, data interface{}, resp interface{}) ([]byte, error) {
+	var url string
+	switch d.Type {
+	case MetaFamily, MetaGroup:
+		// this is on purpose
+		url = d.getGroupCloudHost() + pathname
+	default:
+		url = d.getPersonalCloudHost() + pathname
+	}
+	return d.newRequest(url, http.MethodPost, func(req *resty.Request) {
 		req.SetBody(data)
 	}, resp)
 }
@@ -681,7 +700,21 @@ func (d *Yun139) getPersonalCloudHost() string {
 	return d.PersonalCloudHost
 }
 
-func (d *Yun139) uploadPersonalParts(ctx context.Context, partInfos []PartInfo, uploadPartInfos []PersonalPartInfo, rateLimited *driver.RateLimitReader, p *driver.Progress) error {
+func (d *Yun139) getFamilyCloudHost() string {
+	if d.ref != nil {
+		return d.ref.getFamilyCloudHost()
+	}
+	return d.FamilyCloudHost
+}
+
+func (d *Yun139) getGroupCloudHost() string {
+	if d.ref != nil {
+		return d.ref.getGroupCloudHost()
+	}
+	return d.GroupCloudHost
+}
+
+func (d *Yun139) uploadPersonalParts(ctx context.Context, partInfos []PartInfo, uploadPartInfos []PersonalPartInfo, ss streamPkg.StreamSectionReader, p *driver.Progress) error {
 	// 确保数组以 PartNumber 从小到大排序
 	sort.Slice(uploadPartInfos, func(i, j int) bool {
 		return uploadPartInfos[i].PartNumber < uploadPartInfos[j].PartNumber
@@ -693,31 +726,51 @@ func (d *Yun139) uploadPersonalParts(ctx context.Context, partInfos []PartInfo, 
 			return fmt.Errorf("invalid PartNumber %d: index out of bounds (partInfos length: %d)", uploadPartInfo.PartNumber, len(partInfos))
 		}
 		partSize := partInfos[index].PartSize
+		offset := partInfos[index].ParallelHashCtx.PartOffset
 		log.Debugf("[139] uploading part %+v/%+v", index, len(partInfos))
-		limitReader := io.LimitReader(rateLimited, partSize)
-		r := io.TeeReader(limitReader, p)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadPartInfo.UploadUrl, r)
-		if err != nil {
-			return err
+
+		rd, getErr := ss.GetSectionReader(offset, partSize)
+		if getErr != nil {
+			return getErr
 		}
-		req.Header.Set("Content-Type", "application/octet-stream")
-		req.Header.Set("Content-Length", fmt.Sprint(partSize))
-		req.Header.Set("Origin", "https://yun.139.com")
-		req.Header.Set("Referer", "https://yun.139.com/")
-		req.ContentLength = partSize
-		err = func() error {
-			res, err := base.HttpClient.Do(req)
-			if err != nil {
-				return err
-			}
-			defer res.Body.Close()
-			log.Debugf("[139] uploaded: %+v", res)
-			if res.StatusCode != http.StatusOK {
-				body, _ := io.ReadAll(res.Body)
-				return fmt.Errorf("unexpected status code: %d, body: %s", res.StatusCode, string(body))
-			}
-			return nil
-		}()
+
+		// Save progress before this part so retries don't double-count bytes
+		partDoneStart := p.Done
+		err := retry.Do(
+			func() error {
+				// Reset progress to the start of this part on each attempt
+				p.Done = partDoneStart
+				if _, seekErr := rd.Seek(0, io.SeekStart); seekErr != nil {
+					return seekErr
+				}
+				req, reqErr := http.NewRequestWithContext(ctx, http.MethodPut, uploadPartInfo.UploadUrl, io.TeeReader(rd, p))
+				if reqErr != nil {
+					return reqErr
+				}
+				req.Header.Set("Content-Type", "application/octet-stream")
+				req.Header.Set("Content-Length", fmt.Sprint(partSize))
+				req.Header.Set("Origin", "https://yun.139.com")
+				req.Header.Set("Referer", "https://yun.139.com/")
+				req.ContentLength = partSize
+
+				res, doErr := base.HttpClient.Do(req)
+				if doErr != nil {
+					return doErr
+				}
+				defer res.Body.Close()
+				log.Debugf("[139] uploaded: %+v", res)
+				if res.StatusCode != http.StatusOK {
+					body, _ := io.ReadAll(res.Body)
+					return fmt.Errorf("unexpected status code: %d, body: %s", res.StatusCode, string(body))
+				}
+				return nil
+			},
+			retry.Context(ctx),
+			retry.Attempts(3),
+			retry.DelayType(retry.BackOffDelay),
+			retry.Delay(time.Second),
+		)
+		ss.FreeSectionReader(rd)
 		if err != nil {
 			return err
 		}
@@ -881,7 +934,6 @@ func (d *Yun139) step2_get_single_token(sid string) (string, error) {
 	}
 
 	exchangePassidHeaders := map[string]string{
-		"Host":            "smsrebuild1.mail.10086.cn",
 		"Cookie":          rmkey,
 		"Content-Type":    "text/xml; charset=utf-8",
 		"Accept-Encoding": "gzip",
@@ -1156,7 +1208,6 @@ func (d *Yun139) step3_third_party_login(dycpwd string) (string, error) {
 		"x-UserAgent":         "android|23116PN5BC|android15|1.2.6|||1440x3200|10246600",
 		"x-DeviceInfo":        "4|127.0.0.1|5|1.2.6|Xiaomi|23116PN5BC||02-00-00-00-00-00|android 15|1440x3200|android|||",
 		"Content-Type":        "text/plain;charset=UTF-8",
-		"Host":                "user-njs.yun.139.com",
 		"Accept-Encoding":     "gzip",
 		"User-Agent":          "okhttp/3.12.2",
 	}
@@ -1237,10 +1288,9 @@ func (d *Yun139) loginWithPassword() (string, error) {
 }
 
 func (d *Yun139) andAlbumRequest(pathname string, body interface{}, resp interface{}) ([]byte, error) {
-	url := "https://group.yun.139.com/hcy/family/adapter/andAlbum/openApi" + pathname
+	url := d.getFamilyCloudHost() + "/andAlbum/openApi" + pathname
 
 	headers := map[string]string{
-		"Host":                "group.yun.139.com",
 		"authorization":       "Basic " + d.getAuthorization(),
 		"x-svctype":           "2",
 		"hcy-cool-flag":       "1",
@@ -1323,6 +1373,21 @@ func (d *Yun139) getGroupRootByCloudID(cloudID string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no root found in group response")
+}
+
+// dirPath returns the full path for a directory object.
+// For family root (Path="" from framework), needs "root:/"+id prefix.
+// Non-root objects already have their API path in GetPath() from List responses.
+func (d *Yun139) dirPath(dir model.Obj) string {
+	p := dir.GetPath()
+	id := dir.GetID()
+	if p == "" {
+		if d.isFamily() {
+			return "root:/" + id
+		}
+		return id
+	}
+	return path.Join(p, id)
 }
 
 // getFamilyRootPath 查询 family 的上层 path（data.path）
