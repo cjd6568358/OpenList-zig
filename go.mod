@@ -5,7 +5,7 @@ go 1.25.0
 toolchain go1.27.0
 
 require (
-	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.22.0
+	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.1
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.8.0
 	github.com/KarpelesLab/reflink v1.0.2
 	github.com/KirCute/zip v1.0.1
@@ -77,7 +77,7 @@ require (
 	github.com/zzzhr1990/go-common-entity v0.0.0-20250202070650-1a200048f0d3
 	golang.org/x/crypto v0.55.0
 	golang.org/x/image v0.44.0
-	golang.org/x/net v0.57.0
+	golang.org/x/net v0.58.0
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/time v0.15.0
 	google.golang.org/appengine v1.6.8
