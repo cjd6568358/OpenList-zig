@@ -3220,3 +3220,36 @@ Value ⇒ data 解析成空 ⇒ **静默返回 0 条、不报错**。此前能�
 **结论修订**：41.4 的「115 下载 403 属上游」作废 —— 那是**本端真 bug**
 （WebDAV 漏传请求头），已修。`/115` 上本轮所有测试产物已清理（只剩用户自己的
 `tcping64.exe`）；设备上的 Go 对照实例（`/tmp/goab`、端口 15398）已停并删除。
+
+---
+
+## 42. P0 修复（2026-10-18 晚）：驱动对账揪出的两个真 bug
+
+**背景**：`docs/AUDIT_2026-10-18-drivers.md`（按驱动维度的 Go↔Zig 全量对账，
+11 驱动三分法）确认两个 P0 真 bug，同轮修复：
+
+1. **local put 进度传字节**（local.zig，原 `cb(ctx.progress_userdata, off)`）。
+   `ProgressFn` 契约是 0–100 百分比（driver.zig:70-78，对齐 Go
+   `model.UpdateProgress`），其余 8 个驱动都传 pct，只有 local 传累计字节数
+   ⇒ 1 GB 文件进度条溢出到 1073741824%。改为 `off*100/total`（u128 中间量
+   防溢出）+ 回归测试（回调内断言 ≤100 且单调不减）。
+2. **189 web fs/get size 恒 0**（cloud189.zig details 硬编码 `.size = 0`；
+   Go `drivers/189/driver.go:211-221` 返回列表接口的真 size，189pc 同款问题
+   早在 cloud189pc.zig:1596 修过、189 漏修）。Entry 补 size/modified
+   （照 189pc 方案），findChild 从 list 响应搬真值，details 透出。
+
+**验证**：打包机全量构建 **408/408 单测**（含新增进度回归测试），aarch64 产物
+`c8797e16b9b0d722…`（1,254,784 B）。真机部署（`--keep-config`，13 挂载）后
+e2e **465 通过 / 0 失败 / 1 跳过**（跳过 = 坚果云根目录 403 服务商规则；
+日志 `docs/regression/2026-10-18-p0-fix-e2e.log`）。P0-2 单独用临时
+`/ecloud_web`（189Cloud web 驱动，账密同 §36.2）实测：put 15 字节 →
+fs/get `size=15` + 真 modified，临时存储测后即删。
+
+**环境备注**：测试实例管理员口令重置为 `openlist-zig-test`（原哈希未知，
+停实例后 `openlist admin set` 流程重置，仅影响 /tmp/olz）。中途一次 WebDAV
+MKCOL 遭设备 TCP reset，实例无 panic、重跑全绿 ⇒ 设备一次性抖动。
+
+**顺带记录（Zig 0.17 语言层两个坑）**：裸 `assert` 已移除（须
+`std.debug.assert`）；`**` 数组重复运算符已不是合法 token（`x ** n` 被词法成
+两个 `*`，报 "binary operator '*' has whitespace on one side"），大数组改用
+定长声明 + `@memset`。

@@ -582,7 +582,16 @@ pub const Local = struct {
             if (n == 0) break;
             try f.writeStreamingAll(rt.io(), buf[0..n]);
             off += n;
-            if (ctx.progress) |cb| cb(ctx.progress_userdata, off);
+            // 进度契约是 **0–100 百分比**（`driver.zig` 的 `ProgressFn`，
+            // 对齐 Go `model.UpdateProgress`）。
+            // 2026-10-18 驱动对账（docs/AUDIT_2026-10-18-drivers.md §4-P0-1）：
+            // 这里原来传的是累计字节数，1 GB 的文件进度条会溢出到
+            // 1073741824%。用 u128 做中间量防 `off*100` 溢出（实际文件到不了
+            // 那个量级，但 Zig 的溢出检查会把"理论可能"直接变成 panic）。
+            if (ctx.progress) |cb| {
+                const pct: u64 = @intCast(@min(@as(u128, off) * 100 / @as(u128, total), 100));
+                cb(ctx.progress_userdata, pct);
+            }
         }
         // D09：`Source` 的契约是 size 已知。声明长度大于真实内容时必须判失败
         // —— 以前这里只 `break` 然后照样 rename，把一个被截断的文件原子地
@@ -1116,6 +1125,60 @@ test "put is atomic — the temp file is renamed over the target" {
     // no temp files left behind
     const objs = try d.list(&ctx, "/");
     try testing.expectEqual(@as(usize, 1), objs.len);
+}
+
+/// 进度收集器：把回调收到的值全部记下来。契约校验（0–100、单调不减）
+/// 直接放在回调里 —— 违约即 assert，测试当场红。
+const ProgressRecorder = struct {
+    calls: usize = 0,
+    last: u64 = 0,
+
+    fn record(userdata: ?*anyopaque, pct: u64) void {
+        const r: *ProgressRecorder = @ptrCast(@alignCast(userdata.?));
+        // 2026-10-18 回归（AUDIT_2026-10-18-drivers.md §4-P0-1）：
+        // 这里曾收到累计字节数（1 GB 文件 = 1073741824），前端进度条直接溢出。
+        // ⚠ Zig 0.17 已移除裸 `assert`，须写全 `std.debug.assert`。
+        std.debug.assert(pct <= 100 and pct >= r.last);
+        r.last = pct;
+        r.calls += 1;
+    }
+};
+
+test "put reports upload progress as a 0-100 percentage, not bytes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    var l = testLocal(a, root);
+    const d = driver.asDriver(Local, &l);
+
+    var rec = ProgressRecorder{};
+    var ctx = driver.Ctx{
+        .alloc = a,
+        .progress = ProgressRecorder.record,
+        .progress_userdata = &rec,
+    };
+
+    // 3 × 128 KiB（put 的循环缓冲）= 384 KiB > 单次缓冲，保证至少 3 次回调。
+    // ⚠ Zig 0.17 已无 `**`（数组重复）token，写 `x ** n` 会被词法成两个 `*`
+    // 并触发"binary operator '*' has whitespace on one side"——用定长数组 + memset。
+    var body: [3 * 128 * 1024]u8 = undefined;
+    @memset(&body, 0x41);
+    var b = @import("../http.zig").Body{ .memory = &body };
+    try d.put(&ctx, "/big.bin", b.source());
+
+    try testing.expect(rec.calls >= 3);
+    try testing.expectEqual(@as(u64, 100), rec.last); // 收尾必须是 100%
+    // 内容完整落盘（进度改动没有碰写路径）。
+    const got = try std.Io.Dir.cwd().readFileAlloc(rt.io(), try std.fs.path.join(a, &.{ root, "big.bin" }), a, .limited(1024 * 1024));
+    defer a.free(got);
+    try testing.expectEqual(@as(usize, 3 * 128 * 1024), got.len);
+    try testing.expectEqual(@as(u8, 0x41), got[0]);
 }
 
 test "relPath does not reject legal names containing a double dot" {

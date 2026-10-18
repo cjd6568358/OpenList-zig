@@ -695,6 +695,13 @@ pub const Cloud189 = struct {
         id: []const u8,
         name: []const u8,
         is_dir: bool,
+        // fs/get（details）要用：此前只带 id/name/is_dir，details 对文件恒报
+        // size=0（2026-10-18 对账发现的真 bug，AUDIT_2026-10-18-drivers.md
+        // §4-P0-2；189pc 的同款问题已于 cloud189pc.zig 的 Entry 修过，这里
+        // 照抄同一方案）。Go 的 File 结构体（drivers/189/types.go:11-24）
+        // 在 list 响应里就带 size/lastOpTime，路径寻址只是把原值搬过来。
+        size: i64 = 0,
+        modified: i64 = 0,
     };
 
     const Page = struct {
@@ -806,6 +813,8 @@ pub const Cloud189 = struct {
                         .id = try idStr(arena, item.intAt("id") orelse 0),
                         .name = name,
                         .is_dir = false,
+                        .size = item.intAt("size") orelse 0,
+                        .modified = timeutil.parseCnTime(item.strAt("lastOpTime") orelse "") orelse 0,
                     };
                 }
             }
@@ -827,10 +836,14 @@ pub const Cloud189 = struct {
         const self = as(ptr);
         const a = ctx.alloc;
         const e = try self.resolve(a, path);
+        // size 不能恒 0：Go 的 Get（drivers/189/driver.go:211-221）报的是
+        // 列表接口返回的真 size，前端/WebDAV 都读它（2026-10-18 修复，
+        // 见 Entry.size 注释）。
         return model.File.fromObj(.{
             .name = e.name,
-            .size = 0,
+            .size = e.size,
             .is_dir = e.is_dir,
+            .modified = e.modified,
         });
     }
 
