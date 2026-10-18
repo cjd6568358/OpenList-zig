@@ -3293,3 +3293,41 @@ MKCOL 遭设备 TCP reset，实例无 panic、重跑全绿 ⇒ 设备一次性�
 `self.method()` 只能调到 struct 内声明的成员 —— 新方法必须放进 struct 里，
 否则报 `no field or member function named ...`；另 `_ = self;` 在参数已被
 使用时是编译错误（pointless discard）。
+
+---
+
+## 44. err_detail 铺开（2026-10-18 深夜）：189 / 189pc / aliyun / wopan
+
+按 AUDIT §4-P1-10，把「上游人类可读消息」透传补齐到另外四个驱动（用户在用的
+`/ecloud_self`、`/ecloud_family`、`/aliyun`、`/wo` 直接受益）：
+
+| 驱动 | 穿线范围 | 透出的字段 |
+|---|---|---|
+| cloud189（web） | `request` + `listPage`/`getFiles`/`resolve`/`findChild`/`batchTask` + 9 个 op | `errorMsg` / `res_message` |
+| cloud189pc | `request`/`getBody`/`postBody`/`checkRespErr`/`signedFormPost` + `resolve`/`findChild`/`listPage`/`getFiles` + `createBatchTask`/`checkBatchTask`/`waitBatchTask` + 9 个 op | `res_message` / `msg` / `errorMsg` / `message` |
+| aliyundrive | `request`/`requestRaw` + `resolveEntry`/`findChild`/`listPage`/`listAll` + 8 个 op | `code:message` 的 message |
+| wopan | `post`/`postRaw` + `resolveId`/`findEntry`/`childByName` + 8 个 op | `MSG` / `RSP_DESC` |
+
+**纪律**：worker 线程与上传链一律传 `null` —— 跨线程写请求栈帧上的
+`Ctx.err_detail` 是数据竞争（driver.zig 注释），上传链无 ctx 参数也不强穿。
+登录/刷新/session 探测同样 null（非请求上下文）。至此 err_detail 覆盖
+**8 个驱动**；local（OS 错误）、strm（无上游）、webdav（只有 HTTP 状态码）
+不适用。
+
+**验证**：打包机 **409/409 单测**，aarch64 `8171c461b80cda92…`
+（1,259,264 B）；真机 13 挂载 e2e **460 通过 / 0 失败 / 2 跳过**
+（`docs/regression/2026-10-18-err-detail-e2e.log`；多出的跳过 =
+`mkdir sub 未同步可见 @ecloud_family`，189 上游最终一致性，非代码问题）。
+
+**⚠ 环境事故（不是回归，记下来防误判）**：本轮首次 e2e 报
+`/p/ 前置：fs/get 返回 sign` 失败、只有 5 个挂载。根因是**光猫在 21:07
+重启过**（`uptime` 实证 47 分钟），/tmp 被清空；随后（21:24）测试 cfg 被
+一份**旧快照**恢复（`cfg-restore.json`，18045 B）—— 该快照里
+`/hikvision` 指向 `/media/camera/hikvision`（当时不存在）、7 个存储是
+`disabled: true`。处置：重建 Local 根目录、用 `/api/admin/storage/enable`
+逐个启用、重启实例，13 挂载恢复后 e2e 全绿。**教训：e2e 大面积「挂载为空」
+先看 `uptime` 与 cfg 快照来源，再怀疑代码。**
+
+**顺带产出**：一个自校准的「调用参数个数 vs 定义」校验脚本（临时用，
+已删）—— 手工给 50+ 调用点加参数时，靠它一次找出全部漏网，避免逐个
+build 试错（Zig 本机无工具链，一轮 build 4–5 分钟）。

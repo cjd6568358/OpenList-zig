@@ -571,7 +571,7 @@ pub const AliyundriveOpen = struct {
         defer arena.deinit();
         const a = arena.allocator();
 
-        const body = try self.request(a, path_drive_info, "POST", null, .other);
+        const body = try self.request(a, path_drive_info, "POST", null, .other, null);
         const v = json.parse(a, body) catch return Error.UpstreamNotJson;
 
         const key = try std.fmt.allocPrint(a, "{s}_drive_id", .{self.eff_drive_type});
@@ -638,6 +638,9 @@ pub const AliyundriveOpen = struct {
         body: ?[]const u8,
         bucket: Bucket,
         retried: bool,
+        /// 上游人类可读消息出口（`&ctx.err_detail`）。null = 调用方不需要
+        /// （init、上传链）。跨线程写请求栈帧上的字段是数据竞争。
+        err_detail: ?*?[]const u8,
     ) !Reply {
         (self.limiter orelse &self.private_limiter).wait(bucket);
 
@@ -680,7 +683,7 @@ pub const AliyundriveOpen = struct {
         if (!retried and is_token_error) {
             log.info("[aliopen] {s} -> {s}, refreshing token", .{ uri, code });
             try self.refreshToken(arena);
-            return self.requestRaw(arena, uri, method, body, bucket, true);
+            return self.requestRaw(arena, uri, method, body, bucket, true, err_detail);
         }
         return .{ .body = res.body, .code = code, .message = message };
     }
@@ -693,10 +696,16 @@ pub const AliyundriveOpen = struct {
         method: []const u8,
         body: ?[]const u8,
         bucket: Bucket,
+        err_detail: ?*?[]const u8,
     ) ![]const u8 {
-        const r = try self.requestRaw(arena, uri, method, body, bucket, false);
+        const r = try self.requestRaw(arena, uri, method, body, bucket, false, err_detail);
         if (r.code.len > 0) {
             log.warn("[aliopen] {s} failed: {s}: {s}", .{ uri, r.code, r.message });
+            // 透出上游消息（对齐 Go 的 `fmt.Errorf("%s:%s", code, message)`，
+            // util.go:177）—— 用户看到真原因而不是泛化的 UpstreamError。
+            if (err_detail) |slot| {
+                if (r.message.len > 0) slot.* = r.message;
+            }
             return Error.UpstreamError;
         }
         return r.body;
@@ -818,19 +827,19 @@ pub const AliyundriveOpen = struct {
     };
 
     /// 阿里云盘和夸克、123pan 一样只认 ID，所以同样要逐级列目录。
-    fn resolveEntry(self: *AliyundriveOpen, arena: std.mem.Allocator, path: []const u8) !Entry {
+    fn resolveEntry(self: *AliyundriveOpen, arena: std.mem.Allocator, path: []const u8, err_detail: ?*?[]const u8) !Entry {
         var cur = Entry{ .id = self.cfg.root_folder_id, .name = "/", .is_dir = true };
         var it = std.mem.tokenizeAny(u8, path, "/\\");
         while (it.next()) |seg| {
-            cur = try self.findChild(arena, cur.id, seg);
+            cur = try self.findChild(arena, cur.id, seg, err_detail);
         }
         return cur;
     }
 
-    fn findChild(self: *AliyundriveOpen, arena: std.mem.Allocator, parent_id: []const u8, name: []const u8) !Entry {
+    fn findChild(self: *AliyundriveOpen, arena: std.mem.Allocator, parent_id: []const u8, name: []const u8, err_detail: ?*?[]const u8) !Entry {
         var marker: []const u8 = "";
         while (true) {
-            const page = try self.listPage(arena, parent_id, marker);
+            const page = try self.listPage(arena, parent_id, marker, err_detail);
             for (page.items) |*item| {
                 const n = item.strAt("name") orelse continue;
                 if (!std.mem.eql(u8, n, name)) continue;
@@ -850,7 +859,7 @@ pub const AliyundriveOpen = struct {
     ///
     /// 上游从 `marker = "first"` 起步然后立刻把它清空，等价于「第一轮发空
     /// marker，之后用上一页的 `next_marker`」。这里直接发空 marker。
-    fn listPage(self: *AliyundriveOpen, arena: std.mem.Allocator, parent_id: []const u8, marker: []const u8) !Page {
+    fn listPage(self: *AliyundriveOpen, arena: std.mem.Allocator, parent_id: []const u8, marker: []const u8, err_detail: ?*?[]const u8) !Page {
         var b = Buf.init(arena);
         var w = ObjWriter{ .b = &b };
         try w.begin();
@@ -862,7 +871,7 @@ pub const AliyundriveOpen = struct {
         try w.str("parent_file_id", parent_id);
         try w.end();
 
-        const body = try self.request(arena, path_file_list, "POST", b.slice(), .list);
+        const body = try self.request(arena, path_file_list, "POST", b.slice(), .list, err_detail);
         const v = json.parse(arena, body) catch return Error.UpstreamNotJson;
         return .{
             .items = arrAt(&v, "items"),
@@ -870,11 +879,11 @@ pub const AliyundriveOpen = struct {
         };
     }
 
-    fn listAll(self: *AliyundriveOpen, arena: std.mem.Allocator, parent_id: []const u8) ![]model.Obj {
+    fn listAll(self: *AliyundriveOpen, arena: std.mem.Allocator, parent_id: []const u8, err_detail: ?*?[]const u8) ![]model.Obj {
         var out = List(model.Obj).init(arena);
         var marker: []const u8 = "";
         while (true) {
-            const page = try self.listPage(arena, parent_id, marker);
+            const page = try self.listPage(arena, parent_id, marker, err_detail);
             for (page.items) |*item| try out.append(objFromJson(item));
             if (page.next_marker.len == 0) break;
             marker = page.next_marker;
@@ -889,9 +898,9 @@ pub const AliyundriveOpen = struct {
     fn list(ptr: *anyopaque, ctx: *driver.Ctx, dir: []const u8) anyerror![]model.Obj {
         const self = as(ptr);
         const a = ctx.alloc;
-        const entry = try self.resolveEntry(a, dir);
+        const entry = try self.resolveEntry(a, dir, &ctx.err_detail);
         if (!entry.is_dir) return driver.Error.NotFound;
-        return self.listAll(a, entry.id);
+        return self.listAll(a, entry.id, &ctx.err_detail);
     }
 
     fn details(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8) anyerror!model.File {
@@ -901,7 +910,7 @@ pub const AliyundriveOpen = struct {
         var it = std.mem.tokenizeAny(u8, path, "/\\");
         if (it.next() == null) return .{ .name = "/", .is_dir = true };
 
-        const entry = try self.resolveEntry(a, path);
+        const entry = try self.resolveEntry(a, path, &ctx.err_detail);
         const raw = entry.raw orelse return .{ .name = entry.name, .is_dir = entry.is_dir };
         const o = objFromJson(raw);
         return model.File.fromObj(o);
@@ -911,7 +920,7 @@ pub const AliyundriveOpen = struct {
         const self = as(ptr);
         const a = ctx.alloc;
 
-        const entry = try self.resolveEntry(a, path);
+        const entry = try self.resolveEntry(a, path, &ctx.err_detail);
         if (entry.is_dir) return driver.Error.NotFound;
 
         var b = Buf.init(a);
@@ -922,7 +931,7 @@ pub const AliyundriveOpen = struct {
         try w.int("expire_sec", 14400);
         try w.end();
 
-        const body = try self.request(a, path_download_url, "POST", b.slice(), .link);
+        const body = try self.request(a, path_download_url, "POST", b.slice(), .link, &ctx.err_detail);
         const v = json.parse(a, body) catch return Error.UpstreamNotJson;
 
         var url = v.strAt("url") orelse "";
@@ -951,7 +960,7 @@ pub const AliyundriveOpen = struct {
 
         const name = lastSegment(dir);
         if (name.len == 0) return Error.InvalidPath;
-        const parent = try self.resolveEntry(a, parentOf(dir));
+        const parent = try self.resolveEntry(a, parentOf(dir), &ctx.err_detail);
 
         var b = Buf.init(a);
         var w = ObjWriter{ .b = &b };
@@ -963,15 +972,15 @@ pub const AliyundriveOpen = struct {
         // 目录用 refuse：同名目录直接报错，避免 `ignore` 造成的静默重名。
         try w.str("check_name_mode", "refuse");
         try w.end();
-        _ = try self.request(a, path_file_create, "POST", b.slice(), .other);
+        _ = try self.request(a, path_file_create, "POST", b.slice(), .other, &ctx.err_detail);
     }
 
     fn move(ptr: *anyopaque, ctx: *driver.Ctx, src: []const u8, dst_dir: []const u8) anyerror!void {
         const self = as(ptr);
         const a = ctx.alloc;
 
-        const s = try self.resolveEntry(a, src);
-        const d = try self.resolveEntry(a, dst_dir);
+        const s = try self.resolveEntry(a, src, &ctx.err_detail);
+        const d = try self.resolveEntry(a, dst_dir, &ctx.err_detail);
 
         var b = Buf.init(a);
         var w = ObjWriter{ .b = &b };
@@ -981,7 +990,7 @@ pub const AliyundriveOpen = struct {
         try w.str("to_parent_file_id", d.id);
         try w.str("check_name_mode", "ignore");
         try w.end();
-        _ = try self.request(a, path_move, "POST", b.slice(), .other);
+        _ = try self.request(a, path_move, "POST", b.slice(), .other, &ctx.err_detail);
     }
 
     /// Go `drivers/aliyundrive_open/driver.go` 的 Copy：`/openFile/copy`，
@@ -992,8 +1001,8 @@ pub const AliyundriveOpen = struct {
         const self = as(ptr);
         const a = ctx.alloc;
 
-        const s = try self.resolveEntry(a, src);
-        const d = try self.resolveEntry(a, dst_dir);
+        const s = try self.resolveEntry(a, src, &ctx.err_detail);
+        const d = try self.resolveEntry(a, dst_dir, &ctx.err_detail);
 
         var b = Buf.init(a);
         var w = ObjWriter{ .b = &b };
@@ -1003,7 +1012,7 @@ pub const AliyundriveOpen = struct {
         try w.str("to_parent_file_id", d.id);
         try w.boolean("auto_rename", false);
         try w.end();
-        _ = try self.request(a, path_copy, "POST", b.slice(), .other);
+        _ = try self.request(a, path_copy, "POST", b.slice(), .other, &ctx.err_detail);
     }
 
     fn rename(ptr: *anyopaque, ctx: *driver.Ctx, src: []const u8, new_name: []const u8) anyerror!void {
@@ -1011,7 +1020,7 @@ pub const AliyundriveOpen = struct {
         const a = ctx.alloc;
         if (new_name.len == 0) return Error.InvalidPath;
 
-        const s = try self.resolveEntry(a, src);
+        const s = try self.resolveEntry(a, src, &ctx.err_detail);
         var b = Buf.init(a);
         var w = ObjWriter{ .b = &b };
         try w.begin();
@@ -1019,7 +1028,7 @@ pub const AliyundriveOpen = struct {
         try w.str("file_id", s.id);
         try w.str("name", new_name);
         try w.end();
-        _ = try self.request(a, path_update, "POST", b.slice(), .other);
+        _ = try self.request(a, path_update, "POST", b.slice(), .other, &ctx.err_detail);
     }
 
     fn remove(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, is_dir: bool) anyerror!void {
@@ -1027,7 +1036,7 @@ pub const AliyundriveOpen = struct {
         const a = ctx.alloc;
         _ = is_dir; // 阿里云盘的删除接口对文件和目录是同一个
 
-        const s = try self.resolveEntry(a, path);
+        const s = try self.resolveEntry(a, path, &ctx.err_detail);
         const uri = if (self.cfg.removeIsPermanent()) path_delete else path_trash;
 
         var b = Buf.init(a);
@@ -1036,14 +1045,14 @@ pub const AliyundriveOpen = struct {
         try w.str("drive_id", self.drive_id);
         try w.str("file_id", s.id);
         try w.end();
-        _ = try self.request(a, uri, "POST", b.slice(), .other);
+        _ = try self.request(a, uri, "POST", b.slice(), .other, &ctx.err_detail);
     }
 
     fn space(ptr: *anyopaque, ctx: *driver.Ctx) anyerror!driver.DiskUsage {
         const self = as(ptr);
         const a = ctx.alloc;
 
-        const body = try self.request(a, path_space_info, "POST", null, .other);
+        const body = try self.request(a, path_space_info, "POST", null, .other, &ctx.err_detail);
         const v = json.parse(a, body) catch return Error.UpstreamNotJson;
         return .{
             .total = v.intAt("personal_space_info.total_size") orelse 0,
@@ -1125,7 +1134,7 @@ pub const AliyundriveOpen = struct {
         try w.str("upload_id", upload_id);
         try w.end();
 
-        const body = try self.request(a, path_upload_url, "POST", b.slice(), .other);
+        const body = try self.request(a, path_upload_url, "POST", b.slice(), .other, null);
         const v = json.parse(a, body) catch return Error.UpstreamNotJson;
         return parsePartInfos(a, arrAt(&v, "part_info_list"));
     }
@@ -1138,7 +1147,7 @@ pub const AliyundriveOpen = struct {
         try w.str("file_id", file_id);
         try w.str("upload_id", upload_id);
         try w.end();
-        return self.request(a, path_complete, "POST", b.slice(), .other);
+        return self.request(a, path_complete, "POST", b.slice(), .other, null);
     }
 
     fn uploadPart(self: *AliyundriveOpen, a: std.mem.Allocator, part: PartInfo, data: []const u8) !void {
@@ -1209,7 +1218,7 @@ pub const AliyundriveOpen = struct {
 
         const name = lastSegment(dst);
         if (name.len == 0) return Error.InvalidPath;
-        const dst_dir = try self.resolveEntry(a, parentOf(dst));
+        const dst_dir = try self.resolveEntry(a, parentOf(dst), &ctx.err_detail);
         if (!dst_dir.is_dir) return Error.InvalidPath;
 
         const size = src.size();
@@ -1244,7 +1253,7 @@ pub const AliyundriveOpen = struct {
             pre_hash,
             "",
         );
-        var reply = try self.requestRaw(a, path_file_create, "POST", body, .other, false);
+        var reply = try self.requestRaw(a, path_file_create, "POST", body, .other, false, null);
 
         if (reply.code.len > 0) {
             // 第一轮秒传预检的「命中」是一个**错误码**，不是 200。
@@ -1268,7 +1277,7 @@ pub const AliyundriveOpen = struct {
                 content_hash,
                 pcode,
             );
-            reply = try self.requestRaw(a, path_file_create, "POST", body, .other, false);
+            reply = try self.requestRaw(a, path_file_create, "POST", body, .other, false, null);
             if (reply.code.len > 0) {
                 log.warn("[aliopen] create(proof) {s} failed: {s}: {s}", .{ name, reply.code, reply.message });
                 return Error.UpstreamError;

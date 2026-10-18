@@ -246,7 +246,7 @@ pub const Wopan = struct {
                 continue;
             };
             // retry=false：post 内部的「刷新后重试」不能再递归回 refreshToken。
-            const raw = self.postRaw(a, chan_api_user, k_refresh_token, param, "", false, true, id[0]) catch |e| {
+            const raw = self.postRaw(a, chan_api_user, k_refresh_token, param, "", false, true, id[0], null) catch |e| {
                 last = e;
                 continue;
             };
@@ -290,7 +290,7 @@ pub const Wopan = struct {
         try p.append("{\"accessToken\":");
         try json.writeString(&p, self.access_token);
         try p.append("}");
-        const raw = try self.post(a, chan_api_user, k_query_user, p.slice(), true, true, client_id);
+        const raw = try self.post(a, chan_api_user, k_query_user, p.slice(), true, true, client_id, null);
         const v = json.parse(a, raw) catch return Error.InvalidResponse;
         self.phone = try self.alloc.dupe(u8, v.strAt("userId") orelse "");
     }
@@ -300,7 +300,7 @@ pub const Wopan = struct {
     fn initClassify(self: *Wopan, a: std.mem.Allocator) void {
         if (self.classify != null) return;
         var m = std.StringHashMap([]const u8).init(self.alloc);
-        const raw = self.post(a, chan_wohome, k_classify, "{}", true, true, client_id) catch {
+        const raw = self.post(a, chan_wohome, k_classify, "{}", true, true, client_id, null) catch {
             self.classify = m;
             return;
         };
@@ -325,7 +325,7 @@ pub const Wopan = struct {
         try p.append("{\"appId\":");
         try json.writeString(&p, app_id);
         try p.append("}");
-        const raw = self.post(a, chan_wohome, k_zone, p.slice(), true, true, client_id) catch return;
+        const raw = self.post(a, chan_wohome, k_zone, p.slice(), true, true, client_id, null) catch return;
         const v = json.parse(a, raw) catch return;
         self.zone_url = self.alloc.dupe(u8, v.strAt("url") orelse "") catch "";
     }
@@ -335,7 +335,7 @@ pub const Wopan = struct {
         try p.append("{\"clientId\":");
         try json.writeString(&p, client_id);
         try p.append("}");
-        const raw = try self.post(a, chan_wohome, k_family_current, p.slice(), true, true, client_id);
+        const raw = try self.post(a, chan_wohome, k_family_current, p.slice(), true, true, client_id, null);
         const v = json.parse(a, raw) catch return Error.InvalidResponse;
         if (v.intAt("defaultHomeId")) |n| {
             return std.fmt.allocPrint(self.alloc, "{d}", .{n});
@@ -376,9 +376,12 @@ pub const Wopan = struct {
         retry: bool,
         want_payload: bool,
         body_client_id: []const u8,
+        /// 上游人类可读消息出口（`&ctx.err_detail`）。null = init/刷新/
+        /// 上传等无请求上下文的调用。
+        err_detail: ?*?[]const u8,
     ) anyerror![]const u8 {
         const param_b64 = try encryptParam(a, channel, self.access_token, param_plain);
-        return self.postRaw(a, channel, key, param_b64, param_plain, retry, want_payload, body_client_id);
+        return self.postRaw(a, channel, key, param_b64, param_plain, retry, want_payload, body_client_id, err_detail);
     }
 
     /// 已加密 param 的发送路径。目前只有 `refreshToken` 用 —— 它的加密 key 是
@@ -394,6 +397,7 @@ pub const Wopan = struct {
         retry: bool,
         want_payload: bool,
         body_client_id: []const u8,
+        err_detail: ?*?[]const u8,
     ) anyerror![]const u8 {
         const ts = rt.nowMillis();
         const seq = reqSeqValue();
@@ -446,7 +450,11 @@ pub const Wopan = struct {
         const v = json.parse(a, res.body) catch return Error.InvalidResponse;
         const status = v.strAt("STATUS") orelse return Error.InvalidResponse;
         if (!std.mem.eql(u8, status, "200")) {
-            log.warn("[wopan] {s}: STATUS={s} MSG={s}", .{ key, status, v.strAt("MSG") orelse "" });
+            const msg = v.strAt("MSG") orelse "";
+            log.warn("[wopan] {s}: STATUS={s} MSG={s}", .{ key, status, msg });
+            if (err_detail) |slot| {
+                if (msg.len > 0) slot.* = msg;
+            }
             return Error.InvalidResponse;
         }
         const rsp = v.getPath("RSP") orelse return Error.InvalidResponse;
@@ -463,9 +471,13 @@ pub const Wopan = struct {
                 try self.refreshToken(a);
                 // H3：重试必须**重新加密**（新 accessToken ⇒ 新 key），不能重放
                 // 旧 param_b64。重走 `post` 的明文入口即可。
-                return self.post(a, channel, key, param_plain, false, want_payload, body_client_id);
+                return self.post(a, channel, key, param_plain, false, want_payload, body_client_id, err_detail);
             }
-            log.warn("[wopan] {s}: rsp_code={s} desc={s}", .{ key, code, rsp.strAt("RSP_DESC") orelse "" });
+            const desc = rsp.strAt("RSP_DESC") orelse "";
+            log.warn("[wopan] {s}: rsp_code={s} desc={s}", .{ key, code, desc });
+            if (err_detail) |slot| {
+                if (desc.len > 0) slot.* = desc;
+            }
             return Error.InvalidResponse;
         }
         const data = rsp.getPath("DATA") orelse return "";
@@ -495,7 +507,7 @@ pub const Wopan = struct {
     fn list(p: *anyopaque, ctx: *driver.Ctx, dir: []const u8) anyerror![]model.Obj {
         const self = as(p);
         const a = ctx.alloc;
-        const id = try self.resolveId(a, dir);
+        const id = try self.resolveId(a, dir, &ctx.err_detail);
         var out = List(model.Obj).init(a);
         var page: i64 = 0;
         while (true) {
@@ -513,7 +525,7 @@ pub const Wopan = struct {
                 try json.writeString(&b, self.cfg.family_id);
             }
             try b.append("}");
-            const raw = try self.post(a, chan_wohome, k_query_all_files, b.slice(), true, true, client_id);
+            const raw = try self.post(a, chan_wohome, k_query_all_files, b.slice(), true, true, client_id, &ctx.err_detail);
             const v = json.parse(a, raw) catch return Error.InvalidResponse;
             const files = v.getPath("files") orelse break;
             const arr = files.asArray() orelse break;
@@ -536,7 +548,7 @@ pub const Wopan = struct {
     fn details(p: *anyopaque, ctx: *driver.Ctx, path: []const u8) anyerror!model.File {
         const self = as(p);
         const a = ctx.alloc;
-        const found = try self.findEntry(a, path) orelse return Error.NotFound;
+        const found = try self.findEntry(a, path, &ctx.err_detail) orelse return Error.NotFound;
         const obj = found.obj;
         return .{ .name = obj.name, .size = obj.size, .is_dir = obj.is_dir, .modified = obj.modified, .sign = obj.sign };
     }
@@ -544,7 +556,7 @@ pub const Wopan = struct {
     fn link(p: *anyopaque, ctx: *driver.Ctx, path: []const u8, _: driver.LinkArgs) anyerror!driver.Link {
         const self = as(p);
         const a = ctx.alloc;
-        const found = try self.findEntry(a, path) orelse return Error.NotFound;
+        const found = try self.findEntry(a, path, &ctx.err_detail) orelse return Error.NotFound;
         const obj = found.obj;
         if (obj.is_dir) return Error.InvalidPath;
 
@@ -557,7 +569,7 @@ pub const Wopan = struct {
         try b.append("],\"clientId\":");
         try json.writeString(&b, client_id);
         try b.append("}");
-        const raw = try self.post(a, chan_wohome, k_download_url_v2, b.slice(), true, true, client_id);
+        const raw = try self.post(a, chan_wohome, k_download_url_v2, b.slice(), true, true, client_id, &ctx.err_detail);
         const v = json.parse(a, raw) catch return Error.InvalidResponse;
         const lst = v.getPath("list") orelse return Error.InvalidResponse;
         const arr = lst.asArray() orelse return Error.InvalidResponse;
@@ -569,7 +581,7 @@ pub const Wopan = struct {
     fn makeDir(p: *anyopaque, ctx: *driver.Ctx, dir: []const u8) anyerror!void {
         const self = as(p);
         const a = ctx.alloc;
-        const parent = try self.resolveId(a, urlmod.parentPath(dir));
+        const parent = try self.resolveId(a, urlmod.parentPath(dir), &ctx.err_detail);
         const name = urlmod.baseName(dir);
         if (name.len == 0) return Error.InvalidPath;
         // Go driver.go: family_id 为空时用 `defaultFamilyID`。
@@ -587,13 +599,13 @@ pub const Wopan = struct {
         try b.append(",\"clientId\":");
         try json.writeString(&b, client_id);
         try b.append("}");
-        _ = try self.post(a, chan_wohome, k_create_dir, b.slice(), true, false, client_id);
+        _ = try self.post(a, chan_wohome, k_create_dir, b.slice(), true, false, client_id, &ctx.err_detail);
     }
 
     fn rename(p: *anyopaque, ctx: *driver.Ctx, path: []const u8, new_name: []const u8) anyerror!void {
         const self = as(p);
         const a = ctx.alloc;
-        const found = try self.findEntry(a, path) orelse return Error.NotFound;
+        const found = try self.findEntry(a, path, &ctx.err_detail) orelse return Error.NotFound;
         const obj = found.obj;
         // Go driver.go:116-124 —— `type`: 1 = 文件, 0 = 目录。
         var b = Buf.init(a);
@@ -612,16 +624,16 @@ pub const Wopan = struct {
             try json.writeString(&b, self.cfg.family_id);
         }
         try b.append("}");
-        _ = try self.post(a, chan_wohome, k_rename, b.slice(), true, false, client_id);
+        _ = try self.post(a, chan_wohome, k_rename, b.slice(), true, false, client_id, &ctx.err_detail);
     }
 
     /// move / copy 的上游参数是**同一套**（dirList + fileList + 两个 spaceType）。
     fn moveOrCopy(p: *anyopaque, ctx: *driver.Ctx, src: []const u8, dst_dir: []const u8, is_copy: bool) anyerror!void {
         const self = as(p);
         const a = ctx.alloc;
-        const found = try self.findEntry(a, src) orelse return Error.NotFound;
+        const found = try self.findEntry(a, src, &ctx.err_detail) orelse return Error.NotFound;
         const obj = found.obj;
-        const dst = try self.resolveId(a, dst_dir);
+        const dst = try self.resolveId(a, dst_dir, &ctx.err_detail);
         const st = self.spaceType();
 
         var b = Buf.init(a);
@@ -644,7 +656,7 @@ pub const Wopan = struct {
             try json.writeString(&b, self.cfg.family_id);
         }
         try b.append("}");
-        _ = try self.post(a, chan_wohome, if (is_copy) k_copy else k_move, b.slice(), true, false, client_id);
+        _ = try self.post(a, chan_wohome, if (is_copy) k_copy else k_move, b.slice(), true, false, client_id, &ctx.err_detail);
     }
 
     fn move(p: *anyopaque, ctx: *driver.Ctx, src: []const u8, dst_dir: []const u8) anyerror!void {
@@ -658,7 +670,7 @@ pub const Wopan = struct {
     fn remove(p: *anyopaque, ctx: *driver.Ctx, path: []const u8, is_dir: bool) anyerror!void {
         const self = as(p);
         const a = ctx.alloc;
-        const found = try self.findEntry(a, path) orelse return Error.NotFound;
+        const found = try self.findEntry(a, path, &ctx.err_detail) orelse return Error.NotFound;
         const obj = found.obj;
 
         var b = Buf.init(a);
@@ -671,13 +683,13 @@ pub const Wopan = struct {
         try b.append("],\"clientId\":");
         try json.writeString(&b, client_id);
         try b.append("}");
-        _ = try self.post(a, chan_wohome, k_delete, b.slice(), true, false, client_id);
+        _ = try self.post(a, chan_wohome, k_delete, b.slice(), true, false, client_id, &ctx.err_detail);
     }
 
     fn put(p: *anyopaque, ctx: *driver.Ctx, dst: []const u8, src: model.Source) anyerror!void {
         const self = as(p);
         const a = ctx.alloc;
-        const dir_id = try self.resolveId(a, urlmod.parentPath(dst));
+        const dir_id = try self.resolveId(a, urlmod.parentPath(dst), &ctx.err_detail);
         const name = urlmod.baseName(dst);
         const size: i64 = @max(src.size(), 0);
 
@@ -786,7 +798,7 @@ pub const Wopan = struct {
         try b.append(",\"clientId\":");
         try json.writeString(&b, client_id);
         try b.append("}");
-        const raw = try self.post(a, chan_wohome, k_usage, b.slice(), true, true, client_id);
+        const raw = try self.post(a, chan_wohome, k_usage, b.slice(), true, true, client_id, &ctx.err_detail);
         const v = json.parse(a, raw) catch return Error.InvalidResponse;
         const u = v.getPath("usageInfo") orelse return Error.InvalidResponse;
         const total = std.fmt.parseInt(i64, u.strAt("byteTotalSize") orelse "0", 10) catch 0;
@@ -797,22 +809,22 @@ pub const Wopan = struct {
     // 路径 → id
     // -----------------------------------------------------------------------
 
-    fn resolveId(self: *Wopan, a: std.mem.Allocator, dir: []const u8) ![]const u8 {
+    fn resolveId(self: *Wopan, a: std.mem.Allocator, dir: []const u8, err_detail: ?*?[]const u8) ![]const u8 {
         if (dir.len == 0 or std.mem.eql(u8, dir, "/")) return self.cfg.root_id;
-        const found = try self.findEntry(a, dir) orelse return Error.NotFound;
+        const found = try self.findEntry(a, dir, err_detail) orelse return Error.NotFound;
         const obj = found.obj;
         if (!obj.is_dir) return Error.InvalidPath;
         return obj.sign;
     }
 
     /// 逐段下钻；`sign` 承载上游 id。
-    fn findEntry(self: *Wopan, a: std.mem.Allocator, path: []const u8) !?Found {
+    fn findEntry(self: *Wopan, a: std.mem.Allocator, path: []const u8, err_detail: ?*?[]const u8) !?Found {
         var cur: []const u8 = self.cfg.root_id;
         var result: ?Found = null;
         var it = std.mem.splitScalar(u8, path, '/');
         while (it.next()) |seg| {
             if (seg.len == 0) continue;
-            const found = try self.childByName(a, cur, seg) orelse return null;
+            const found = try self.childByName(a, cur, seg, err_detail) orelse return null;
             cur = try a.dupe(u8, found.obj.sign);
             result = found;
         }
@@ -825,7 +837,7 @@ pub const Wopan = struct {
     /// 所以这里把两个都带出去，调用方各取所需。
     const Found = struct { obj: model.Obj, fid: []const u8 };
 
-    fn childByName(self: *Wopan, a: std.mem.Allocator, parent_id: []const u8, name: []const u8) !?Found {
+    fn childByName(self: *Wopan, a: std.mem.Allocator, parent_id: []const u8, name: []const u8, err_detail: ?*?[]const u8) !?Found {
         var page: i64 = 0;
         while (true) {
             var b = Buf.init(a);
@@ -842,7 +854,7 @@ pub const Wopan = struct {
                 try json.writeString(&b, self.cfg.family_id);
             }
             try b.append("}");
-            const raw = try self.post(a, chan_wohome, k_query_all_files, b.slice(), true, true, client_id);
+            const raw = try self.post(a, chan_wohome, k_query_all_files, b.slice(), true, true, client_id, err_detail);
             const v = json.parse(a, raw) catch return null;
             const files = v.getPath("files") orelse return null;
             const arr = files.asArray() orelse return null;

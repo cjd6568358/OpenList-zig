@@ -367,8 +367,18 @@ Addition.AccessToken 有解析但 **schema 未声明**（:976-982）⇒ 前端�
 | P1-2 | webdav **PUT 发 Content-Type** | `model.Source` 新增 `mime` 字段；`fs/put` 用 `mimeFor(basename)`、DAV PUT 优先用请求自身 CT；驱动侧 `src.mime` 非空即发。**顺带修正原注释的错误论断**（Go callback 实际会设 CT） | 编译 + e2e（WebDAV PUT 201/覆盖/ETag 全过） |
 
 **P1 剩余**：webdav SharePoint、189pc family_transfer / old 上传 / rapid_upload /
-torrent、local 缩略图、aliyun `Other(video_preview)`、api 三端点、err_detail
-其余七驱动（cloud189/cloud189pc/aliyundrive/wopan/webdav/local/strm）。
+torrent、local 缩略图、aliyun `Other(video_preview)`、api 三端点。
+
+**2026-10-18 深夜再落地 1 项（P1-10 err_detail 其余驱动）**：
+cloud189 / cloud189pc / aliyundrive / wopan 四个驱动的请求链全部穿线
+（`request`/`post`/`getBody`/`postBody`/`checkRespErr`/`signedFormPost` +
+各解析链 `resolve`/`findChild`/`listPage`/`getFiles`/`resolveId`/`findEntry`/
+`childByName`/`batchTask`），上游 `res_message`/`message`/`RSP_DESC` 直接
+透出到用户响应。**worker 线程与上传链一律传 null**（数据竞争 + 无 ctx）。
+至此 err_detail 覆盖 8 个驱动（quarkuc/quark/itvsh/pan115/cloud189/
+cloud189pc/aliyundrive/wopan）；local（OS 错误）、strm（无上游）、webdav
+（只有 HTTP 状态码）无「上游人类可读消息」概念，不适用。验证：409/409 单测
++ 真机 e2e **460/0/2**（多出的跳过是 189 家庭云 mkdir 最终一致性抖动）。
 
 ### P2 — 取舍/待确认（记录在案，不阻塞）
 

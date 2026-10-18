@@ -24,11 +24,12 @@
 >
 > **2026-10-18 驱动维度全量对账完成** → `docs/AUDIT_2026-10-18-drivers.md`
 > （11 个驱动逐个 Go↔Zig 三分法对账；**P0 两个真 bug 已修**：local put 进度传
-> 字节、cloud189 fs/get size 恒 0；**P1 已落地 5 项**：pan115 动态 appver +
-> OSS 分片重试、189pc 分片重试、pan123 err_detail、webdav PUT Content-Type
-> —— 409/409 单测 + 真机 e2e 465/0/1，详见 STATUS §42/§43；
+> 字节、cloud189 fs/get size 恒 0；**P1 已落地 6 项**：pan115 动态 appver +
+> OSS 分片重试、189pc 分片重试、pan123 err_detail、webdav PUT Content-Type、
+> err_detail 铺开到 189/189pc/aliyun/wopan（共 8 驱动）—— 409/409 单测 +
+> 真机 e2e 460/0/2，详见 STATUS §42/§43/§44；
 > P1 剩余：SharePoint、189pc family_transfer/old 上传/torrent、local 缩略图、
-> aliyun Other、api 三端点、其余七驱动 err_detail；文档漂移 11 处待顺手修。）
+> aliyun Other、api 三端点；文档漂移 11 处待顺手修。）
 
 ---
 

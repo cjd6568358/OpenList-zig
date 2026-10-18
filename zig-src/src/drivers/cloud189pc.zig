@@ -691,24 +691,40 @@ fn appConfOk(v: *const json.Value) bool {
 }
 
 /// `RespErr.HasError()` —— 上游「居然有四种返回方式」。
-fn checkRespErr(alloc: std.mem.Allocator, url: []const u8, body: []const u8) !void {
+fn checkRespErr(alloc: std.mem.Allocator, url: []const u8, body: []const u8, err_detail: ?*?[]const u8) !void {
     const v = json.parse(alloc, body) catch return; // 非 JSON（XML / HTML）就放过
+    // 上游人类可读消息透出（`Ctx.err_detail`）：Go 把这些 res_message /
+    // msg / errorMsg 直接包进 error（utils.go:1577 一带），用户看得到真原因。
+    // 空串不覆盖 —— 与 `Ctx.setErrDetail` 的语义一致。
+    const relay = struct {
+        fn put(slot: ?*?[]const u8, msg: []const u8) void {
+            if (slot) |sp| {
+                if (msg.len > 0) sp.* = msg;
+            }
+        }
+    }.put;
     if (v.getPath("res_code")) |rc| {
         switch (rc.*) {
             .int => |n| {
                 if (n == 0) return;
-                log.warn("[189pc] {s}: res_code {d} {s}", .{ url, n, v.strAt("res_message") orelse "" });
+                const msg = v.strAt("res_message") orelse "";
+                log.warn("[189pc] {s}: res_code {d} {s}", .{ url, n, msg });
+                relay(err_detail, msg);
                 return Error.UpstreamError;
             },
             .float => |f| {
                 if (f == 0) return;
-                log.warn("[189pc] {s}: res_code {d} {s}", .{ url, f, v.strAt("res_message") orelse "" });
+                const msg = v.strAt("res_message") orelse "";
+                log.warn("[189pc] {s}: res_code {d} {s}", .{ url, f, msg });
+                relay(err_detail, msg);
                 return Error.UpstreamError;
             },
-            .string => |s| {
+            .string => |sv| {
                 // 字符串形态只要非空就算错误 —— 哪怕它是 "0"。
-                if (s.len == 0) return;
-                log.warn("[189pc] {s}: res_code {s} {s}", .{ url, s, v.strAt("res_message") orelse "" });
+                if (sv.len == 0) return;
+                const msg = v.strAt("res_message") orelse "";
+                log.warn("[189pc] {s}: res_code {s} {s}", .{ url, sv, msg });
+                relay(err_detail, msg);
                 return Error.UpstreamError;
             },
             else => {},
@@ -716,15 +732,21 @@ fn checkRespErr(alloc: std.mem.Allocator, url: []const u8, body: []const u8) !vo
     }
     const code = v.strAt("code") orelse "";
     if (code.len > 0 and !std.mem.eql(u8, code, "SUCCESS")) {
-        log.warn("[189pc] {s}: {s} {s}", .{ url, code, v.strAt("msg") orelse v.strAt("message") orelse @as([]const u8, "") });
+        const msg = v.strAt("msg") orelse v.strAt("message") orelse @as([]const u8, "");
+        log.warn("[189pc] {s}: {s} {s}", .{ url, code, msg });
+        relay(err_detail, msg);
         return Error.UpstreamError;
     }
     if ((v.strAt("errorCode") orelse @as([]const u8, "")).len > 0) {
-        log.warn("[189pc] {s}: {s} {s}", .{ url, v.strAt("errorCode") orelse "", v.strAt("errorMsg") orelse "" });
+        const msg = v.strAt("errorMsg") orelse "";
+        log.warn("[189pc] {s}: {s} {s}", .{ url, v.strAt("errorCode") orelse "", msg });
+        relay(err_detail, msg);
         return Error.UpstreamError;
     }
     if ((v.strAt("error") orelse @as([]const u8, "")).len > 0) {
-        log.warn("[189pc] {s}: error {s}", .{ url, v.strAt("message") orelse "" });
+        const msg = v.strAt("message") orelse "";
+        log.warn("[189pc] {s}: error {s}", .{ url, msg });
+        relay(err_detail, msg);
         return Error.UpstreamError;
     }
 }
@@ -980,6 +1002,9 @@ pub const Cloud189PC = struct {
         query: []const [2][]const u8,
         is_family: bool,
         retried: bool,
+        /// 上游人类可读消息出口（`&ctx.err_detail`）。null = init/登录/
+        /// 上传链等无请求上下文的调用。
+        err_detail: ?*?[]const u8,
     ) !httpclient.Response {
         var src = std.Random.IoSource{ .io = rt.io() };
         const rnd = src.interface();
@@ -1014,19 +1039,19 @@ pub const Cloud189PC = struct {
         {
             log.info("[189pc] {s}: session invalid, refreshing", .{requestPath(url)});
             try self.refreshSession(arena, 0);
-            return self.request(arena, url, method, params, query, is_family, true);
+            return self.request(arena, url, method, params, query, is_family, true, err_detail);
         }
 
-        try checkRespErr(arena, url, res.body);
+        try checkRespErr(arena, url, res.body, err_detail);
         return res;
     }
 
-    fn getBody(self: *Cloud189PC, arena: std.mem.Allocator, url: []const u8, query: []const [2][]const u8, is_family: bool) ![]const u8 {
-        return (try self.request(arena, url, "GET", &.{}, query, is_family, false)).body;
+    fn getBody(self: *Cloud189PC, arena: std.mem.Allocator, url: []const u8, query: []const [2][]const u8, is_family: bool, err_detail: ?*?[]const u8) ![]const u8 {
+        return (try self.request(arena, url, "GET", &.{}, query, is_family, false, err_detail)).body;
     }
 
-    fn postBody(self: *Cloud189PC, arena: std.mem.Allocator, url: []const u8, query: []const [2][]const u8, is_family: bool) ![]const u8 {
-        return (try self.request(arena, url, "POST", &.{}, query, is_family, false)).body;
+    fn postBody(self: *Cloud189PC, arena: std.mem.Allocator, url: []const u8, query: []const [2][]const u8, is_family: bool, err_detail: ?*?[]const u8) ![]const u8 {
+        return (try self.request(arena, url, "POST", &.{}, query, is_family, false, err_detail)).body;
     }
 
     /// 登录流程里的裸请求：不带签名、不带 clientSuffix，失败只看 HTTP 状态码。
@@ -1066,6 +1091,7 @@ pub const Cloud189PC = struct {
         form: []const u8,
         is_family: bool,
         retried: bool,
+        err_detail: ?*?[]const u8,
     ) ![]const u8 {
         var src = std.Random.IoSource{ .io = rt.io() };
         const rnd = src.interface();
@@ -1095,10 +1121,10 @@ pub const Cloud189PC = struct {
         {
             log.info("[189pc] {s}: session invalid, refreshing", .{requestPath(url)});
             try self.refreshSession(arena, 0);
-            return self.signedFormPost(arena, url, form, is_family, true);
+            return self.signedFormPost(arena, url, form, is_family, true, err_detail);
         }
 
-        try checkRespErr(arena, url, res.body);
+        try checkRespErr(arena, url, res.body, err_detail);
         return res.body;
     }
 
@@ -1350,7 +1376,7 @@ pub const Cloud189PC = struct {
 
         const url = try std.fmt.allocPrint(arena, "{s}/getSessionForPC.action?{s}", .{ API_URL, q.slice() });
         const res = try self.client.send(arena, .{ .method = "POST", .url = url, .headers = hs.slice() });
-        try checkRespErr(arena, url, res.body);
+        try checkRespErr(arena, url, res.body, null);
 
         const v = json.parse(arena, res.body) catch return Error.UpstreamNotJson;
         try self.applySession(&v);
@@ -1398,7 +1424,7 @@ pub const Cloud189PC = struct {
                 return self.refreshToken(arena, retry);
             }
         } else |_| {}
-        try checkRespErr(arena, url, res.body);
+        try checkRespErr(arena, url, res.body, null);
         const v = json.parse(arena, res.body) catch return Error.UpstreamNotJson;
         try self.applySession(&v);
     }
@@ -1441,7 +1467,7 @@ pub const Cloud189PC = struct {
     }
 
     fn getFamilyId(self: *Cloud189PC, arena: std.mem.Allocator) ![]const u8 {
-        const body = try self.getBody(arena, API_URL ++ "/family/manage/getFamilyList.action", &.{}, true);
+        const body = try self.getBody(arena, API_URL ++ "/family/manage/getFamilyList.action", &.{}, true, null);
         const v = json.parse(arena, body) catch return Error.UpstreamNotJson;
         const infos = if (v.getPath("familyInfoResp")) |p| p.asArray() orelse &.{} else &.{};
         if (infos.len == 0) {
@@ -1486,6 +1512,7 @@ pub const Cloud189PC = struct {
         size: i64,
         order_by: []const u8,
         order_direction: []const u8,
+        err_detail: ?*?[]const u8,
     ) !Page {
         const url = if (self.isFamily())
             API_URL ++ "/family/file/listFiles.action"
@@ -1509,7 +1536,7 @@ pub const Cloud189PC = struct {
             try entries.append(.{ "descending", toDesc(order_direction) });
         }
 
-        const body = try self.getBody(arena, url, entries.slice(), self.isFamily());
+        const body = try self.getBody(arena, url, entries.slice(), self.isFamily(), err_detail);
         const v = json.parse(arena, body) catch return Error.UpstreamNotJson;
         const ao = v.getPath("fileListAO") orelse return .{ .count = 0, .folders = &.{}, .files = &.{} };
         return .{
@@ -1519,7 +1546,7 @@ pub const Cloud189PC = struct {
         };
     }
 
-    fn getFiles(self: *Cloud189PC, alloc: std.mem.Allocator, folder_id: []const u8) ![]model.Obj {
+    fn getFiles(self: *Cloud189PC, alloc: std.mem.Allocator, folder_id: []const u8, err_detail: ?*?[]const u8) ![]model.Obj {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1527,7 +1554,7 @@ pub const Cloud189PC = struct {
         var out = List(model.Obj).init(alloc);
         var page_num: i64 = 1;
         while (true) {
-            const page = try self.listPage(a, folder_id, page_num, @intCast(page_size), self.cfg.order_by, self.cfg.order_direction);
+            const page = try self.listPage(a, folder_id, page_num, @intCast(page_size), self.cfg.order_by, self.cfg.order_direction, err_detail);
             if (page.count == 0) break;
 
             for (page.folders) |item| {
@@ -1564,19 +1591,19 @@ pub const Cloud189PC = struct {
         return out.toOwned();
     }
 
-    fn resolve(self: *Cloud189PC, arena: std.mem.Allocator, path: []const u8) !Entry {
+    fn resolve(self: *Cloud189PC, arena: std.mem.Allocator, path: []const u8, err_detail: ?*?[]const u8) !Entry {
         var cur = Entry{ .id = self.cfg.root_folder_id, .name = "/", .is_dir = true };
         var it = std.mem.tokenizeAny(u8, path, "/\\");
         while (it.next()) |seg| {
-            cur = try self.findChild(arena, cur.id, seg);
+            cur = try self.findChild(arena, cur.id, seg, err_detail);
         }
         return cur;
     }
 
-    fn findChild(self: *Cloud189PC, arena: std.mem.Allocator, parent_id: []const u8, name: []const u8) !Entry {
+    fn findChild(self: *Cloud189PC, arena: std.mem.Allocator, parent_id: []const u8, name: []const u8, err_detail: ?*?[]const u8) !Entry {
         var page_num: i64 = 1;
         while (true) {
-            const page = try self.listPage(arena, parent_id, page_num, @intCast(page_size), "filename", "asc");
+            const page = try self.listPage(arena, parent_id, page_num, @intCast(page_size), "filename", "asc", err_detail);
             if (page.count == 0) return driver.Error.NotFound;
             // ⚠️ `name` 是调用方给的路径段（已经过 `normalizeName`，因为 list 返回的
             // 就是归一化后的名字）。服务端返回的是**原始名**，可能含 `\'`。不归一化
@@ -1644,6 +1671,7 @@ pub const Cloud189PC = struct {
         target_folder_id: []const u8,
         tasks: []const Entry,
         other: []const [2][]const u8,
+        err_detail: ?*?[]const u8,
     ) ![]const u8 {
         var tasks_buf = Buf.init(arena);
         try writeTaskInfos(&tasks_buf, tasks);
@@ -1662,26 +1690,26 @@ pub const Cloud189PC = struct {
 
         // 上游 `y.CreateBatchTask` 经 `y.post` → `y.request`，带 clientSuffix + 签名；
         // familyID 非空时（familyId 已在 form 里）用 family 会话签名。
-        const body = try self.signedFormPost(arena, API_URL ++ "/batch/createBatchTask.action", f.slice(), self.isFamily(), false);
+        const body = try self.signedFormPost(arena, API_URL ++ "/batch/createBatchTask.action", f.slice(), self.isFamily(), false, err_detail);
         const v = json.parse(arena, body) catch return Error.UpstreamNotJson;
         return v.strAt("taskId") orelse return Error.InvalidResponse;
     }
 
-    fn checkBatchTask(self: *Cloud189PC, arena: std.mem.Allocator, kind: []const u8, task_id: []const u8) !i64 {
+    fn checkBatchTask(self: *Cloud189PC, arena: std.mem.Allocator, kind: []const u8, task_id: []const u8, err_detail: ?*?[]const u8) !i64 {
         var f = urlmod.Query.init(arena);
         defer f.deinit();
         try f.add("type", kind);
         try f.add("taskId", task_id);
         // 上游 `y.CheckBatchTask` 经 `y.post`，但没传 isFamily，所以始终用个人会话签名。
-        const body = try self.signedFormPost(arena, API_URL ++ "/batch/checkBatchTask.action", f.slice(), false, false);
+        const body = try self.signedFormPost(arena, API_URL ++ "/batch/checkBatchTask.action", f.slice(), false, false, err_detail);
         const v = json.parse(arena, body) catch return Error.UpstreamNotJson;
         return v.intAt("taskStatus") orelse 0;
     }
 
     /// `WaitBatchTask` —— 1 初始化 / 2 冲突 / 3 执行中 / 4 完成。
-    fn waitBatchTask(self: *Cloud189PC, arena: std.mem.Allocator, kind: []const u8, task_id: []const u8, interval_ms: i64) !void {
+    fn waitBatchTask(self: *Cloud189PC, arena: std.mem.Allocator, kind: []const u8, task_id: []const u8, interval_ms: i64, err_detail: ?*?[]const u8) !void {
         while (true) {
-            const st = try self.checkBatchTask(arena, kind, task_id);
+            const st = try self.checkBatchTask(arena, kind, task_id, err_detail);
             if (st == 2) {
                 log.warn("[189pc] 批量任务 {s} 撞上同名目标", .{task_id});
                 return Error.Conflict;
@@ -1697,13 +1725,13 @@ pub const Cloud189PC = struct {
 
     fn list(ptr: *anyopaque, ctx: *driver.Ctx, dir: []const u8) anyerror![]model.Obj {
         const self = as(ptr);
-        const e = try self.resolve(ctx.alloc, dir);
-        return self.getFiles(ctx.alloc, e.id);
+        const e = try self.resolve(ctx.alloc, dir, &ctx.err_detail);
+        return self.getFiles(ctx.alloc, e.id, &ctx.err_detail);
     }
 
     fn details(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8) anyerror!model.File {
         const self = as(ptr);
-        const e = try self.resolve(ctx.alloc, path);
+        const e = try self.resolve(ctx.alloc, path, &ctx.err_detail);
         return model.File.fromObj(.{
             .name = e.name,
             .size = e.size,
@@ -1717,7 +1745,7 @@ pub const Cloud189PC = struct {
         const self = as(ptr);
         const a = ctx.alloc;
 
-        const e = try self.resolve(a, path);
+        const e = try self.resolve(a, path, &ctx.err_detail);
         const url = if (self.isFamily())
             API_URL ++ "/family/file/getFileDownloadUrl.action"
         else
@@ -1732,7 +1760,7 @@ pub const Cloud189PC = struct {
             try entries.append(.{ "flag", "1" });
         }
 
-        const body = try self.getBody(a, url, entries.slice(), self.isFamily());
+        const body = try self.getBody(a, url, entries.slice(), self.isFamily(), &ctx.err_detail);
         const v = json.parse(a, body) catch return Error.UpstreamNotJson;
         const raw = v.strAt("fileDownloadUrl") orelse return Error.InvalidResponse;
         const first = try normalizeDownloadUrl(a, raw);
@@ -1766,7 +1794,7 @@ pub const Cloud189PC = struct {
 
         const name = lastSegment(dir);
         if (name.len == 0) return Error.InvalidPath;
-        const parent = try self.resolve(a, parentOf(dir));
+        const parent = try self.resolve(a, parentOf(dir), &ctx.err_detail);
 
         const url = if (self.isFamily())
             API_URL ++ "/family/file/createFolder.action"
@@ -1782,20 +1810,20 @@ pub const Cloud189PC = struct {
         } else {
             try entries.append(.{ "parentFolderId", parent.id });
         }
-        _ = try self.postBody(a, url, entries.slice(), self.isFamily());
+        _ = try self.postBody(a, url, entries.slice(), self.isFamily(), &ctx.err_detail);
     }
 
     fn move(ptr: *anyopaque, ctx: *driver.Ctx, src_path: []const u8, dst_dir: []const u8) anyerror!void {
         const self = as(ptr);
         const a = ctx.alloc;
-        const src = try self.resolve(a, src_path);
-        const dst = try self.resolve(a, dst_dir);
+        const src = try self.resolve(a, src_path, &ctx.err_detail);
+        const dst = try self.resolve(a, dst_dir, &ctx.err_detail);
 
         // 上游把目标目录的**名字**放在 targetFileName 里（不是要改成的名字）。
         const other = [1][2][]const u8{.{ "targetFileName", dst.name }};
         const tasks = [1]Entry{src};
-        const task_id = try self.createBatchTask(a, "MOVE", dst.id, &tasks, &other);
-        try self.waitBatchTask(a, "MOVE", task_id, 400);
+        const task_id = try self.createBatchTask(a, "MOVE", dst.id, &tasks, &other, &ctx.err_detail);
+        try self.waitBatchTask(a, "MOVE", task_id, 400, &ctx.err_detail);
     }
 
     /// Go `drivers/189pc/driver.go:327-345`：COPY 与 MOVE 一样是
@@ -1808,30 +1836,30 @@ pub const Cloud189PC = struct {
     fn copy(ptr: *anyopaque, ctx: *driver.Ctx, src_path: []const u8, dst_dir: []const u8) anyerror!void {
         const self = as(ptr);
         const a = ctx.alloc;
-        const src = try self.resolve(a, src_path);
-        const dst = try self.resolve(a, dst_dir);
+        const src = try self.resolve(a, src_path, &ctx.err_detail);
+        const dst = try self.resolve(a, dst_dir, &ctx.err_detail);
 
         const other = [1][2][]const u8{.{ "targetFileName", dst.name }};
         const tasks = [1]Entry{src};
-        const task_id = try self.createBatchTask(a, "COPY", dst.id, &tasks, &other);
-        try self.waitBatchTask(a, "COPY", task_id, 1000);
+        const task_id = try self.createBatchTask(a, "COPY", dst.id, &tasks, &other, &ctx.err_detail);
+        try self.waitBatchTask(a, "COPY", task_id, 1000, &ctx.err_detail);
     }
 
     fn remove(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, is_dir: bool) anyerror!void {
         const self = as(ptr);
         const a = ctx.alloc;
-        var src = try self.resolve(a, path);
+        var src = try self.resolve(a, path, &ctx.err_detail);
         if (is_dir) src.is_dir = true;
         const tasks = [1]Entry{src};
-        const task_id = try self.createBatchTask(a, "DELETE", "", &tasks, &.{});
+        const task_id = try self.createBatchTask(a, "DELETE", "", &tasks, &.{}, &ctx.err_detail);
         // 上游注释：批量任务过快会导致删不掉。
-        try self.waitBatchTask(a, "DELETE", task_id, 200);
+        try self.waitBatchTask(a, "DELETE", task_id, 200, &ctx.err_detail);
     }
 
     fn rename(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, new_name: []const u8) anyerror!void {
         const self = as(ptr);
         const a = ctx.alloc;
-        const src = try self.resolve(a, path);
+        const src = try self.resolve(a, path, &ctx.err_detail);
 
         var entries = List([2][]const u8).init(a);
         var url: []const u8 = undefined;
@@ -1856,13 +1884,13 @@ pub const Cloud189PC = struct {
             try entries.append(.{ "fileId", src.id });
             try entries.append(.{ "destFileName", new_name });
         }
-        _ = try self.request(a, url, method, &.{}, entries.slice(), self.isFamily(), false);
+        _ = try self.request(a, url, method, &.{}, entries.slice(), self.isFamily(), false, &ctx.err_detail);
     }
 
     fn space(ptr: *anyopaque, ctx: *driver.Ctx) anyerror!driver.DiskUsage {
         const self = as(ptr);
         const a = ctx.alloc;
-        const body = try self.getBody(a, API_URL ++ "/portal/getUserSizeInfo.action", &.{}, false);
+        const body = try self.getBody(a, API_URL ++ "/portal/getUserSizeInfo.action", &.{}, false, &ctx.err_detail);
         const v = json.parse(a, body) catch return Error.UpstreamNotJson;
         return if (self.isFamily()) .{
             .total = v.intAt("familyCapacityInfo.totalSize") orelse 0,
@@ -1901,6 +1929,7 @@ pub const Cloud189PC = struct {
             &.{},
             self.isFamily(),
             false,
+            null,
         );
         const v = json.parse(arena, res.body) catch return Error.UpstreamNotJson;
 
@@ -2062,6 +2091,7 @@ pub const Cloud189PC = struct {
             &.{},
             self.isFamily(),
             false,
+            null,
         )).body;
         const init_v = json.parse(a, body) catch return Error.UpstreamNotJson;
         const data = init_v.getPath("data") orelse return Error.InvalidResponse;
@@ -2173,6 +2203,7 @@ pub const Cloud189PC = struct {
             &.{},
             self.isFamily(),
             false,
+            null,
         );
         // 流式路径的最后一片已在循环里报过进度，这里补一个收尾的 100%。
         if (ctx.progress) |f| f(ctx.progress_userdata, 100);
@@ -2225,6 +2256,7 @@ pub const Cloud189PC = struct {
             &.{},
             self.isFamily(),
             false,
+            null,
         )).body;
         const init_v = json.parse(a, body) catch return Error.UpstreamNotJson;
         const data = init_v.getPath("data") orelse return Error.InvalidResponse;
@@ -2273,6 +2305,7 @@ pub const Cloud189PC = struct {
             &.{},
             self.isFamily(),
             false,
+            null,
         );
         // fast 路径的字节只在「算整文件 MD5」时流经本地，提交完成后报 100%。
         if (ctx.progress) |f| f(ctx.progress_userdata, 100);
@@ -2284,7 +2317,7 @@ pub const Cloud189PC = struct {
 
         const name = lastSegment(dst);
         if (name.len == 0) return Error.InvalidPath;
-        const dir = try self.resolve(a, parentOf(dst));
+        const dir = try self.resolve(a, parentOf(dst), &ctx.err_detail);
         if (!dir.is_dir) return Error.InvalidPath;
 
         // `rapid` 先算 MD5 好秒传；`stream` 遇到 0 字节文件也只能走 fast ——

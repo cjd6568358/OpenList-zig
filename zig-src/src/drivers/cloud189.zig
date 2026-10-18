@@ -452,6 +452,9 @@ pub const Cloud189 = struct {
         method: []const u8,
         form: ?[]const u8,
         retried: bool,
+        /// 上游人类可读消息出口（`&ctx.err_detail`）。null = init / 登录 /
+        /// session 探测等非请求上下文。
+        err_detail: ?*?[]const u8,
     ) ![]const u8 {
         var src = std.Random.IoSource{ .io = rt.io() };
         const nc = try noCache(arena, src.interface());
@@ -483,17 +486,26 @@ pub const Cloud189 = struct {
                     if (retried) return driver.Error.AuthFailed;
                     log.info("[189] session expired, logging in again", .{});
                     try self.newLogin(arena);
-                    return self.request(arena, url, method, form, true);
+                    return self.request(arena, url, method, form, true, err_detail);
                 }
-                log.warn("[189] {s}: {s} {s}", .{ url, ec, v.strAt("errorMsg") orelse "" });
+                const emsg = v.strAt("errorMsg") orelse "";
+                log.warn("[189] {s}: {s} {s}", .{ url, ec, emsg });
+                // 透出上游消息（Go 把 res_message 包进 error，util.go:173-175）。
+                if (err_detail) |slot| {
+                    if (emsg.len > 0) slot.* = emsg;
+                }
                 return Error.UpstreamError;
             }
             const rc = v.intAt("res_code") orelse 0;
             if (rc != 0) {
+                const rmsg = v.strAt("res_message") orelse "";
                 log.warn("[189] {s}: res_code {d} {s} | body: {s}", .{
-                    url, rc, v.strAt("res_message") orelse "",
+                    url, rc, rmsg,
                     res.body[0..@min(res.body.len, 160)],
                 });
+                if (err_detail) |slot| {
+                    if (rmsg.len > 0) slot.* = rmsg;
+                }
                 return Error.UpstreamError;
             }
         } else |_| {
@@ -716,7 +728,7 @@ pub const Cloud189 = struct {
     /// 条数还是总数，文档没说；若它是总数，一个非空目录会永远翻不完。这里
     /// 额外加了「本页两个列表都空」这个短路 —— 真机上只可能是多发了最后一
     /// 次请求，不会死循环。
-    fn listPage(self: *Cloud189, arena: std.mem.Allocator, folder_id: []const u8, page_num: i64) !Page {
+    fn listPage(self: *Cloud189, arena: std.mem.Allocator, folder_id: []const u8, page_num: i64, err_detail: ?*?[]const u8) !Page {
         var q = urlmod.Query.init(arena);
         try q.addInt("pageSize", page_size);
         try q.addInt("pageNum", page_num);
@@ -727,7 +739,7 @@ pub const Cloud189 = struct {
         try q.add("descending", "true");
 
         const url = try std.fmt.allocPrint(arena, "{s}?{s}", .{ path_list, q.slice() });
-        const body = try self.request(arena, url, "GET", null, false);
+        const body = try self.request(arena, url, "GET", null, false, err_detail);
         const v = json.parse(arena, body) catch return Error.UpstreamNotJson;
 
         const ao = v.getPath("fileListAO") orelse return .{ .count = 0, .folders = &.{}, .files = &.{} };
@@ -748,7 +760,7 @@ pub const Cloud189 = struct {
         return alloc.dupe(u8, s orelse "");
     }
 
-    fn getFiles(self: *Cloud189, alloc: std.mem.Allocator, folder_id: []const u8) ![]model.Obj {
+    fn getFiles(self: *Cloud189, alloc: std.mem.Allocator, folder_id: []const u8, err_detail: ?*?[]const u8) ![]model.Obj {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -756,7 +768,7 @@ pub const Cloud189 = struct {
         var out = List(model.Obj).init(alloc);
         var page_num: i64 = 1;
         while (true) {
-            const page = try self.listPage(a, folder_id, page_num);
+            const page = try self.listPage(a, folder_id, page_num, err_detail);
             if (page.count == 0 or (page.folders.len == 0 and page.files.len == 0)) break;
 
             for (page.folders) |item| {
@@ -782,19 +794,19 @@ pub const Cloud189 = struct {
         return out.toOwned();
     }
 
-    fn resolve(self: *Cloud189, arena: std.mem.Allocator, path: []const u8) !Entry {
+    fn resolve(self: *Cloud189, arena: std.mem.Allocator, path: []const u8, err_detail: ?*?[]const u8) !Entry {
         var cur = Entry{ .id = self.cfg.root_folder_id, .name = "/", .is_dir = true };
         var it = std.mem.tokenizeAny(u8, path, "/\\");
         while (it.next()) |seg| {
-            cur = try self.findChild(arena, cur.id, seg);
+            cur = try self.findChild(arena, cur.id, seg, err_detail);
         }
         return cur;
     }
 
-    fn findChild(self: *Cloud189, arena: std.mem.Allocator, parent_id: []const u8, name: []const u8) !Entry {
+    fn findChild(self: *Cloud189, arena: std.mem.Allocator, parent_id: []const u8, name: []const u8, err_detail: ?*?[]const u8) !Entry {
         var page_num: i64 = 1;
         while (true) {
-            const page = try self.listPage(arena, parent_id, page_num);
+            const page = try self.listPage(arena, parent_id, page_num, err_detail);
             if (page.count == 0 or (page.folders.len == 0 and page.files.len == 0)) {
                 return driver.Error.NotFound;
             }
@@ -828,14 +840,14 @@ pub const Cloud189 = struct {
 
     fn list(ptr: *anyopaque, ctx: *driver.Ctx, dir: []const u8) anyerror![]model.Obj {
         const self = as(ptr);
-        const e = try self.resolve(ctx.alloc, dir);
-        return self.getFiles(ctx.alloc, e.id);
+        const e = try self.resolve(ctx.alloc, dir, &ctx.err_detail);
+        return self.getFiles(ctx.alloc, e.id, &ctx.err_detail);
     }
 
     fn details(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8) anyerror!model.File {
         const self = as(ptr);
         const a = ctx.alloc;
-        const e = try self.resolve(a, path);
+        const e = try self.resolve(a, path, &ctx.err_detail);
         // size 不能恒 0：Go 的 Get（drivers/189/driver.go:211-221）报的是
         // 列表接口返回的真 size，前端/WebDAV 都读它（2026-10-18 修复，
         // 见 Entry.size 注释）。
@@ -851,9 +863,9 @@ pub const Cloud189 = struct {
         const self = as(ptr);
         const a = ctx.alloc;
 
-        const e = try self.resolve(a, path);
+        const e = try self.resolve(a, path, &ctx.err_detail);
         const url = try std.fmt.allocPrint(a, "{s}?fileId={s}", .{ path_file_info, e.id });
-        const body = try self.request(a, url, "GET", null, false);
+        const body = try self.request(a, url, "GET", null, false, &ctx.err_detail);
         const v = json.parse(a, body) catch return Error.UpstreamNotJson;
         const raw = v.strAt("downloadUrl") orelse return Error.InvalidResponse;
 
@@ -890,16 +902,16 @@ pub const Cloud189 = struct {
 
         const name = lastSegment(dir);
         if (name.len == 0) return Error.InvalidPath;
-        const parent = try self.resolve(a, parentOf(dir));
+        const parent = try self.resolve(a, parentOf(dir), &ctx.err_detail);
 
         var q = urlmod.Query.init(a);
         try q.add("parentFolderId", parent.id);
         try q.add("folderName", name);
-        _ = try self.request(a, path_mkdir, "POST", q.slice(), false);
+        _ = try self.request(a, path_mkdir, "POST", q.slice(), false, &ctx.err_detail);
     }
 
     /// 移动/删除都走 `createBatchTask`，只有 `type` 不同。
-    fn batchTask(self: *Cloud189, a: std.mem.Allocator, kind: []const u8, src: Entry, target: []const u8) !void {
+    fn batchTask(self: *Cloud189, a: std.mem.Allocator, kind: []const u8, src: Entry, target: []const u8, err_detail: ?*?[]const u8) !void {
         var infos = Buf.init(a);
         try infos.appendByte('[');
         try infos.appendByte('{');
@@ -921,15 +933,15 @@ pub const Cloud189 = struct {
         try q.add("type", kind);
         try q.add("targetFolderId", target);
         try q.add("taskInfos", infos.slice());
-        _ = try self.request(a, path_batch, "POST", q.slice(), false);
+        _ = try self.request(a, path_batch, "POST", q.slice(), false, err_detail);
     }
 
     fn move(ptr: *anyopaque, ctx: *driver.Ctx, src_path: []const u8, dst_dir: []const u8) anyerror!void {
         const self = as(ptr);
         const a = ctx.alloc;
-        const src = try self.resolve(a, src_path);
-        const dst = try self.resolve(a, dst_dir);
-        try self.batchTask(a, "MOVE", src, dst.id);
+        const src = try self.resolve(a, src_path, &ctx.err_detail);
+        const dst = try self.resolve(a, dst_dir, &ctx.err_detail);
+        try self.batchTask(a, "MOVE", src, dst.id, &ctx.err_detail);
     }
 
     /// Go `drivers/189/driver.go` 的 Copy 与 Move 同形，只有 `type` 不同
@@ -937,40 +949,40 @@ pub const Cloud189 = struct {
     fn copy(ptr: *anyopaque, ctx: *driver.Ctx, src_path: []const u8, dst_dir: []const u8) anyerror!void {
         const self = as(ptr);
         const a = ctx.alloc;
-        const src = try self.resolve(a, src_path);
-        const dst = try self.resolve(a, dst_dir);
-        try self.batchTask(a, "COPY", src, dst.id);
+        const src = try self.resolve(a, src_path, &ctx.err_detail);
+        const dst = try self.resolve(a, dst_dir, &ctx.err_detail);
+        try self.batchTask(a, "COPY", src, dst.id, &ctx.err_detail);
     }
 
     fn remove(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, is_dir: bool) anyerror!void {
         const self = as(ptr);
         const a = ctx.alloc;
-        var src = try self.resolve(a, path);
+        var src = try self.resolve(a, path, &ctx.err_detail);
         if (is_dir) src.is_dir = true;
-        try self.batchTask(a, "DELETE", src, "");
+        try self.batchTask(a, "DELETE", src, "", &ctx.err_detail);
     }
 
     fn rename(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, new_name: []const u8) anyerror!void {
         const self = as(ptr);
         const a = ctx.alloc;
-        const src = try self.resolve(a, path);
+        const src = try self.resolve(a, path, &ctx.err_detail);
 
         var q = urlmod.Query.init(a);
         if (src.is_dir) {
             try q.add("folderId", src.id);
             try q.add("destFolderName", new_name);
-            _ = try self.request(a, path_rename_folder, "POST", q.slice(), false);
+            _ = try self.request(a, path_rename_folder, "POST", q.slice(), false, &ctx.err_detail);
         } else {
             try q.add("fileId", src.id);
             try q.add("destFileName", new_name);
-            _ = try self.request(a, path_rename_file, "POST", q.slice(), false);
+            _ = try self.request(a, path_rename_file, "POST", q.slice(), false, &ctx.err_detail);
         }
     }
 
     fn space(ptr: *anyopaque, ctx: *driver.Ctx) anyerror!driver.DiskUsage {
         const self = as(ptr);
         const a = ctx.alloc;
-        const body = try self.request(a, path_capacity, "GET", null, false);
+        const body = try self.request(a, path_capacity, "GET", null, false, &ctx.err_detail);
         const v = json.parse(a, body) catch return Error.UpstreamNotJson;
         return .{
             .total = v.intAt("cloudCapacityInfo.totalSize") orelse 0,
@@ -983,7 +995,7 @@ pub const Cloud189 = struct {
     // -----------------------------------------------------------------------
 
     fn getSessionKey(self: *Cloud189, arena: std.mem.Allocator) ![]const u8 {
-        const body = try self.request(arena, path_user_brief, "GET", null, false);
+        const body = try self.request(arena, path_user_brief, "GET", null, false, null);
         const v = json.parse(arena, body) catch return Error.UpstreamNotJson;
         return v.strAt("sessionKey") orelse return Error.InvalidResponse;
     }
@@ -992,7 +1004,7 @@ pub const Cloud189 = struct {
         const now = rt.nowMillis();
         if (self.rsa_expire > now and self.rsa_pub_key.len > 0) return;
 
-        const body = try self.request(arena, path_rsa_key, "GET", null, false);
+        const body = try self.request(arena, path_rsa_key, "GET", null, false, null);
         const v = json.parse(arena, body) catch return Error.UpstreamNotJson;
         const new_key = v.strAt("pubKey") orelse return Error.InvalidResponse;
         const id = v.strAt("pkId") orelse return Error.InvalidResponse;
@@ -1219,7 +1231,7 @@ pub const Cloud189 = struct {
 
         const name = lastSegment(dst);
         if (name.len == 0) return Error.InvalidPath;
-        const dir = try self.resolve(a, parentOf(dst));
+        const dir = try self.resolve(a, parentOf(dst), &ctx.err_detail);
         if (!dir.is_dir) return Error.InvalidPath;
 
         try self.newUpload(a, dir, name, src, ctx);
