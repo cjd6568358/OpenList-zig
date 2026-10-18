@@ -20,7 +20,9 @@
 //!      普通 PUT（≤10MB）或 OSS 分片（>10MB）。
 //!
 //! 与 Go 版的差异（有意为之）：二维码登录未移植（需要 qrcode 会话状态机，
-//! 而用户配置走的是 Cookie）；离线下载未移植；`Copy` vtable 没有槽位。
+//! 而用户配置走的是 Cookie）；离线下载未移植（Go 侧也只有无人调用的死方法）。
+//! `Copy` **已实现**（vtable 有槽位，走 `files/copy`；2026-10-18 对账修正了
+//! 这里「没有槽位」的错误注释）。
 
 const std = @import("std");
 const driver = @import("../driver.zig");

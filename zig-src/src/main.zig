@@ -24,6 +24,7 @@ const client = @import("client.zig");
 const cookiejar = @import("cookiejar.zig");
 const List = @import("util/buf.zig").List;
 const rt = @import("rt.zig");
+const rand = @import("util/random.zig");
 
 pub const version = "0.1.0-zig";
 
@@ -352,52 +353,6 @@ fn onSignal(_: std.posix.SIG) callconv(.c) void {
 // CLI 子命令（对齐 Go `cmd/admin.go` + `internal/bootstrap/data/user.go`）
 // ---------------------------------------------------------------------------
 
-/// 字母数字字符集，与 Go `pkg/utils/random/random.go` 的 `letterBytes` 逐字一致。
-const rand_letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-
-/// Go `random.String(n)`：n 位字母数字，取自 `crypto/rand`。
-/// 0.17 移除了 `std.crypto.random`，熵改从 `Io` 句柄取（`rt.io().random`，
-/// ChaCha CSPRNG，种子来自 OS）—— 与 config.zig 的 `randomSecret` 同一套做法。
-fn randomString(buf: []u8) []const u8 {
-    var raw: [1]u8 = undefined;
-    for (buf) |*c| {
-        rt.io().random(&raw);
-        c.* = rand_letters[raw[0] % rand_letters.len];
-    }
-    return buf;
-}
-
-/// RFC 4122 v4 UUID，小写带连字符 —— 与 Go `google/uuid` 的 `NewString()` 同形。
-fn formatUuidV4(out: *[36]u8) void {
-    var b: [16]u8 = undefined;
-    rt.io().random(&b);
-    b[6] = (b[6] & 0x0f) | 0x40; // version 4
-    b[8] = (b[8] & 0x3f) | 0x80; // variant 10xx
-    const hex = "0123456789abcdef";
-    var i: usize = 0;
-    var j: usize = 0;
-    while (i < 16) : (i += 1) {
-        if (i == 4 or i == 6 or i == 8 or i == 10) {
-            out[j] = '-';
-            j += 1;
-        }
-        out[j] = hex[b[i] >> 4];
-        out[j + 1] = hex[b[i] & 0x0f];
-        j += 2;
-    }
-}
-
-/// Go `random.Token()` = `"openlist-" + uuid.NewString() + String(64)`。
-/// `buf` 至少要 9 + 36 + 64 = 109 字节。
-fn randomToken(buf: []u8) []const u8 {
-    var uuid: [36]u8 = undefined;
-    formatUuidV4(&uuid);
-    const head = std.fmt.bufPrint(buf, "openlist-{s}", .{uuid}) catch return buf[0..0];
-    const n = head.len;
-    _ = randomString(buf[n .. n + 64]);
-    return buf[0 .. n + 64];
-}
-
 /// 对齐 Go `internal/bootstrap/data/user.go:initAdmin`。
 ///
 /// 无管理员时：设了 `OPENLIST_ADMIN_PASSWORD` 就以 `admin` 为用户名建管理员，
@@ -428,7 +383,7 @@ fn initAdminFromEnv(init: std.process.Init, cfg: *config.Config) !void {
 fn ensureToken(cfg: *config.Config) !void {
     if (cfg.raw("zig.token") != null) return;
     var buf: [128]u8 = undefined;
-    const gen = randomToken(&buf);
+    const gen = rand.randomToken(&buf);
     try cfg.putZig("token", .{ .string = try cfg.allocator().dupe(u8, gen) });
     try cfg.save();
 }
@@ -453,7 +408,7 @@ fn runAdmin(cfg: *config.Config, gpa: std.mem.Allocator, act: AdminCmd) !void {
         .random => {
             if (!has_admin) return error.NoAdministrator;
             var buf: [8]u8 = undefined;
-            const pwd = randomString(&buf);
+            const pwd = rand.randomString(&buf);
             try setAdminPassword(cfg, pwd);
             std.debug.print("admin user has been updated:\nusername: {s}\npassword: {s}\n", .{ username, pwd });
             notifyReload(cfg, gpa);
@@ -471,7 +426,7 @@ fn runAdmin(cfg: *config.Config, gpa: std.mem.Allocator, act: AdminCmd) !void {
             if (cfg.raw("zig.token")) |v| tok = v.asStr() orelse "";
             if (tok.len == 0) {
                 var buf: [128]u8 = undefined;
-                const gen = randomToken(&buf);
+                const gen = rand.randomToken(&buf);
                 const owned = try ca.dupe(u8, gen);
                 try cfg.putZig("token", .{ .string = owned });
                 try cfg.save();
@@ -661,13 +616,13 @@ test "version string is non-empty" {
 
 test "randomString / randomToken match Go's alphabet and shape" {
     var buf: [8]u8 = undefined;
-    const s = randomString(&buf);
+    const s = rand.randomString(&buf);
     try testing.expectEqual(@as(usize, 8), s.len);
-    for (s) |c| try testing.expect(std.mem.indexOfScalar(u8, rand_letters, c) != null);
+    for (s) |c| try testing.expect(std.ascii.isAlphanumeric(c));
 
     // Go `random.Token()` = "openlist-" + uuid(36) + String(64)
     var tbuf: [128]u8 = undefined;
-    const t = randomToken(&tbuf);
+    const t = rand.randomToken(&tbuf);
     try testing.expect(std.mem.startsWith(u8, t, "openlist-"));
     try testing.expectEqual(@as(usize, "openlist-".len + 36 + 64), t.len);
     const uuid = t["openlist-".len..][0..36];

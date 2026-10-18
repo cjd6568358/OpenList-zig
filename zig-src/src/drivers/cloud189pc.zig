@@ -2339,7 +2339,7 @@ pub const factory = driver.Factory{
     .secrets = &.{ "password", "access_token", "refresh_token", "sms_code" },
     .addition_schema =
     \\{
-    \\  "login_type":       {"type":"select","default":"password","options":["password","qrcode"],"help":"qrcode 本工程不支持（无法把二维码回传前端）"},
+    \\  "login_type":       {"type":"select","default":"password","options":["password","qrcode"],"help":"qrcode 本工程不支持（无法把二维码回传前端）。Go meta 标 required:true；本工程允许 token-only 配置（有 access_token/refresh_token 时账密可空），故不标 —— 有意偏差"},
     \\  "username":         {"type":"string","help":"有 access_token / refresh_token 时可不填"},
     \\  "password":         {"type":"string","secret":true,"help":"有 access_token / refresh_token 时可不填"},
     \\  "validate_code":    {"type":"string","help":"图形验证码。本工程不能 OCR，触发时建议改填 token"},

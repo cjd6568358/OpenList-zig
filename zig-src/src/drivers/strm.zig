@@ -867,7 +867,7 @@ pub const factory = driver.Factory{
     \\  "SaveStrmToLocal":    {"type":"bool","default":false,"help":"把 strm 文件写到本地目录"},
     \\  "SaveStrmLocalPath":  {"type":"text","help":"strm 本地保存目录"},
     \\  "SaveLocalMode":      {"type":"select","options":"insert,update,sync","default":"insert","help":"本地写入模式"},
-    \\  "Version":            {"type":"number","default":5,"help":"配置版本（自动迁移）"}
+    \\  "Version":            {"type":"number","default":0,"help":"配置版本：0/缺省触发迁移（补后缀清单、强制 PathPrefix=/d），迁移后为 5。Go 的 Addition 默认就是 0，以前这里写 5 会让新建配置跳过迁移"}
     \\}
     ,
     .create = create,

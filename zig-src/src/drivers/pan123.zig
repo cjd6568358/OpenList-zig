@@ -868,6 +868,10 @@ fn uploadPresigned(self: *Pan123, a: std.mem.Allocator, data: *const json.Value,
         // 单片的 getS3Auth 与批量的 getS3PreSignedUrls 字段名一致、顺序不同。
         const auth_body = try std.fmt.allocPrint(a,
             "{{\"bucket\":{s},\"key\":{s},\"partNumberEnd\":{d},\"partNumberStart\":{d},\"uploadId\":{s},\"StorageNode\":{s}}}",
+            // ⚠ 与 Go 差 1 是**有意的**：Go 发 `partNumberEnd=end`（end = min(start+10, count+1)）
+            // 但只上传 [start, end-1]，每批多要一个用不到的 URL；这里发 end-1，
+            // 恰好覆盖本批实际使用的片。单片路径（count=1）真机通过证明上游按
+            // inclusive 语义返回（若按半开区间，这里会少一个 URL 而单片必挂）。
             .{ try jsonQuote(a, bucket), try jsonQuote(a, key), end - 1, start, try jsonQuote(a, upload_id), try jsonQuote(a, storage_node) },
         );
         const res_body = try self.post(a, ep, auth_body, err_detail);

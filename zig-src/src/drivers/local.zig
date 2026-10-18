@@ -96,7 +96,11 @@ pub const Addition = struct {
         return a;
     }
 
-    /// `mkdir_perm` → 八进制 mode。非法值退回 Go 的默认 `0o777`。
+    /// `mkdir_perm` → 八进制 mode。非法值退回 `0o777`。
+    ///
+    /// ⚠ 与 Go 的差异：Go `driver.go:51-59` 在 Init 里 `ParseUint` 失败会
+    /// **让存储启动失败**；本工程静默回落（用户少填一个 0 不至于整盘挂掉）。
+    /// 这是有意的宽松，不是漏判 —— 但配置校验确实比 Go 弱（AUDIT §3.1-C3）。
     pub fn mkdirMode(self: Addition) u32 {
         const s = std.mem.trim(u8, self.mkdir_perm, " \t");
         if (s.len == 0) return 0o777;

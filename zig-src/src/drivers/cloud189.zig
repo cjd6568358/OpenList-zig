@@ -19,10 +19,12 @@
 //!     （16~31 字节），不是加密用的那 16 字节。
 //!
 //! 未移植：
-//!   * `Copy` —— 本工程的 vtable 没有这个槽位（见 `src/driver.zig` 文件头）。
 //!   * `newUpload` 里那个 fire-and-forget 的 torrent 生成 goroutine —— 它在
 //!     goroutine 里跑、失败只打一行日志、不影响上传结果，属于离线下载生态，
-//!     与「能列、能传、能下载」无关。
+//!     与「能列、能传、能下载」无关（且其 Go 实现的 `oldUpload` sessionKey 是
+//!     字面量 `"??"`，上游本身就是残废的）。
+//!   * `Copy` **不是**缺口：vtable 有槽位，走 `batchTask("COPY")`（2026-10-18
+//!     对账修正了这里「没有槽位」的错误注释）。
 
 const std = @import("std");
 const driver = @import("../driver.zig");
@@ -1203,8 +1205,10 @@ pub const Cloud189 = struct {
             log.info("[189] {s}: 秒传命中", .{name});
         }
 
-        // 秒传 commit 不带 isLog（Go util.go:380-388 的秒传分支）；
-        // 非秒传 commit 带 isLog=0（Go util.go:852-858 的分片上传分支）。
+        // Go `drivers/189/util.go` 的**两个** commit 分支都不带 isLog
+        // （全文 0 命中；852-858 是 189pc 的文件，以前这里引错了文件）。
+        // 本工程以前在非秒传分支多加了 isLog=0，服务端忽略、真机通过，
+        // 但与上游不一致 —— 2026-10-18 对账后删掉，逐字节对齐 Go。
         if (exists == 1) {
             _ = try self.uploadRequest(a, uri_commit_upload, &.{
                 .{ "uploadFileId", upload_file_id },
@@ -1219,7 +1223,6 @@ pub const Cloud189 = struct {
                 .{ "fileMd5", file_md5 },
                 .{ "sliceMd5", slice_md5 },
                 .{ "lazyCheck", "1" },
-                .{ "isLog", "0" },
                 .{ "opertype", "3" },
             });
         }

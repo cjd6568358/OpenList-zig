@@ -1450,7 +1450,7 @@ pub const factory = driver.Factory{
     \\  "rapid_upload":         {"type":"bool","default":false,"help":"秒传。开启后先算 pre_hash，命中则不上传内容，进度条会不准"},
     \\  "internal_upload":      {"type":"bool","default":false,"help":"阿里云北京 ECS 上打开可走内网上传"},
     \\  "livp_download_format": {"type":"select","default":"jpeg","options":["jpeg","mov"],"help":"实况照片取不到直链时回退成静态帧还是视频"},
-    \\  "callback_concurrency": {"type":"number","default":1,"help":"保留字段：代理下载的并发闸门由 API 层负责，本工程未使用"},
+    \\  "callback_concurrency": {"type":"number","default":1,"help":"保留字段：本仓库 Go 树里没有这个键（上游版本差异），并发闸门由 API 层负责，本工程原样保留但不使用"},
     \\  "AccessToken":          {"type":"string","required":false,"secret":true,"help":"由 refresh_token 换得；与 Go 版一致使用大写键名"}
     \\}
     ,

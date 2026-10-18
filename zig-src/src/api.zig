@@ -51,6 +51,7 @@ const http = @import("http.zig");
 const model = @import("model.zig");
 const driver = @import("driver.zig");
 const json = @import("util/json.zig");
+const rand = @import("util/random.zig");
 const urlmod = @import("util/url.zig");
 const config = @import("config.zig");
 const log = @import("log.zig");
@@ -119,6 +120,14 @@ pub const App = struct {
     retired_creds_count: usize = 0,
     retired_creds_next: usize = 0,
     jwt_secret: []const u8,
+    /// 下载签名（/d/ /p/ 与 fs/get 的 sign）用的 HMAC 密钥。
+    ///
+    /// ⚠ Go 用的是 **`token` 设置**（`internal/sign/sign.go:39`
+    /// `sign.NewHMACSign([]byte(setting.GetStr(conf.Token)))`），不是
+    /// jwt_secret —— 所以 Go 的 `admin/setting/reset_token` 会顺带作废
+    /// 所有已发下载链接。本工程对应 `zig.token`（CLI 认证与签名共用一个串）。
+    /// 空串 = 回退 jwt_secret（测试里只设 jwt_secret 的构造走这条）。
+    sign_secret: []const u8 = "",
     site_url: []const u8,
     cdn: []const u8,
     token_expires_in_hours: i64,
@@ -141,6 +150,7 @@ pub const App = struct {
             // `Permission: 0x71FF`。前端按这些位控制按钮，返回 0 会把功能全禁掉。
             .admin_permission = readSecretInt(cfg, "admin_permission", 0x71FF),
             .jwt_secret = try alloc.dupe(u8, cfg.jwt_secret),
+            .sign_secret = try alloc.dupe(u8, if (cfg.raw("zig.token")) |v| (v.asStr() orelse "") else ""),
             .site_url = try alloc.dupe(u8, cfg.site_url),
             .cdn = try alloc.dupe(u8, cfg.cdn),
             .token_expires_in_hours = cfg.token_expires_in,
@@ -506,7 +516,14 @@ fn bridgeLink(ctx: *anyopaque, alloc: std.mem.Allocator, path: []const u8, args:
 fn bridgeSign(ctx: *anyopaque, alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
     const app = bridgeCtx(ctx);
     // Go `sign.Sign(path)` = SignWithExpire(path, 0)（永不过期）。
-    return signValue(alloc, app.jwt_secret, path, 0);
+    return signValue(alloc, signKey(app), path, 0);
+}
+
+/// 下载签名密钥：`zig.token`（Go 的 `token` 设置），空串时回退 jwt_secret。
+/// 单独一个函数是为了让所有签名/验签点**只有一处**取密钥 —— 换密钥（
+/// reset_token）时不会漏掉某条路径。
+fn signKey(app: *const App) []const u8 {
+    return if (app.sign_secret.len > 0) app.sign_secret else app.jwt_secret;
 }
 
 fn bridgeSiteUrl(ctx: *anyopaque) []const u8 {
@@ -2745,6 +2762,39 @@ const setting_defs = [_]SettingDef{
     .{ .key = "text_types", .default = "txt,htm,html,xml,java,properties,sql,js,md,json,conf,ini,vue,php,py,bat,gitignore,yml,go,sh,c,cpp,h,hpp,tsx,vtt,srt,ass,rs,lrc,strm", .kind = "text", .group = 3, .flag = 1 },
 };
 
+/// `POST /api/admin/setting/reset_token` —— Go `handles.ResetToken`
+///（`server/handles/setting.go:19-28`）：生成新 token → 存设置 →
+/// `sign.Instance()` → 把新 token 作为 `data` 返回。
+///
+/// 本工程 token = `zig.token`（CLI 认证与下载签名共用，见 `App.sign_secret`）。
+/// Go 的 `sign.Instance()` 以 token 作 HMAC 密钥 ⇒ 换 token 会**作废所有已发
+/// 下载链接**；这里同步 `app.sign_secret` 并落盘，语义与 Go 一致。
+/// 修复前该路由落在前缀白名单里但没有分支，回的是 JSON 404（前端静默失败）。
+fn handleSettingResetToken(app: *App, req: *http.Request, res: *http.Response) !void {
+    if (!std.mem.eql(u8, req.method, "POST")) return res.jsonError(405, "method not allowed");
+    const a = req.arena;
+    const cfg = config.get();
+
+    var buf: [128]u8 = undefined;
+    const gen = rand.randomToken(&buf);
+    cfg.putZig("token", .{ .string = try cfg.allocator().dupe(u8, gen) }) catch |e| {
+        log.warn("api: reset_token could not store zig.token: {s}", .{@errorName(e)});
+        return res.jsonError(500, "failed to save token");
+    };
+    cfg.save() catch |e| {
+        log.warn("api: reset_token could not persist config: {s}", .{@errorName(e)});
+        return res.jsonError(500, "failed to save token");
+    };
+    // 同步内存副本：此后签发的链接用新密钥，旧链接立即失效（等价 Go 的
+    // `sign.Instance()`）。必须先落盘再改内存 —— 落盘失败时内存不能先变。
+    app.sign_secret = try app.alloc.dupe(u8, gen);
+
+    // token 字符集是 [A-Za-z0-9-]（`util/random.zig`），直接拼引号即可；
+    // 用 allocPrint 而非手写 Buf 是为了跟 Go `SuccessResp(c, token)` 一样
+    // 把 token 作为字符串放进 data。
+    try res.jsonOk(try std.fmt.allocPrint(a, "\"{s}\"", .{gen}));
+}
+
 fn handleSettingRoute(app: *App, req: *http.Request, res: *http.Response, action: []const u8) !void {
     if (std.mem.eql(u8, action, "list") and std.mem.eql(u8, req.method, "GET")) {
         return renderSettingItems(req, res, false, null);
@@ -2761,6 +2811,10 @@ fn handleSettingRoute(app: *App, req: *http.Request, res: *http.Response, action
     }
     if (std.mem.eql(u8, action, "save") and std.mem.eql(u8, req.method, "POST")) {
         return handleSettingSave(app, req, res);
+    }
+    // Go `router.go:161`：`setting.POST("/reset_token", handles.ResetToken)`。
+    if (std.mem.eql(u8, action, "reset_token") and std.mem.eql(u8, req.method, "POST")) {
+        return handleSettingResetToken(app, req, res);
     }
     // 前端设置页的每项设置都有删除按钮（Common.tsx onDelete →
     // `/admin/setting/delete?key=`）。Go 删的是 settings 表行 ⇒ 取值回落到
@@ -4245,14 +4299,14 @@ fn signForObj(app: *App, a: std.mem.Allocator, is_dir: bool, path: []const u8) !
     const cfg = config.getOpt() orelse return "";
     if (!cfg.sign_all) return "";
     const expire_hours = cfg.link_expiration;
-    if (expire_hours == 0) return signValue(a, app.jwt_secret, path, 0);
+    if (expire_hours == 0) return signValue(a, signKey(app), path, 0);
     // 溢出防护：`link_expiration` 是用户可配的，配个巨大值不能让服务崩在
     // 一次列目录上。算不出来就按「不过期」处理。
     const expire = std.math.mul(i64, expire_hours, 3600) catch {
         log.warn("[api] link_expiration={d} overflows; signing without expiry", .{expire_hours});
-        return signValue(a, app.jwt_secret, path, 0);
+        return signValue(a, signKey(app), path, 0);
     };
-    return signValue(a, app.jwt_secret, path, rt.nowSeconds() + expire);
+    return signValue(a, signKey(app), path, rt.nowSeconds() + expire);
 }
 
 /// `Verify(data, sign)` —— 逐条对齐 Go `pkg/sign/hmac.go:34-56`。
@@ -4268,7 +4322,7 @@ fn verifySign(app: *App, a: std.mem.Allocator, data: []const u8, sign: []const u
     const expires = std.fmt.parseInt(i64, exp_str, 10) catch return SignError.ExpireInvalid;
     // 0 表示「永不过期」；负数视为已过期。
     if (expires != 0 and expires < rt.nowSeconds()) return SignError.SignExpired;
-    const expect = try signValue(a, app.jwt_secret, data, expires);
+    const expect = try signValue(a, signKey(app), data, expires);
     // L1：`std.mem.eql` 会在第一个不同字节处提前返回，等于把"前几个字节对
     // 不对"用响应时间泄漏出去。签名比较必须常量时间（同文件已有 `ctEqual`）。
     if (!ctEqual(expect, sign)) return SignError.SignInvalid;
@@ -6432,6 +6486,61 @@ test "setting save persists and setting delete resets a key to its default" {
         const res = try doRequestWith(&app, a, "POST", "/api/admin/setting/delete", "key=no_such_key", hdrs);
         try expectApiCode(res, 404);
     }
+}
+
+test "reset_token rotates zig.token, persists it, and invalidates old download links" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fe = try frontend_mod.initFromHtml(a, .{}, ROUTING_SHELL);
+    defer fe.deinit();
+    var app = routingApp(a, fe);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const cfg_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{root});
+    defer testing.allocator.free(cfg_path);
+    const prev_cfg = config.getOpt();
+    const tcfg = try config.load(testing.allocator, cfg_path);
+    defer tcfg.deinit();
+    config.setForTest(tcfg);
+    defer config.setForTest(prev_cfg);
+
+    // 固定一个已知 token 并让 app 用它签名（模拟线上启动时的内存快照）。
+    try tcfg.putZig("token", .{ .string = try tcfg.allocator().dupe(u8, "openlist-old-token") });
+    app.sign_secret = "openlist-old-token";
+    const old_sign = try signValue(a, signKey(&app), "/local/a.txt", 0);
+    try verifySign(&app, a, "/local/a.txt", old_sign); // 旧密钥有效
+
+    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    const hdrs = try a.alloc(Header, 1);
+    hdrs[0] = .{ .name = "Authorization", .value = auth };
+
+    const res = try doRequestWith(&app, a, "POST", "/api/admin/setting/reset_token", "", hdrs);
+    try testing.expectEqual(@as(u16, 200), res.status);
+    const doc = try json.parse(a, res.buf.slice());
+    const new_tok = doc.strAt("data") orelse return error.TestUnexpectedResult;
+    // Go `random.Token()` 形状：openlist- + 36 位 UUID + 64 位字母数字。
+    try testing.expectEqual(@as(usize, 9 + 36 + 64), new_tok.len);
+    try testing.expect(std.mem.startsWith(u8, new_tok, "openlist-"));
+    try testing.expect(!std.mem.eql(u8, new_tok, "openlist-old-token"));
+
+    // 内存副本同步 + 落盘（重启后仍生效）。
+    try testing.expectEqualStrings(new_tok, app.sign_secret);
+    {
+        const text = try std.Io.Dir.cwd().readFileAlloc(rt.io(), cfg_path, a, .limited(1 << 20));
+        const on_disk = try json.parse(a, text);
+        try testing.expectEqualStrings(new_tok, on_disk.strAt("zig.token").?);
+    }
+
+    // 旧链接立即失效（Go `sign.Instance()` 的效果），新密钥可用。
+    try testing.expectError(SignError.SignInvalid, verifySign(&app, a, "/local/a.txt", old_sign));
+    const new_sign = try signValue(a, signKey(&app), "/local/a.txt", 0);
+    try verifySign(&app, a, "/local/a.txt", new_sign);
 }
 
 test "buildMountsFromConfig skips broken records but keeps them visible to the admin list" {

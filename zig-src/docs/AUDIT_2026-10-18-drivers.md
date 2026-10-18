@@ -353,8 +353,7 @@ Addition.AccessToken 有解析但 **schema 未声明**（:976-982）⇒ 前端�
 | 8 | pan123 | **err_detail 未接**（上游 message 用户不可见；quarkuc 已是标杆） | pan123.zig:433 |
 | 9 | aliyundrive | `Other("video_preview")` 未实现（实况/预览播放信息） | driver.go:269-291 |
 | 10 | 全局 | err_detail 只接了 quarkuc/quark/itvsh/pan115；**cloud189 / cloud189pc / aliyundrive / pan123 / webdav / wopan / local / strm 八个驱动的上游错误用户只能看到泛化 message** | driver.zig:40-67 |
-| 11 | api 层 | STATUS §22.4 遗留三端点仍缺：`POST /api/fs/form`（multipart 直传）、`GET/POST /api/fs/archive/meta`、`POST /api/admin/setting/reset_token`（现以 JSON 404 静默失败） | api.zig 白名单无匹配 |
-| 12 | local | 缩略图整块：list thumb URL + `?type=thumb` + 缓存目录 + 限速（schema 已标 [未实现]） | local.zig:362、48-53 |
+| 11 | api 层 | STATUS §22.4 遗留三端点仍缺：`POST /api/fs/form`（multipart 直传）、`GET/POST /api/fs/archive/meta`、`POST /api/admin/setting/reset_token`（现以 JSON 404 静默失败） | api.zig 白名单无匹配 || 12 | local | 缩略图整块：list thumb URL + `?type=thumb` + 缓存目录 + 限速（schema 已标 [未实现]） | local.zig:362、48-53 |
 
 **2026-10-18 晚已落地 5 项**（同轮修完，构建 409/409 + 真机 e2e 465/0/1）：
 
@@ -380,6 +379,30 @@ cloud189pc/aliyundrive/wopan）；local（OS 错误）、strm（无上游）、w
 （只有 HTTP 状态码）无「上游人类可读消息」概念，不适用。验证：409/409 单测
 + 真机 e2e **460/0/2**（多出的跳过是 189 家庭云 mkdir 最终一致性抖动）。
 
+**2026-10-18 深夜第三批（P1-11 部分 + 文档漂移清零）**：
+
+1. **`POST /api/admin/setting/reset_token` 已实现**（原为 JSON 404 静默失败）：
+   生成 Go 同形 token（`openlist-` + UUID + 64 字母数字）→ 写 `zig.token` →
+   落盘 → 同步内存 → 返回 token。**顺带发现并修了一个真差异**：Go 的下载签名
+   密钥是 **`token` 设置**（`internal/sign/sign.go:39`），Zig 一直用
+   `jwt_secret` ⇒ reset_token 在 Zig 里本来「换了也不生效」。现已统一：
+   `App.sign_secret` = `zig.token`（空则回退 jwt_secret，测试构造不受影响），
+   所有 sign/verify 点走单一 `signKey()`。**行为变化**：升级后旧的 `/d/` `/p/`
+   链接会失效（与 Go 换 token 的语义一致）。
+2. **`fs/form` 与 `fs/archive/meta` 仍不做**，理由明确：
+   - `fs/form`：本工程没有 multipart 解析器（全仓 0 处），且前端上传走
+     `fs/put`、WebDAV 走裸 body —— 没有已知客户端依赖它；
+   - `fs/archive/meta`：Go 的响应用 `/ad`|`/ae` 归档下载端点（本工程按边界
+     刻意未实现），只做 meta 会返回一个必然 404 的 `raw_url`，属「半套功能」，
+     不如不做（宁缺毋滥，避免误导前端）。
+3. **文档漂移 11 处全部清零**（§5 表）：pan115/wopan/cloud189 的
+   「Copy 无槽位 / 未移植 Other」等错误论断、cloud189 的 isLog 注释引错文件
+   （并删掉多出的 `isLog=0`，逐字节对齐 Go）、strm 的 Version schema 默认值
+   5→0（否则新建配置跳过迁移）、pan123 的 partNumberEnd 差 1 补注、
+   aliyun callback_concurrency 的「本树无此键」说明、local mkdir_perm 的
+   「Go 会启动失败」偏差说明、189pc schema 的 required 有意偏差说明、
+   STATUS §2 驱动表 UC/WoPan 的 stale 状态。
+
 ### P2 — 取舍/待确认（记录在案，不阻塞）
 
 - **待确认 4 项**：① wopan psToken 个人空间链路（建议真机抓包，§3.10-C2）；
@@ -395,6 +418,10 @@ cloud189pc/aliyundrive/wopan）；local（OS 错误）、strm（无上游）、w
   local 符号链接默认拒、strm 恒 proxy、匿名浏览 opt-in 默认关。
 
 ## 5. 文档/注释漂移清单（顺带修，成本低）
+
+> **状态（2026-10-18 深夜）**：下表 11 处**已全部修复**（webdav CT 在
+> P1-2 轮、其余在 §4 第三批）。保留清单是为了记录「曾经写错什么」——
+> 这类错误论断是本轮审计最大的坑源。
 
 | 位置 | 漂移 |
 |---|---|

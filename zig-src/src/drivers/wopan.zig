@@ -19,11 +19,13 @@
 //!   4. **响应解密**：`RSP.DATA` 若被一对双引号包裹即为密文 —— base64 解码后
 //!      按同一规则解密，再 JSON 解析。
 //!   5. **错误两层**：外层 `STATUS`（`"200"`）、内层 `RSP.RSP_CODE`（`"0000"`）。
-//!      内层非 `0000` 且 channel ≠ api-user 时**刷 token 重试一次**。
+//!      内层为 **`9999`**（令牌失效）且 channel ≠ api-user 时**刷 token 重试一次**
+//!      —— 对齐 SDK `request.go:42` 的判据；业务错误（配额/参数/限流）不白刷。
 //!   6. **上传不走 dispatcher**：`{zoneURL}/openapi/client/upload2C` 的
 //!      multipart 表单，8 MiB 一片，`fileInfo` 字段是 wohome 加密的 base64。
 //!
-//! 未移植：`Other`（Go 里就是注释掉的 `errs.NotSupport`）、离线下载。
+//! **无缺口声明**：Go 侧也没有 `Other`（`drivers/wopan/driver.go:186-188` 只有
+//! 注释掉的死代码）和离线下载 —— 以前这里写「未移植」属于误导，已纠正。
 
 const std = @import("std");
 const driver = @import("../driver.zig");

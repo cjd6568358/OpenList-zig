@@ -30,9 +30,9 @@
 | 123 网盘 | `123Pan`（用户名+密码） | `pan123.zig` | ✅ |
 | 阿里云盘开放平台 | `AliyundriveOpen` | `aliyundrive.zig` | ✅ |
 | 夸克网盘 | `Quark`（Cookie） | `quarkuc.zig` | ✅ |
-| UC 网盘 | `UC`（Cookie，`OnlyProxy` 变体） | `quarkuc.zig`（共用实现） | ⚠️ 2026-10-15 注册（§13.5），未真机 |
+| UC 网盘 | `UC`（Cookie，`OnlyProxy` 变体） | `quarkuc.zig`（共用实现） | ✅ 2026-10-17 真机全矩阵通过（§36A.1） |
 | 115 网盘 | `115 Cloud`（Cookie） | `pan115.zig` | ✅ |
-| 联通沃云盘 WoPan | `WoPan`（refresh_token） | `wopan.zig` | ⚠️ 仅注册 + 单测，未真机（配置无凭据） |
+| 联通沃云盘 WoPan | `WoPan`（refresh_token） | `wopan.zig` | ✅ 2026-10-17 真机修通（四连修 + 20MB 分片 md5 全链一致，§36B/§36C.2） |
 | STRM（其他挂载→.strm） | `Strm`（paths 行） | `strm.zig` | ✅ 2026-10-14 真机验证（挂载/列表/详情/内容/OnlyProxy 全链路） |
 
 **铁律**：`factory.key` 必须逐字节等于 Go 的 `driver.Config.Name`（即写进 `Storage.driver` 的字符串）；历史名只能进 `Factory.aliases`。
@@ -3331,3 +3331,57 @@ MKCOL 遭设备 TCP reset，实例无 panic、重跑全绿 ⇒ 设备一次性�
 **顺带产出**：一个自校准的「调用参数个数 vs 定义」校验脚本（临时用，
 已删）—— 手工给 50+ 调用点加参数时，靠它一次找出全部漏网，避免逐个
 build 试错（Zig 本机无工具链，一轮 build 4–5 分钟）。
+
+---
+
+## 45. reset_token 补齐 + 签名密钥对齐 Go（2026-10-18 深夜）
+
+**背景**：AUDIT §4-P1-11 的三个遗留端点里，`reset_token` 是唯一「契约完整、
+前端有按钮、当前静默 404」的一个（其余两个见下）。
+
+### 45.1 端点实现
+
+`POST /api/admin/setting/reset_token`（对齐 Go `handles.ResetToken`，
+`server/handles/setting.go:19-28`）：
+
+1. 生成 Go 同形 token：`"openlist-" + uuid.NewString() + String(64)`（109 字符，
+   生成器抽到 `src/util/random.zig`，main.zig 的 `ensureToken` 与 api 共用）；
+2. 写 `zig.token` 并 `cfg.save()`；
+3. 同步内存 `App.sign_secret`（等价 Go 的 `sign.Instance()`）；
+4. `data` 返回新 token 字符串。
+
+### 45.2 顺带发现并修掉的真差异：签名密钥
+
+Go 的下载签名（`/d/` `/p/`、`fs/get` 的 `sign`）密钥是 **`token` 设置**
+（`internal/sign/sign.go:39` `NewHMACSign([]byte(setting.GetStr(conf.Token)))`），
+而本工程一直用 `jwt_secret` ⇒ **reset_token 在 Zig 里本来换了也不生效**。
+现已统一：`App.sign_secret` 初始化自 `zig.token`（空则回退 `jwt_secret`，
+测试里只设 jwt_secret 的构造不受影响），所有签名/验签点走单一 `signKey()`。
+**行为变化**：升级后旧的 `/d/` `/p/` 链接会失效 —— 与 Go 换 token 的语义
+一致，属预期。
+
+### 45.3 未做：fs/form 与 archive/meta（附明确理由）
+
+* **`POST /api/fs/form`**：本工程没有 multipart 解析器（全仓 0 处），前端
+  上传走 `fs/put`、WebDAV 走裸 body —— 无已知客户端依赖；
+* **`GET/POST /api/fs/archive/meta`**：Go 的响应里 `raw_url` 指向 `/ad`|`/ae`
+  归档下载端点，本工程按边界（§22.1）刻意未实现；只做 meta 会给前端一个
+  必然 404 的下载地址，属半套功能。**宁缺毋滥**，等真要做归档下载时一起做。
+
+### 45.4 文档漂移清零
+
+AUDIT §5 的 11 处全部修复，其中两处**顺带改了行为**：
+* `cloud189.zig` 非秒传 commit 的 `isLog=0` 删除（Go 两个分支都没有，逐字节对齐）；
+* `strm.zig` 的 `Version` schema 默认值 5 → 0（Go 默认 0 才触发迁移，写 5 会
+  让新建配置跳过迁移）。
+
+### 45.5 验证
+
+* 打包机 **411/411 单测**（新增 `util/random.zig` 的 token 形状测试 +
+  `reset_token` 端到端单测：轮换/落盘/旧链接失效/新链接可用）；
+* 真机实测：旧链接 reset 前 200 → reset 后 **401**；新 sign 200 + 正文正确；
+  `zig.token` 落盘一致；CLI token 认证（`/api/admin/user/del_cache`）接受新 token；
+* 真机 e2e 见本节末尾（构建 `73027007e1763f51…`，1,260,816 B）。
+
+**真机 e2e 结果**：13 挂载 **464 通过 / 0 失败 / 1 跳过**（跳过仍是坚果云根目录
+403 服务商规则；日志 `docs/regression/2026-10-18-reset-token-e2e.log`）。
