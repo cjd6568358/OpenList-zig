@@ -146,7 +146,12 @@ jobs:
           zig version
 
       - name: Show build.zig options
-        run: zig build --help | sed -n '1,40p'
+        run: |
+          set -e
+          # 布局漂移守卫：build.zig 不在当前目录就明说，别让 zig 自己报一句
+          # 难懂的 "no build.zig found"（2026-10-18 之前正是这个状态）。
+          test -f build.zig || { echo "::error::build.zig not found in $PWD (layout drift?)"; exit 1; }
+          zig build --help | sed -n '1,40p'
 
       # ---- 驱动白名单校验 ----
       # 输入是自由文本，先确认它合法，别等编译到一半才炸。
