@@ -8,6 +8,7 @@ tests locally; every binary that ships is produced here, so the toolchain
 """
 import hashlib
 import io
+import subprocess
 import os
 import sys
 import tarfile
@@ -21,6 +22,11 @@ ZIG = "/root/.cache/zig/zig"
 # 打包机工作目录（用户 2026-10-11 指定用 /tmp）。仍然不碰 /root/.cache/ 里的工具链。
 WORK = "/tmp/olz-build"
 GCACHE = "/tmp/olz-build/zigcache"
+# 打过 TLS 补丁的 std 副本（tools/ziglib_patch.py 生成）。工具链本体保持
+# 只读，编译器通过 ZIG_LIB_DIR 指向这份副本 —— 详见 ziglib_patch.py 的模块
+# 文档（drive.quark.cn 只接受 ECDSA 套件，上游 Zig 0.17.0 却只提供
+# ECDHE-RSA）。放在 WORK 内：每次构建都会重建，工具链升级后不会用到旧副本。
+ZIGLIB = "/tmp/olz-build/ziglib"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TARGET = "aarch64-linux-musl"
 
@@ -28,7 +34,8 @@ TARGET = "aarch64-linux-musl"
 def pack_src():
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for name in ("src", "build.zig", "build.zig.zon"):
+        # tools/ 必须一起打包：ziglib_patch.py 要在构建机上跑（见 main() 步骤 0.5）。
+        for name in ("src", "build.zig", "build.zig.zon", "tools"):
             tf.add(os.path.join(ROOT, name), arcname=name)
     return buf.getvalue()
 
@@ -44,6 +51,22 @@ def main():
         i = sys.argv.index("--drivers")
         drivers = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
     print(f"driver whitelist: {drivers or '(all)'}", flush=True)
+
+    # --- 0) lint the built-in page's inline JS --------------------------
+    # 必须在最前面：这是唯一能发现"页面 JS 语法错误"的检查。
+    # 教训（2026-10-15）：`<script>` 是 raw text，实体不解码，我写了
+    # `&amp;&amp;` ⇒ 浏览器把字面量交给 JS ⇒ 语法错误 ⇒ 整个脚本不执行 ⇒
+    # 表单永远不显示。而当时所有检查都只是把 HTML 当**字符串**看，全过了。
+    # 这个脚本把内联 JS 抽出来跑 `node --check`，补上那个盲区。
+    r = subprocess.run(
+        [sys.executable, os.path.join(ROOT, "tools", "check_builtin_js.py")],
+        capture_output=True, text=True,
+    )
+    print((r.stdout + r.stderr).strip(), flush=True)
+    if r.returncode != 0:
+        print("!! built-in page JS lint failed; aborting before any build", flush=True)
+        return 1
+
     blob = pack_src()
     src_sha = hashlib.sha256(blob).hexdigest()
     print(f"packed sources: {len(blob)} bytes", flush=True)
@@ -55,6 +78,19 @@ def main():
     sh(c, f"mkdir -p {GCACHE}")
     sftp.putfo(io.BytesIO(blob), WORK + "/src.tar.gz")
     sh(c, f"cd {WORK} && tar xzf src.tar.gz && ls")
+
+    # --- 0.5) patched std copy ------------------------------------------
+    # Zig 0.17.0 只提供 ECDHE-RSA 套件，drive.quark.cn 的 ECDHE-RSA 路径是坏的
+    # （发完 RSA 证书链就在 ServerKeyExchange 处 internal_error），必须让客户端
+    # 提供 ECDSA 套件。std 的套件列表是硬编码的、没有开关，所以在工作区放一份
+    # 打过补丁的 std 副本，构建时用 ZIG_LIB_DIR 指过去。工具链本体只读。
+    o, e, rc = sh(c, f"cd {WORK} && python3 tools/ziglib_patch.py")
+    print((o + e).rstrip(), flush=True)
+    if rc != 0:
+        print("!! ziglib patch failed; aborting before any build", flush=True)
+        sftp.close()
+        c.close()
+        return 1
 
     # --- 1) unit tests -------------------------------------------------
     # B01: Linux 必须显式 `-lc`，否则 local.zig 的 `extern "c" statvfs`
@@ -72,7 +108,11 @@ def main():
     #    `failed command: <test bin>`（实测 ZIGBUILD_RC=0，测试是全过的）。
     #    退出码才是唯一可靠判据，`test success` 是它的可读替身。
     drv_args = f' -Ddrivers="{drivers}"' if drivers else ""
-    o, e, rc = sh(c, f"cd {WORK} && ZIG_GLOBAL_CACHE_DIR={GCACHE} {ZIG} build test --summary all{drv_args}")
+    # 多分钟的构建：remote.sh() 默认 120s 不够，显式放大到 15 分钟
+    # （正常 3–4.5 分钟，留 3 倍余量；仍然有界，不会无限挂死）。
+    o, e, rc = sh(c, f"cd {WORK} && ZIG_GLOBAL_CACHE_DIR={GCACHE} "
+                     f"ZIG_LIB_DIR={ZIGLIB} {ZIG} build test --summary all{drv_args}",
+                  timeout=900)
     log = (o + e)
     print(log.rstrip()[-4000:] if len(log) > 4000 else log.rstrip(), flush=True)
     if rc != 0:
@@ -91,8 +131,10 @@ def main():
     # B03: 同样按 rc 判定；失败不得继续下载旧产物。
     # 走 `zig build`（而不是裸 build-exe）才能带上 `-Ddrivers=` 白名单，
     # 产物因此落在 `zig-out/bin/openlist` 而不是工作目录根下。
-    o, e, rc = sh(c, f"cd {WORK} && ZIG_GLOBAL_CACHE_DIR={GCACHE} {ZIG} build "
-                     f"-Dtarget={TARGET} -Doptimize=small{drv_args}")
+    o, e, rc = sh(c, f"cd {WORK} && ZIG_GLOBAL_CACHE_DIR={GCACHE} "
+                     f"ZIG_LIB_DIR={ZIGLIB} {ZIG} build "
+                     f"-Dtarget={TARGET} -Doptimize=small{drv_args}",
+                  timeout=900)
     log = (o + e)
     if rc != 0:
         print(log.rstrip()[-4000:], flush=True)

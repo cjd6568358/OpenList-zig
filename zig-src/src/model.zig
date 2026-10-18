@@ -158,6 +158,27 @@ pub const Storage = struct {
     addition: []const u8 = "{}",
     remark: []const u8 = "",
     disabled: bool = false,
+    /// Go `Storage.WebProxy`（admin UI 的「Web 代理」开关）。true 时 `/d/`
+    /// 不走 302 重定向，而是由服务端回源转发 —— 直链绑定会话 cookie 的驱动
+    /// （夸克/UC）必须这样，否则 CDN 以 `require login` 拒掉。
+    /// 对齐 Go `server/handles/down.go` 的 `ShouldProxy` 第一分支。
+    web_proxy: bool = false,
+    /// Go `Storage.WebdavPolicy`（admin 存储表单的「WebDAV 策略」下拉）。
+    /// 取值与上游逐字一致：
+    ///   "" / "native_proxy" → 服务端转发（`common.Proxy`）；
+    ///   "302_redirect"      → WebDAV GET 直接 302 到驱动直链；
+    ///   "use_proxy_url"     → 302 到 `down_proxy_url`（且使 `/p/` 可代理）。
+    /// 缺失时按 ""（native）处理 —— 与本次对齐前的行为一致，不会让既有
+    /// 配置突然开始 302。
+    webdav_policy: []const u8 = "",
+    /// Go `Storage.DownProxyURL`：`use_proxy_url` 策略用的反代前缀。
+    down_proxy_url: []const u8 = "",
+    /// Go `Storage.DisableProxySign`：为 true 时 `use_proxy_url` 的 302 不带签名。
+    disable_proxy_sign: bool = false,
+    /// Go `Storage.Modified`（`internal/op/storage.go`）：创建与每次更新时
+    /// 置 `time.Now()`，管理员界面「存储列表/编辑表单」会显示它。
+    /// Unix 秒；0 = Go 零值时间（RFC3339 `0001-01-01T00:00:00Z`）。
+    modified: i64 = 0,
     /// Runtime-only: set when `init` failed, so the API can report it without
     /// taking the whole process down (OpenList shows these as "disabled").
     /// Named `error_msg` because `error` is a Zig keyword.

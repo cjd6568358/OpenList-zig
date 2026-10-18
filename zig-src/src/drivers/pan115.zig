@@ -170,6 +170,20 @@ fn errCodeOf(v: *const json.Value) i64 {
     return v.intAt("errNo") orelse 0;
 }
 
+/// 写路径的统一失败出口：把 115 的业务 message 透传给响应（`driver.Ctx.
+/// err_detail`，机制见 STATUS §31.9），并留一条带响应体的 warn —— 只有
+/// "upstream error" 的话，「115 建目录失败」这类问题完全无法定位
+/// （2026-10-17 实测：errno 的具体原因只有 body 里的 `error` 字段有）。
+fn writeFail(ctx: *driver.Ctx, v: *const json.Value) anyerror {
+    const code = errCodeOf(v);
+    const msg = v.strAt("error") orelse v.strAt("message") orelse "";
+    if (msg.len > 0) {
+        ctx.err_detail = ctx.alloc.dupe(u8, msg) catch null;
+    }
+    log.warn("[115] write failed errno={d}: {s}", .{ code, msg });
+    return mapUpstreamError(code);
+}
+
 /// `error.go:errMap` 的子集（只映射本工程会 surface 出来的码）。
 fn mapUpstreamError(code: i64) anyerror {
     return switch (code) {
@@ -250,7 +264,21 @@ pub const Pan115 = struct {
         try hdrs.append(.{ .name = "User-Agent", .value = try self.ua(arena) });
         try hdrs.append(.{ .name = "Cookie", .value = self.cookie });
         try hdrs.append(.{ .name = "Referer", .value = "https://115.com/" });
-        for (extra) |h| try hdrs.append(h);
+        // `extra` 是**请求级**头，语义上覆盖上面的客户端级默认值（resty
+        // `parseRequestHeader` 就是这个顺序）。直接 append 会出现两个
+        // 同名头（例如 downurl 的 User-Agent），线上行为取决于服务端取哪个
+        // —— 115 的直链按 UA 授权，取错就 403。这里按名字**替换**。
+        for (extra) |h| {
+            var replaced = false;
+            for (hdrs.sliceMut()) |*cur| {
+                if (std.ascii.eqlIgnoreCase(cur.name, h.name)) {
+                    cur.* = h;
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) try hdrs.append(h);
+        }
 
         return self.client.send(arena, .{
             .method = method,
@@ -274,8 +302,13 @@ pub const Pan115 = struct {
         var q = urlmod.Query.init(arena);
         defer q.deinit();
         try q.addSorted(form);
+        // ⚠ 表单体必须是 **x-www-form-urlencoded**：Go 是 `SetFormData(form)` +
+        // `ForceContentType("application/json;charset=UTF-8")`
+        // （drivers/115/driver.go:91-94）—— 后者只改**响应**的解析，请求头
+        // 仍是 resty 默认的表单类型。曾错把 JSON 设成请求 Content-Type，
+        // 115 解不出 `cname` → 建目录恒「目录名称不能为空」。
         const res = try self.request(arena, "POST", url, q.slice(), &.{
-            .{ .name = "Content-Type", .value = "application/json;charset=UTF-8" },
+            .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
         });
         if (res.status < 200 or res.status >= 300) {
             log.warn("[115] POST {s} -> HTTP {d}", .{ url, res.status });
@@ -403,13 +436,18 @@ fn daysFromCivil(y_in: i64, m: i64, d: i64) i64 {
 }
 
 /// 列一页（`driver/dir.go:109-144` 的 `GetFiles`）。
+/// ⚠ 返回值是 `*const json.Value`：`json.parse` 按值返回，**绝不能**
+/// `return &v` 指向栈上的 local —— 那是悬垂指针，调用方读到的是被复用
+/// 的栈垃圾（2026-10-18 实测：删掉 listPage 里的日志行改变栈帧布局后，
+/// fs/list 静默变成 0 条、不报错）。按 itvsh 的模式把根节点装进 arena。
 fn listPage(self: *Pan115, arena: std.mem.Allocator, dir_id: []const u8, offset: i64, limit: i64) !*const json.Value {
     const cid = if (dir_id.len == 0) default_root else dir_id;
     const url = try std.fmt.allocPrint(arena, "{s}?aid=1&cid={s}&o=user_ptime&asc=1&offset={d}&show_dir=1&limit={d}&snap=0&natsort=0&record_open_time=1&format=json&fc_mix=0", .{ api_file_list, cid, offset, limit });
     const body = try self.get(arena, url);
-    const v = json.parse(arena, body) catch return Error.UpstreamNotJson;
-    if (!basicOk(&v)) return mapUpstreamError(errCodeOf(&v));
-    return &v;
+    const slot = try arena.create(json.Value);
+    slot.* = json.parse(arena, body) catch return Error.UpstreamNotJson;
+    if (!basicOk(slot)) return mapUpstreamError(errCodeOf(slot));
+    return slot;
 }
 
 fn listAll(self: *Pan115, arena: std.mem.Allocator, dir_id: []const u8, out: *List(model.Obj)) !void {
@@ -549,7 +587,7 @@ fn makeDir(ptr: *anyopaque, ctx: *driver.Ctx, dir: []const u8) anyerror!void {
         .{ "cname", name },
     });
     const v = json.parse(a, body) catch return Error.UpstreamNotJson;
-    if (!basicOk(&v)) return mapUpstreamError(errCodeOf(&v));
+    if (!basicOk(&v)) return writeFail(ctx, &v);
 }
 
 /// Go `drivers/115/driver.go` 的 Copy = `WaitLimit` + `client.Copy(pid, fid)`，
@@ -564,7 +602,7 @@ fn copy(ptr: *anyopaque, ctx: *driver.Ctx, src: []const u8, dst_dir: []const u8)
         .{ "fid[0]", src_id },
     });
     const v = json.parse(a, body) catch return Error.UpstreamNotJson;
-    if (!basicOk(&v)) return mapUpstreamError(errCodeOf(&v));
+    if (!basicOk(&v)) return writeFail(ctx, &v);
 }
 
 fn move(ptr: *anyopaque, ctx: *driver.Ctx, src: []const u8, dst_dir: []const u8) anyerror!void {
@@ -577,7 +615,7 @@ fn move(ptr: *anyopaque, ctx: *driver.Ctx, src: []const u8, dst_dir: []const u8)
         .{ "fid[0]", src_id },
     });
     const v = json.parse(a, body) catch return Error.UpstreamNotJson;
-    if (!basicOk(&v)) return mapUpstreamError(errCodeOf(&v));
+    if (!basicOk(&v)) return writeFail(ctx, &v);
 }
 
 fn rename(ptr: *anyopaque, ctx: *driver.Ctx, src: []const u8, new_name: []const u8) anyerror!void {
@@ -591,7 +629,7 @@ fn rename(ptr: *anyopaque, ctx: *driver.Ctx, src: []const u8, new_name: []const 
         .{ key, new_name },
     });
     const v = json.parse(a, body) catch return Error.UpstreamNotJson;
-    if (!basicOk(&v)) return mapUpstreamError(errCodeOf(&v));
+    if (!basicOk(&v)) return writeFail(ctx, &v);
 }
 
 fn remove(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, is_dir: bool) anyerror!void {
@@ -603,7 +641,7 @@ fn remove(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, is_dir: bool) any
         .{ "fid[0]", id },
     });
     const v = json.parse(a, body) catch return Error.UpstreamNotJson;
-    if (!basicOk(&v)) return mapUpstreamError(errCodeOf(&v));
+    if (!basicOk(&v)) return writeFail(ctx, &v);
 }
 
 fn space(ptr: *anyopaque, ctx: *driver.Ctx) anyerror!driver.DiskUsage {
@@ -611,7 +649,7 @@ fn space(ptr: *anyopaque, ctx: *driver.Ctx) anyerror!driver.DiskUsage {
     const a = ctx.alloc;
     const body = try self.get(a, api_file_index_info);
     const v = json.parse(a, body) catch return Error.UpstreamNotJson;
-    if (!basicOk(&v)) return mapUpstreamError(errCodeOf(&v));
+    if (!basicOk(&v)) return writeFail(ctx, &v);
     return .{
         .total = numAt(&v, "data.space_info.all_total.size") orelse 0,
         .used = numAt(&v, "data.space_info.all_use.size") orelse 0,
@@ -657,8 +695,13 @@ fn downloadWithUa(self: *Pan115, arena: std.mem.Allocator, pick_code: []const u8
     try q.add("data", data);
 
     var extra = List(model.Header).init(arena);
-    try extra.append(.{ .name = "Content-Type", .value = "application/json" });
-    if (ua.len > 0) try extra.append(.{ .name = "User-Agent", .value = ua });
+    // `data=` 是表单字段（driver115 SDK 的 downurl 同款），不是 JSON body
+    try extra.append(.{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" });
+    // SDK `download.go:84` 是 `req.SetHeader("User-Agent", ua)` —— **无条件**设置，
+    // 空串也覆盖客户端级 UA（SDK client.go:46-123 的 sentinel 机制保证线上
+    // 真的不带 UA）。`request()` 现在按名字替换，所以这里必须照传，不能只
+    // 在非空时追加。
+    try extra.append(.{ .name = "User-Agent", .value = ua });
     const res = try self.request(arena, "POST", url, q.slice(), extra.slice());
     if (res.status < 200 or res.status >= 300) return Error.UpstreamHttp;
 
@@ -674,9 +717,54 @@ fn downloadWithUa(self: *Pan115, arena: std.mem.Allocator, pick_code: []const u8
         const size = numAt(info, "file_size") orelse 0;
         if (size < 0) return Error.UpstreamError;
         const u = info.strAt("url.url") orelse return Error.InvalidResponse;
-        return .{ .url = u, .header = &.{} };
+        // SDK `download.go:104`：`info.Header = buildDownloadHeaders(
+        // sentRequestHeaders(resp), resp.Cookies())`。Go 的 `Link` 就是拿
+        // 这份头去回源的（`drivers/115/driver.go:76-79`）—— 115 直链按 UA /
+        // Cookie 授权，丢掉就是 403。
+        return .{ .url = u, .header = try buildDownloadHeaders(arena, ua, self.cookie, res.headers) };
     }
     return Error.InvalidResponse;
+}
+
+/// SDK `buildDownloadHeaders`（`115driver/pkg/driver/download.go:173-196`）：
+/// 下载头 =「downurl 请求**实际发出**的头」+ 响应 Set-Cookie 合并进 Cookie。
+///
+/// 与 Go 逐字对齐的偏差只有一处，是有意为之：Go 的来源是
+/// `RawRequest.Header`（整个请求头 map），里面带着本次 API 调用的
+/// `Content-Type: application/x-www-form-urlencoded`（resty `SetFormData`
+/// 的副产品）。回源 GET 带它没有任何作用（`common.Proxy` 的透明代理分支也
+/// 不读 `link.Header` 的 Content-Type —— 只有 `link.RangeReader != nil` 那条
+/// 分支才读，115 不走那条），却可能让严格的 CDN 拒绝无 body 的请求，所以
+/// 这里不输出。
+fn buildDownloadHeaders(
+    arena: std.mem.Allocator,
+    ua: []const u8,
+    cookie: []const u8,
+    res_headers: []const model.Header,
+) ![]const model.Header {
+    var out = List(model.Header).init(arena);
+    // 空 UA 在 Go 侧等于「不发 UA」（`http.Request.write` 对空 User-Agent
+    // 整个跳过；SDK 的 sentinel 机制也是这个目的），所以这里同样跳过。
+    if (ua.len > 0) try out.append(.{ .name = "User-Agent", .value = ua });
+
+    // Cookie：本端的会话 Cookie（= SDK 客户端级 Cookie）+ downurl 响应里
+    // 的 Set-Cookie。SDK 用 `resp.Cookies()` 解析后逐个 `cookie.String()`，
+    // 即只保留 `name=value`、丢掉 Expires/Path 等属性，用 `"; "` 连接。
+    var merged = Buf.init(arena);
+    try merged.append(cookie);
+    for (res_headers) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "Set-Cookie")) continue;
+        var pair = std.mem.trimStart(u8, h.value, " \t");
+        if (std.mem.indexOfScalar(u8, pair, ';')) |sc| pair = pair[0..sc];
+        pair = std.mem.trimEnd(u8, pair, " \t\r\n");
+        if (pair.len == 0) continue;
+        if (merged.len > 0) try merged.append("; ");
+        try merged.append(pair);
+    }
+    if (merged.len > 0) try out.append(.{ .name = "Cookie", .value = try merged.toOwned() });
+
+    try out.append(.{ .name = "Referer", .value = "https://115.com/" });
+    return out.toOwned();
 }
 
 // ---------------------------------------------------------------------------
@@ -915,6 +1003,21 @@ const OssToken = struct {
     security_token: []const u8,
 };
 
+/// 解析 gettoken.php 的响应体（字段全在顶层）。
+/// ⚠ Go SDK 的结构体 tag 写的是 `json:"AccessKeyID"`，但 Go 的 encoding/json
+/// 键匹配**大小写不敏感**；115 线上实际返回的是 `AccessKeyId`（小写 d，
+/// 2026-10-18 真机抓包实证）。Zig 的 `strAt` 是精确匹配，只认一种拼法会漏
+/// —— 两种都试，先认线上实证形态。
+fn parseOssToken(v: *const json.Value) !OssToken {
+    const status_code = v.strAt("StatusCode") orelse "";
+    if (!std.mem.eql(u8, status_code, "200")) return Error.UpstreamError;
+    return .{
+        .access_key_id = v.strAt("AccessKeyId") orelse v.strAt("AccessKeyID") orelse return Error.InvalidResponse,
+        .access_key_secret = v.strAt("AccessKeySecret") orelse return Error.InvalidResponse,
+        .security_token = v.strAt("SecurityToken") orelse "",
+    };
+}
+
 /// `GET /3.0/gettoken.php`（`upload.go:177-185`）。
 fn getOssToken(self: *Pan115, arena: std.mem.Allocator) !OssToken {
     const res = try self.request(arena, "GET", api_upload_oss_token, "", &.{
@@ -922,13 +1025,7 @@ fn getOssToken(self: *Pan115, arena: std.mem.Allocator) !OssToken {
     });
     if (res.status < 200 or res.status >= 300) return Error.UpstreamHttp;
     const v = json.parse(arena, res.body) catch return Error.UpstreamNotJson;
-    const status_code = v.strAt("StatusCode") orelse "";
-    if (!std.mem.eql(u8, status_code, "200")) return Error.UpstreamError;
-    return .{
-        .access_key_id = v.strAt("AccessKeyID") orelse return Error.InvalidResponse,
-        .access_key_secret = v.strAt("AccessKeySecret") orelse return Error.InvalidResponse,
-        .security_token = v.strAt("SecurityToken") orelse "",
-    };
+    return parseOssToken(&v);
 }
 
 /// OSS V1 签名（`VERB\nContent-MD5\nContent-Type\nDate\nCanonicalizedOSSHeaders
@@ -1335,6 +1432,44 @@ test "T2: Credential.fromCookie normalises and rejects bad cookies" {
     try testing.expectError(Error.AuthFailed, Credential.fromCookie(a, "UID=1;CID=2;KID=4"));
 }
 
+// M2（审计）：115 直链按 UA / Cookie 授权，Go 把 downurl 请求实际发出的头
+// 挂到 `Link.Header` 上（`drivers/115/driver.go:76-79` + SDK
+// `download.go:104,173-196`）。以前这里恒返回空头，代理回源会 403。
+test "M2: buildDownloadHeaders mirrors SDK buildDownloadHeaders" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const res_headers = [_]model.Header{
+        .{ .name = "Set-Cookie", .value = "download_token=abc123; Path=/; HttpOnly" },
+        .{ .name = "Set-Cookie", .value = " extra=9 " },
+        .{ .name = "Content-Type", .value = "application/json" },
+    };
+
+    // 有 UA + 已有 Cookie：UA 原样带出，两个 Set-Cookie 只取 name=value 拼进 Cookie
+    const h = try buildDownloadHeaders(a, "Mozilla/5.0", "UID=1;CID=2", &res_headers);
+    try testing.expectEqual(@as(usize, 3), h.len);
+    try testing.expectEqualStrings("User-Agent", h[0].name);
+    try testing.expectEqualStrings("Mozilla/5.0", h[0].value);
+    try testing.expectEqualStrings("Cookie", h[1].name);
+    try testing.expectEqualStrings("UID=1;CID=2; download_token=abc123; extra=9", h[1].value);
+    try testing.expectEqualStrings("Referer", h[2].name);
+    try testing.expectEqualStrings("https://115.com/", h[2].value);
+
+    // 空 UA（curl 不带 UA）：Go 侧等价于「不发 UA」，所以不输出；
+    // 无会话 Cookie 时 Cookie 头也只含响应 Set-Cookie。
+    const h2 = try buildDownloadHeaders(a, "", "", &res_headers);
+    try testing.expectEqual(@as(usize, 2), h2.len);
+    try testing.expectEqualStrings("Cookie", h2[0].name);
+    try testing.expectEqualStrings("download_token=abc123; extra=9", h2[0].value);
+
+    // 既无 UA 也无任何 Cookie：只剩 Referer
+    const none = [_]model.Header{};
+    const h3 = try buildDownloadHeaders(a, "", "", &none);
+    try testing.expectEqual(@as(usize, 1), h3.len);
+    try testing.expectEqualStrings("Referer", h3[0].name);
+}
+
 test "T2: parseCstMinutes converts a 115 timestamp to unix seconds" {
     // 2023-11-14 22:13 CST = 2023-11-14 14:13 UTC = 1699971180
     try testing.expectEqual(@as(i64, 1699971180), parseCstMinutes("2023-11-14 22:13").?);
@@ -1468,4 +1603,83 @@ test "T2: createWithId builds a driver with the expected name" {
     try testing.expectEqual(@as(i64, 7), self.storage_id);
     try testing.expectEqualStrings("115 Cloud", Pan115.drvName(@ptrCast(self)));
     try testing.expectEqualStrings("115 Cloud", factory.key);
+}
+
+// P115-REG（2026-10-18 真机事故）：线上 fs/list /115 拿到**空** content，
+// 而同一 cookie、同一 URL 的 curl 直打有 14 条。本测试用**真机抓下来的
+// 响应体原文**（src/drivers/115list_sample.json，cid=0, limit=1000）钉住
+// 解析链路：json.parse → basicOk → arrAt("data") → entryFrom。
+test "P115-REG: real files response parses to all entries" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = @embedFile("115list_sample.json");
+
+    const v = try json.parse(a, body);
+    try testing.expect(basicOk(&v));
+    const items = arrAt(&v, "data");
+    // 样本是 2026-10-18 抓的：根目录 14 个条目（全目录）。
+    try testing.expect(items.len > 0);
+    // 逐条 entryFrom 不许抛错；首条必须解析出 id/name。
+    const first = try entryFrom(&items[0]);
+    try testing.expect(first.id.len > 0);
+    try testing.expect(first.name.len > 0);
+    // count 与 data 长度一致（分页循环依赖它）。
+    const count = numAt(&v, "count") orelse 0;
+    try testing.expectEqual(@as(i64, @intCast(items.len)), count);
+}
+
+// P115-REG（2026-10-18 真机事故）：put 秒传失败走 OSS 上传时，getOssToken
+// 抛 InvalidResponse，上传整链断在这里 —— 线上 gettoken.php 返回的键是
+// `AccessKeyId`（小写 d，真机抓包实证），Zig 原来只认 `AccessKeyID`。
+// Go SDK 的 tag 虽写 `json:"AccessKeyID"`，但 encoding/json 键匹配大小写
+// 不敏感所以一直能跑。本测试用真机响应形态（键序、大小写逐字）钉住解析。
+test "P115-REG: gettoken response parses with AccessKeyId (Go case-insensitive trap)" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body =
+        \\{"StatusCode":"200","AccessKeySecret":"SK-test-secret","SecurityToken":"ST-test-token","Expiration":"2026-10-18T04:36:51Z","AccessKeyId":"STS.TestKeyId"}
+    ;
+    const v = try json.parse(a, body);
+    const tok = try parseOssToken(&v);
+    try testing.expectEqualStrings("STS.TestKeyId", tok.access_key_id);
+    try testing.expectEqualStrings("SK-test-secret", tok.access_key_secret);
+    try testing.expectEqualStrings("ST-test-token", tok.security_token);
+}
+
+test "P115-REG: gettoken accepts the Go tag spelling AccessKeyID too" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body =
+        \\{"StatusCode":"200","AccessKeyID":"STS.Upper","AccessKeySecret":"SK"}
+    ;
+    const v = try json.parse(a, body);
+    const tok = try parseOssToken(&v);
+    try testing.expectEqualStrings("STS.Upper", tok.access_key_id);
+    try testing.expectEqualStrings("SK", tok.access_key_secret);
+    try testing.expectEqualStrings("", tok.security_token);
+}
+
+test "P115-REG: gettoken non-200 StatusCode is UpstreamError" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body =
+        \\{"StatusCode":"500","AccessKeyId":"x","AccessKeySecret":"y"}
+    ;
+    const v = try json.parse(a, body);
+    try testing.expectError(Error.UpstreamError, parseOssToken(&v));
+}
+
+test "P115-REG: gettoken missing AccessKey is InvalidResponse" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body =
+        \\{"StatusCode":"200","AccessKeySecret":"y"}
+    ;
+    const v = try json.parse(a, body);
+    try testing.expectError(Error.InvalidResponse, parseOssToken(&v));
 }

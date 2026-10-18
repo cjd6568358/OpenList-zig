@@ -490,12 +490,22 @@ pub const Cloud189 = struct {
             }
             const rc = v.intAt("res_code") orelse 0;
             if (rc != 0) {
-                log.warn("[189] {s}: res_code {d} {s}", .{ url, rc, v.strAt("res_message") orelse "" });
+                log.warn("[189] {s}: res_code {d} {s} | body: {s}", .{
+                    url, rc, v.strAt("res_message") orelse "",
+                    res.body[0..@min(res.body.len, 160)],
+                });
                 return Error.UpstreamError;
             }
         } else |_| {
             // 不是 JSON：登录页、WAF 拦截页、空 body 都会走到这里。
-            // `res_code` 取不到就是 0，上游同样当作没错误。
+            // `res_code` 取不到就是 0，上游同样当作没错误 —— 但静默吞掉会让
+            // 「MOVE 502」这种问题完全没有线索，所以非 JSON 的响应也要留痕
+            // （截断，防止 HTML 页面刷爆日志）。
+            if (res.body.len > 0) {
+                log.warn("[189] {s}: 非 JSON 响应: {s}", .{
+                    url, res.body[0..@min(res.body.len, 160)],
+                });
+            }
         }
 
         return res.body;
@@ -619,7 +629,35 @@ pub const Cloud189 = struct {
             log.err("[189] 登录失败: {s}", .{lr.strAt("msg") orelse login_body});
             return Error.LoginFailed;
         }
-        log.info("[189] 登录成功", .{});
+
+        // ★ SSO 回跳（登录的**最后一步**，缺了它整个驱动等于没登录）：
+        //
+        //   `loginSubmit.do` 只把会话种在 **e.189.cn** 域（SSON/OPENINFO…），
+        //   而 API 在 **cloud.189.cn** —— 必须再 GET 一次响应里的 `toUrl`
+        //   （`callbackUnify.action`），跟着 302 走完才会种下
+        //   `COOKIE_LOGIN_USER` + cloud.189.cn 的 `JSESSIONID`。
+        //
+        //   证据（2026-10-17 真机，`tools/probe_189web_login.py`）：
+        //   不补这一步 listFiles 恒 400 `InvalidSessionKey: cookieUserSession
+        //   is null`；补上之后 200 + `res_code:0` + 真实目录。
+        //   （上游 login.go 把老版登录里这一步弄丢了 —— drivers/189/util.go
+        //   注释里的旧实现有 `d.client.R().Get(loginResp.ToUrl)`。）
+        const to_url = lr.strAt("toUrl") orelse "";
+        if (to_url.len > 0) {
+            var sso_url = to_url;
+            var sso_hop: usize = 0;
+            while (sso_hop < max_redirects) : (sso_hop += 1) {
+                const sso_res = try self.client.send(arena, .{
+                    .method = "GET",
+                    .url = sso_url,
+                    .headers = &.{.{ .name = "User-Agent", .value = user_agent }},
+                });
+                if (sso_res.status < 300 or sso_res.status >= 400) break;
+                const loc = sso_res.header("Location") orelse break;
+                sso_url = try resolveUrl(arena, sso_url, loc);
+            }
+        }
+        log.info("[189] 登录成功（含 SSO 回跳）", .{});
     }
 
     /// 登录流程里的裸 POST：不带 `noCache`，不判 `res_code`（这三个接口的
@@ -695,6 +733,14 @@ pub const Cloud189 = struct {
         };
     }
 
+    /// 深拷进长生命周期分配器（H1）。`getFiles` 在内层 arena 里解析分页 JSON，
+    /// 输出数组却分配在 `alloc`（= `ctx.alloc`）—— 函数返回时内层 arena 一
+    /// `deinit()`，裸用 `item.strAt(...)` 拿到的切片就悬空了。名字/缩略图
+    /// 必须整体拷贝到 `alloc`，由调用方的请求级 arena 统一回收。
+    fn dupeStr(alloc: std.mem.Allocator, s: ?[]const u8) ![]const u8 {
+        return alloc.dupe(u8, s orelse "");
+    }
+
     fn getFiles(self: *Cloud189, alloc: std.mem.Allocator, folder_id: []const u8) ![]model.Obj {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
@@ -708,7 +754,7 @@ pub const Cloud189 = struct {
 
             for (page.folders) |item| {
                 try out.append(.{
-                    .name = item.strAt("name") orelse "",
+                    .name = try dupeStr(alloc, item.strAt("name")),
                     .size = 0,
                     .is_dir = true,
                     .modified = timeutil.parseCnTime(item.strAt("lastOpTime") orelse "") orelse 0,
@@ -717,11 +763,11 @@ pub const Cloud189 = struct {
             for (page.files) |item| {
                 const icon = item.getPath("icon");
                 try out.append(.{
-                    .name = item.strAt("name") orelse "",
+                    .name = try dupeStr(alloc, item.strAt("name")),
                     .size = item.intAt("size") orelse 0,
                     .is_dir = false,
                     .modified = timeutil.parseCnTime(item.strAt("lastOpTime") orelse "") orelse 0,
-                    .thumb = if (icon) |ic| ic.strAt("smallUrl") orelse "" else "",
+                    .thumb = if (icon) |ic| try dupeStr(alloc, ic.strAt("smallUrl")) else "",
                 });
             }
             page_num += 1;
@@ -998,7 +1044,11 @@ pub const Cloud189 = struct {
         });
 
         if (!res.isOk()) {
-            log.warn("[189] upload {s} HTTP {d}", .{ uri, res.status });
+            // 带上响应体：4xx 的 body 里是上游的真实原因（403/400 的
+            // message 与签名无关，是业务侧拒绝），只有状态码没法定位。
+            log.warn("[189] upload {s} HTTP {d}: {s}", .{
+                uri, res.status, res.body[0..@min(res.body.len, 200)],
+            });
             return Error.UpstreamHttp;
         }
         const v = json.parse(arena, res.body) catch return Error.UpstreamNotJson;
@@ -1128,13 +1178,26 @@ pub const Cloud189 = struct {
             log.info("[189] {s}: 秒传命中", .{name});
         }
 
-        _ = try self.uploadRequest(a, uri_commit_upload, &.{
-            .{ "uploadFileId", upload_file_id },
-            .{ "fileMd5", file_md5 },
-            .{ "sliceMd5", slice_md5 },
-            .{ "lazyCheck", "1" },
-            .{ "opertype", "3" },
-        });
+        // 秒传 commit 不带 isLog（Go util.go:380-388 的秒传分支）；
+        // 非秒传 commit 带 isLog=0（Go util.go:852-858 的分片上传分支）。
+        if (exists == 1) {
+            _ = try self.uploadRequest(a, uri_commit_upload, &.{
+                .{ "uploadFileId", upload_file_id },
+                .{ "fileMd5", file_md5 },
+                .{ "sliceMd5", slice_md5 },
+                .{ "lazyCheck", "1" },
+                .{ "opertype", "3" },
+            });
+        } else {
+            _ = try self.uploadRequest(a, uri_commit_upload, &.{
+                .{ "uploadFileId", upload_file_id },
+                .{ "fileMd5", file_md5 },
+                .{ "sliceMd5", slice_md5 },
+                .{ "lazyCheck", "1" },
+                .{ "isLog", "0" },
+                .{ "opertype", "3" },
+            });
+        }
     }
 
     fn put(ptr: *anyopaque, ctx: *driver.Ctx, dst: []const u8, src: model.Source) anyerror!void {
@@ -1440,4 +1503,25 @@ test "lastSegment and parentOf split paths the way the vtable promises" {
     try testing.expectEqualStrings("/a/b", parentOf("/a/b/c.txt"));
     try testing.expectEqualStrings("/", parentOf("/c.txt"));
     try testing.expectEqualStrings("/", parentOf("/"));
+}
+
+test "H1: dupeStr copies into the caller's allocator, not the scratch arena" {
+    // H1 回归：getFiles 在内层 arena 里解析 JSON。若 name/thumb 直接借用
+    // JSON 字符串，函数返回即悬垂。dupeStr 必须拷进长期分配器 —— 这里用
+    // 「源 arena reset 后原地复用」来精确复现触发条件。
+    var live = std.heap.ArenaAllocator.init(testing.allocator);
+    defer live.deinit();
+    const la = live.allocator();
+
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    const raw = try scratch.allocator().dupe(u8, "photo.jpg");
+    const name = try Cloud189.dupeStr(la, raw);
+    const missing = try Cloud189.dupeStr(la, null);
+
+    _ = scratch.reset(.retain_capacity);
+    _ = try scratch.allocator().dupe(u8, "OVERWRITTEN!"); // 原地覆盖 raw
+
+    try testing.expectEqualStrings("photo.jpg", name);
+    try testing.expectEqualStrings("", missing);
 }

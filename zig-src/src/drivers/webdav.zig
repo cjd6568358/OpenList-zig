@@ -484,11 +484,22 @@ fn okProp(a: std.mem.Allocator, resp: *xml.Node) !?*xml.Node {
         _ = args;
         const url = try self.urlFor(a, path, false);
         const needs_auth = self.cfg.username.len != 0;
+        // L14：Go 的 `client.Link` 会把 cookie jar 里对该 URL 有效的 cookie
+        // 一并放进返回的 header（gowebdav `client.go:361-365`）。带 cookie 的
+        // WebDAV（如某些 NAS 的会话 cookie）缺了它，代理回源就 401。
+        var hdrs = List(model.Header).init(a);
+        if (needs_auth) try hdrs.appendSlice(try self.authHeaders(a, "GET", uriPath(url)));
+        var ck = Buf.init(a);
+        if (urlmod.Url.parse(url)) |t| {
+            if (try self.jar.headerFor(t.host, t.path, t.isHttps(), rt.nowSeconds(), &ck)) {
+                try hdrs.append(.{ .name = "Cookie", .value = try ck.toOwned() });
+            }
+        } else |_| {} // URL 解析失败：没有 cookie 可带，直链照发
         return .{
             .url = url,
             // 代理请求是 GET；Digest 的响应值绑定 method+uri，所以这里按
             // GET 算（Basic 与 method/uri 无关，两种模式下都正确）。
-            .header = if (needs_auth) try self.authHeaders(a, "GET", uriPath(url)) else &.{},
+            .header = try hdrs.toOwned(),
             .proxy = needs_auth,
         };
     }
@@ -659,7 +670,12 @@ fn okProp(a: std.mem.Allocator, resp: *xml.Node) !?*xml.Node {
         // 服务端若要求认证就会 401；实际部署里 PROPFIND（init/list）会先
         // 协商好，PUT 轮到时认证方式已确定。
         try headers.appendSlice(try self.authHeaders(a, "PUT", uriPath(target)));
-        try headers.append(.{ .name = "Content-Type", .value = "application/octet-stream" });
+        // L12：Go 的 gowebdav `put`（pkg/gowebdav/requests.go:199 起）**根本
+        // 不发** `Content-Type` —— resty 只在 body 是 string/[]byte/struct 时
+        // 才推断，这里是 `io.Reader`，于是什么都不设。以前这里恒定发
+        // `application/octet-stream`，与上游不一致（个别服务端会按 CT 分派
+        // 处理逻辑，照抄上游更安全）。
+
 
         const total: u64 = @intCast(@max(src.size(), 0));
 
@@ -750,8 +766,10 @@ pub const factory = driver.Factory{
     .addition_schema =
     \\{
     \\  "address":                 {"type":"string","required":true,"help":"WebDAV 服务地址，如 https://nas.example.com/dav"},
-    \\  "username":                 {"type":"string","required":false},
-    \\  "password":                 {"type":"string","required":false,"secret":true},
+    // L13：Go 的 `drivers/webdav/meta.go:11-12` 把 username / password 都标了
+    // `required:"true"`；以前这里是 false，前端表单会放过空凭据。
+    \\  "username":                 {"type":"string","required":true},
+    \\  "password":                 {"type":"string","required":true,"secret":true},
     \\  "root_folder_path":         {"type":"string","default":"/","help":"挂载的远端子路径"},
     \\  "show_hidden":              {"type":"bool","default":false,"help":"显示以点开头的隐藏条目"},
     \\  "tls_insecure_skip_verify": {"type":"bool","default":false,"help":"跳过 TLS 证书校验（自签名 NAS 需要）"}

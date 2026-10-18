@@ -3,7 +3,7 @@
 用 Zig 重写 OpenList 的可行性验证工程 —— 目标是把一个 OpenList 兼容的服务塞进
 中兴 F4610U 光猫（aarch64 / musl / squashfs）的极小空间里。
 
-**注册的十个驱动已全部实现（2026-10-13）。** 驱动集已于 2026-10-12 更换为
+**12 个注册项已全部实现并真机验证（2026-10-17，12/12 驱动）。** 驱动集已于 2026-10-12 更换为
 「正确变体」：`123Pan`（用户名+密码）、`Quark`（Cookie）、`115 Cloud`（Cookie）取代
 原 `123 Open`/`QuarkOpen`/`115 Open`（后三者代码保留但不再注册）。
 `115 Cloud` 的上传链是协议最重的部分（P-224 ECDH `ec115` + RSA/XOR `m115` + OSS），
@@ -12,9 +12,8 @@
 功能边界不变：
 远程 Range 仍经现有 HTTP client 缓冲响应；归档暂只支持本地 ZIP/TAR 列表，不支持远程归档、解压下载、ZIP64/加密。上传进度回调已全线接通（所有驱动按 Go `model.UpdateProgress` 报 0–100 百分比；itvsh 因并发上传用原子计数 + 独立轮询线程），但**尚无 `/api` 端点把它暴露给前端**。SFTP SSH 服务端**明确暂缓**（2026-10-11 决策 defer，备选 SSH 实现见 [`docs/STATUS.md`](docs/STATUS.md) §9，恢复时从该处继续）。
 
-Zig **0.17.0** 下 **328 passed / 3 skipped** 单元测试通过（3 项 itvsh 上传用例跳过；打包机 Linux 上 331/331 全通过）；
-交叉编译出的 aarch64 静态二进制为
-**1,144,432 B**（Go 版全量驱动为 45,154,464 B，裸小约 39.4 倍）。
+Zig **0.17.0** 下 **400/400** 单元测试通过（打包机；真机 e2e **92/92** 通过，见 [`docs/STATUS.md`](docs/STATUS.md) §38；更早的 437/20/2 基线是 §36 的 /115 上游最终一致性级联轮，脚本结构已改）；
+交叉编译出的 aarch64 静态二进制 **1,252,640 B**（Go 版全量驱动为 45,154,464 B，裸小约 36 倍）。
 本机端到端既有冒烟覆盖登录 / 文件操作 /
 12 MiB 上传下载 / 并发 / 路径穿越防护 / 前端三种加载模式 / WebDAV 服务端；真机
 e2e 覆盖云盘全操作（见 [`docs/STATUS.md`](docs/STATUS.md) §3）。
@@ -40,7 +39,7 @@ e2e 覆盖云盘全操作（见 [`docs/STATUS.md`](docs/STATUS.md) §3）。
 > **+296,096 B** 裸 / **+124,928 B** xz，框架地板 775,680 B 裸 / 325,488 B xz。
 > 当天的审计 P1/P2 修复与 P3/功能族补齐把基线进一步推到 **1,116,568 B**
 > （含 digest/mime/html/copy/进度等新代码，未重测边际）；10-13 晚再加 `wopan` 后
-> 最终 aarch64 二进制为 **1,144,432 B**（见 [`docs/STATUS.md`](docs/STATUS.md) §3）。
+> 最新产物与体积见 [`docs/STATUS.md`](docs/STATUS.md) §3/§36（本节数字为 2026-10-13 快照，未随每轮修复刷新）。
 > 三个 `_open` 变体（123 Open / QuarkOpen / 115 Open）已下线未注册，
 > 其历史边际（9,868 / 9,312 / 16,188 B）属 `_open` 时代的测量。
 
@@ -218,7 +217,10 @@ Zig 特有的东西放在 `zig` 块里，Go 版会忽略它：
 **已实现**：配置加载与写回、挂载点解析（最长前缀 + 段边界）、JWT 鉴权、
 `/api/fs/{list,get,dirs,mkdir,rename,move,remove,put}`、本地与代理下载（本地支持单 Range 流式，代理转发 Range）、
 本地 ZIP/TAR 归档目录列表（`/api/fs/archive/list`）、驱动层上传进度 callback（目前 Local 逐块触发）、
-设置接口（`/api/admin/setting/{list,get,default,save}`，仅 config-backed 项）、存储/驱动只读接口、
+设置接口（`/api/admin/setting/{list,get,default,save,delete}`，仅 config-backed 项）、
+**存储管理面全量 CRUD**（`/api/admin/storage/{list,get,create,update,delete,enable,disable,load_all}`，
+落盘回 config.json + 挂载热更新，2026-10-15 补齐）、
+**驱动表单元数据**（`/api/admin/driver/{list,names,info}`，Go `driver.Info` 形状）、
 任务中心空的 undone/done 列表、cookie 持久化、itvsh 完整协议（登录链 / 列表 / 上传分块并发 / 可回滚收尾 / 会话自愈）、
 **前端服务**（CDN / `dist_dir` / 内置占位页，含占位符替换与 PWA manifest），
 **WebDAV 服务端**（`/dav`：PROPFIND/MKCOL/GET/PUT/DELETE/COPY/MOVE，Windows 资源管理器可挂载）。
@@ -233,11 +235,12 @@ Zig 特有的东西放在 `zig` 块里，Go 版会忽略它：
 用用户真实配置（10 存储）跑出 **32 通过 / 0 失败 / 0 跳过** —— 9 挂载点全部列出、
 详情/下载/Range/sign 校验（含篡改 sign 被 401 拒）、WebDAV 读（PROPFIND 207 / GET 200 逐字节）、
 Local 全量写操作 13 项（mkdir/上传/重命名/移动/删除/WebDAV PUT/MKCOL/清理）全过。
-**十个驱动中九个已真机验证**；`WoPan` 仅注册 + 单测，因当前配置无 refresh_token 未真机。
+**12 个注册项全部真机验证**（§36B.5：含 WoPan 61/0/0、UC 全矩阵、115 Cloud mkdir/写入）。
 
 **未实现或仅部分实现**（见 [`docs/STATUS.md`](docs/STATUS.md) §9）：
 数据库与多用户体系、搜索、分享链接、后台任务/离线下载、归档解压与文件下载、远程归档浏览、
-远程 Range 的真正响应流式、完整设置与存储 CRUD、任务中心操作接口。
+远程 Range 的真正响应流式、任务中心操作接口。
+（存储 CRUD 与设置读写已于 2026-10-15 补齐，见 [`docs/STATUS.md`](docs/STATUS.md) §20。）
 **SFTP SSH 服务端：明确暂缓（defer）**，非本轮目标；备选 SSH 实现分析见 [`docs/STATUS.md`](docs/STATUS.md) §9。
 
 ## 已知平台差异

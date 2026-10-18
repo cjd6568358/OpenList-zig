@@ -36,12 +36,35 @@ pub const Ctx = struct {
     alloc: std.mem.Allocator,
     /// Prefix used in log lines, e.g. `[/nas]` or `[itvsh:家庭共享]`.
     tag: []const u8 = "",
+
+    /// 驱动在返回上游错误前，可把上游的**人类可读消息**写到这里（用
+    /// `ctx.alloc` 分配）。`api.zig` 的 `mapDriverError` 会优先用它当响应
+    /// message —— 对齐 Go：fs 操作失败时 `common.ErrorResp` 直接透出
+    /// `err.Error()`，用户看到的是 `capacity limit[{0}]` 这种真原因，而不是
+    /// 泛化的 "upstream error"（2026-10-16 全驱动回归发现，见 STATUS §31.7）。
+    ///
+    /// 值语义（不是指针）：`Ctx` 自己就活在**请求栈帧**上（handler 的局部
+    /// 变量），所以字段天然是请求级、无并发串台，handler 不需要额外开槽。
+    /// 驱动内部的辅助函数要把**这个字段的地址**（`&ctx.err_detail`）往下传
+    /// 才能写回。
+    /// 注意：Zig `error` 无 payload，这是把上游文本带出驱动的通道。
+    ///
+    /// ⚠ 只能在**请求线程**上写：多线程分块上传的驱动（如 itvsh 的 worker）
+    /// 从别的线程写它属于数据竞争。这类驱动要透传得先把消息收回到请求线程。
+    err_detail: ?[]const u8 = null,
+
     /// Optional upload progress sink. Mirrors OpenList's
     /// `driver.UpdateProgress` so the frontend's chunked upload can show a bar.
     /// `null` means "caller does not care about progress".
     progress: ?ProgressFn = null,
     /// Opaque per-request state handed back to `progress`.
     progress_userdata: ?*anyopaque = null,
+
+    /// 便利函数：写上游消息。空串按「没有消息」处理（避免响应回落时被空串
+    /// 顶掉默认的 "upstream error"）。
+    pub fn setErrDetail(self: *Ctx, msg: []const u8) void {
+        if (msg.len > 0) self.err_detail = msg;
+    }
 };
 
 /// Signature for the upload progress callback.
@@ -429,4 +452,18 @@ test "keys() reports exactly the registered driver names, no duplicates" {
         // find 必须能按这个 key 找到自己
         try testing.expectEqualStrings(k, find(k).?.key);
     }
+}
+
+test "Ctx.setErrDetail holds the upstream message; empty is ignored" {
+    // 请求级出口：api 层把响应 message 取走（对齐 Go err.Error() 透出）。
+    var ctx = Ctx{ .alloc = testing.allocator };
+    try testing.expect(ctx.err_detail == null);
+    ctx.setErrDetail("capacity limit[{0}]");
+    try testing.expectEqualStrings("capacity limit[{0}]", ctx.err_detail.?);
+    // 再次写入覆盖（长请求里可能有多段上游消息）
+    ctx.setErrDetail("other");
+    try testing.expectEqualStrings("other", ctx.err_detail.?);
+    // 空串不覆盖：否则会把默认的 "upstream error" 顶成空 message
+    ctx.setErrDetail("");
+    try testing.expectEqualStrings("other", ctx.err_detail.?);
 }

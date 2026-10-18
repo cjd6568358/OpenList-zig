@@ -72,6 +72,9 @@ pub const uc_conf = Conf{
 };
 
 const oss_ua = "aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit";
+/// L18：OSS 分片 PUT 的 Referer —— Go 是**硬编码**的
+/// （`drivers/quark_uc/util.go:241`），UC 变体也同样发夸克这个值。
+const oss_referer = "https://pan.quark.cn/";
 
 const page_size: i64 = 100;
 /// 秒传判定用：Go 里 hash 阶段直接看 `data.finish`。
@@ -220,7 +223,13 @@ pub const Quark = struct {
     }
 
     /// 通用请求（util.go:27-67）。`pathname` 以 `/` 开头。
-    fn request(self: *Quark, arena: std.mem.Allocator, pathname: []const u8, method: []const u8, query: ?[]const u8, body: []const u8, ua_override: ?[]const u8) ![]const u8 {
+    ///
+    /// `err_detail`：请求级的「上游消息出口」（`driver.Ctx.err_detail`，见
+    /// driver.zig）。上游失败时把它的 `message` 写进去，api 层拿来当响应
+    /// message —— 对齐 Go `errors.New(e.Message)`：用户看到 `capacity
+    /// limit[{0}]` 这种真原因，而不是泛化的 "upstream error"（STATUS §31.7）。
+    /// 没有请求上下文的调用（init 之外几乎都有）传 `null` 即可。
+    fn request(self: *Quark, arena: std.mem.Allocator, pathname: []const u8, method: []const u8, query: ?[]const u8, body: []const u8, ua_override: ?[]const u8, err_detail: ?*?[]const u8) ![]const u8 {
         const io = rt.io();
         self.req_mu.lockUncancelable(io);
         defer self.req_mu.unlock(io);
@@ -244,18 +253,35 @@ pub const Quark = struct {
 
         // 上游回写的会话 cookie 必须落盘，否则隔一阵就 401/403。
         self.absorbCookie(res, "__puus");
-        if (self.cfg.use_transcoding_address) self.absorbCookie(res, "__pus");
+        // M4（审计）：`__pus` 只在 **Quark** 变体下才吸收（util.go:55-61 的
+        // `d.UseTransCodingAddress && d.config.Name == "Quark"`）。UC 变体
+        // 走这条分支会把 UC 的 cookie 串写成夸克会话的值。
+        if (self.isQuarkVariant() and self.cfg.use_transcoding_address) self.absorbCookie(res, "__pus");
 
         const v = json.parse(arena, res.body) catch return Error.UpstreamNotJson;
         const status = v.intAt("status") orelse 0;
         const code = v.intAt("code") orelse 0;
         if (status >= 400 or code != 0) {
-            const msg = v.strAt("message") orelse "(no message)";
+            const msg = v.strAt("message") orelse "";
             log.warn("[quark] {s} {s} -> status {d} code {d}: {s}", .{ method, pathname, status, code, msg });
-            // 同名冲突在 MakeDir 里是可容忍的特定错误，交给调用方按文案判断。
+            // 把上游消息带出驱动（见 `request` 的 `err_detail` 文档）——
+            // 只带上游自己的文案，与 Go 的 err.Error() 内容一致；
+            // 同名冲突在 MakeDir 里是可容忍的特定错误，调用方按文案判断。
+            if (err_detail) |slot| {
+                if (msg.len > 0) slot.* = msg;
+            }
             return Error.UpstreamError;
         }
         return res.body;
+    }
+
+    /// M4（审计）：转码相关的两条判据在 Go 里都带 `d.config.Name == "Quark"`
+    /// （`util.go:55` 吸 `__pus`、`driver.go:66` 走转码链）—— 也就是说
+    /// **UC 变体永远不走转码**，即便用户开了 `use_transcoding_address`。
+    /// 以前这里只看开关，UC + 转码开启时行为与 Go 分叉（§36A.1 的 UC 全矩阵
+    /// 没开转码，所以没暴露）。
+    fn isQuarkVariant(self: *const Quark) bool {
+        return std.mem.eql(u8, self.conf.name, "Quark");
     }
 
     /// 从响应里捡一个指定 cookie 并写回配置（util.go:49-61）。
@@ -283,12 +309,12 @@ pub const Quark = struct {
         }
     }
 
-    fn get(self: *Quark, arena: std.mem.Allocator, pathname: []const u8, query: ?[]const u8) ![]const u8 {
-        return self.request(arena, pathname, "GET", query, "", null);
+    fn get(self: *Quark, arena: std.mem.Allocator, pathname: []const u8, query: ?[]const u8, err_detail: ?*?[]const u8) ![]const u8 {
+        return self.request(arena, pathname, "GET", query, "", null, err_detail);
     }
 
-    fn post(self: *Quark, arena: std.mem.Allocator, pathname: []const u8, body: []const u8) ![]const u8 {
-        return self.request(arena, pathname, "POST", null, body, null);
+    fn post(self: *Quark, arena: std.mem.Allocator, pathname: []const u8, body: []const u8, err_detail: ?*?[]const u8) ![]const u8 {
+        return self.request(arena, pathname, "POST", null, body, null, err_detail);
     }
 };
 
@@ -348,30 +374,30 @@ fn objFromJson(a: std.mem.Allocator, item: *const json.Value) !model.Obj {
     };
 }
 
-fn listPage(self: *Quark, arena: std.mem.Allocator, parent: []const u8, page: i64) !*const json.Value {
+fn listPage(self: *Quark, arena: std.mem.Allocator, parent: []const u8, page: i64, err_detail: ?*?[]const u8) !*const json.Value {
     const sort = if (!std.mem.eql(u8, self.cfg.order_by, "none"))
         try std.fmt.allocPrint(arena, "&_sort=file_type:asc,{s}:{s}", .{ self.cfg.order_by, self.cfg.order_direction })
     else
         "";
     const query = try std.fmt.allocPrint(arena, "&pdir_fid={s}&_size={d}&_fetch_total=1&fetch_all_file=1&fetch_risk_file_name=1{s}&_page={d}", .{ parent, page_size, sort, page });
-    const body = try self.get(arena, "/file/sort", query);
+    const body = try self.get(arena, "/file/sort", query, err_detail);
     const v = json.parse(arena, body) catch return Error.UpstreamNotJson;
     return v.getPath("data") orelse return Error.InvalidResponse;
 }
 
-fn resolveEntry(self: *Quark, arena: std.mem.Allocator, path: []const u8) !Entry {
+fn resolveEntry(self: *Quark, arena: std.mem.Allocator, path: []const u8, err_detail: ?*?[]const u8) !Entry {
     var cur = Entry{ .id = self.cfg.root_folder_id, .name = "/", .is_dir = true };
     var it = std.mem.tokenizeAny(u8, path, "/\\");
     while (it.next()) |seg| {
-        cur = try findChild(self, arena, cur.id, seg);
+        cur = try findChild(self, arena, cur.id, seg, err_detail);
     }
     return cur;
 }
 
-fn findChild(self: *Quark, arena: std.mem.Allocator, parent: []const u8, name: []const u8) !Entry {
+fn findChild(self: *Quark, arena: std.mem.Allocator, parent: []const u8, name: []const u8, err_detail: ?*?[]const u8) !Entry {
     var page: i64 = 1;
     while (true) {
-        const data = try listPage(self, arena, parent, page);
+        const data = try listPage(self, arena, parent, page, err_detail);
         const children = arrAt(data, "list");
         for (children, 0..) |_, i| {
             const item = &children[i];
@@ -399,7 +425,7 @@ fn findChild(self: *Quark, arena: std.mem.Allocator, parent: []const u8, name: [
 fn init(ptr: *anyopaque, ctx: *driver.Ctx) anyerror!void {
     const self = as(ptr);
     const a = ctx.alloc;
-    _ = try self.get(a, "/config", null);
+    _ = try self.get(a, "/config", null, &ctx.err_detail);
     // Go: AdditionVersion != 2 时迁移到 2（并按需打开 WebProxy/WebdavPolicy，
     // 那两个字段本工程没有，故只做版本号迁移）。
     if (self.cfg.addition_version != 2) {
@@ -418,13 +444,13 @@ fn deinit(ptr: *anyopaque, ctx: *driver.Ctx) void {
 fn list(ptr: *anyopaque, ctx: *driver.Ctx, dir: []const u8) anyerror![]model.Obj {
     const self = as(ptr);
     const a = ctx.alloc;
-    const entry = try resolveEntry(self, a, dir);
+    const entry = try resolveEntry(self, a, dir, &ctx.err_detail);
     if (!entry.is_dir) return driver.Error.NotFound;
 
     var out = List(model.Obj).init(a);
     var page: i64 = 1;
     while (true) {
-        const data = try listPage(self, a, entry.id, page);
+        const data = try listPage(self, a, entry.id, page, &ctx.err_detail);
         for (arrAt(data, "list")) |item| {
             const o = try objFromJson(a, &item);
             if (self.cfg.only_list_video_file and !o.is_dir and (item.intAt("category") orelse 0) != 1) continue;
@@ -442,7 +468,7 @@ fn details(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8) anyerror!model.F
     const a = ctx.alloc;
     var it = std.mem.tokenizeAny(u8, path, "/\\");
     if (it.next() == null) return .{ .name = "/", .is_dir = true };
-    const entry = try resolveEntry(self, a, path);
+    const entry = try resolveEntry(self, a, path, &ctx.err_detail);
     const raw = entry.raw orelse return .{ .name = entry.name, .is_dir = entry.is_dir };
     const o = try objFromJson(a, raw);
     return .{ .name = o.name, .size = o.size, .is_dir = o.is_dir, .modified = o.modified, .created = o.created };
@@ -452,14 +478,17 @@ fn link(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, args: driver.LinkAr
     const self = as(ptr);
     const a = ctx.alloc;
     _ = args;
-    const entry = try resolveEntry(self, a, path);
+    const entry = try resolveEntry(self, a, path, &ctx.err_detail);
     if (entry.is_dir) return driver.Error.NotSupported;
     const raw = entry.raw;
 
-    // 转码地址：仅 Quark、视频分类、且有大小（driver.go:66-71）
-    if (self.cfg.use_transcoding_address and (raw != null and (raw.?.intAt("category") orelse 0) == 1) and (raw != null and (raw.?.intAt("size") orelse 0) > 0)) {
+    // 转码地址：仅 Quark 变体、视频分类（category==1）、且有大小（driver.go:66-71）
+    if (self.isQuarkVariant() and self.cfg.use_transcoding_address and
+        (raw != null and (raw.?.intAt("category") orelse 0) == 1) and
+        (raw != null and (raw.?.intAt("size") orelse 0) > 0))
+    {
         const body = try std.fmt.allocPrint(a, "{{\"fid\":{s},\"resolutions\":\"low,normal,high,super,2k,4k\",\"supports\":\"fmp4_av,m3u8,dolby_vision\"}}", .{try jsonQuote(a, entry.id)});
-        const res = try self.request(a, "/file/v2/play/project", "POST", null, body, self.conf.ua);
+        const res = try self.request(a, "/file/v2/play/project", "POST", null, body, self.conf.ua, &ctx.err_detail);
         const v = json.parse(a, res) catch return Error.UpstreamNotJson;
         for (arrAt(&v, "data.video_list")) |item| {
             // `UC` 变体 `OnlyProxy`：转码地址同样靠 Cookie 认身份。
@@ -469,19 +498,39 @@ fn link(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, args: driver.LinkAr
     }
 
     const body = try std.fmt.allocPrint(a, "{{\"fids\":[{s}]}}", .{try jsonQuote(a, entry.id)});
-    const res = try self.request(a, "/file/download", "POST", null, body, self.conf.ua);
+    const res = try self.request(a, "/file/download", "POST", null, body, self.conf.ua, &ctx.err_detail);
     const v = json.parse(a, res) catch return Error.UpstreamNotJson;
     const url = v.strAt("data.0.download_url") orelse return Error.InvalidResponse;
+    return linkResult(a, url, self.cfg.cookie, self.conf.referer, self.conf.ua, self.conf.only_proxy);
+}
+
+/// 构造下载 `Link`（纯函数，可单测；`link()` 本身要联网）。
+///
+/// ⚠️ `header` 必须是分配器拥有的切片。**绝不能**写
+/// `return .{ .header = &[_]model.Header{...} }` —— 数组字面量会落在本
+/// 函数的栈帧里，返回后 `Link.header` 即悬垂。真机实锤（2026-10-16，抓包 +
+/// 线路解密）：代理下载读到栈残留，name/value 的 len 是 16MB 级垃圾，TLS 层
+/// 把它按 16KB 上限切成 16408 字节的畸形记录，CDN 回告警，openlist 侧表现为
+/// `sendBodiless failed: WriteFailed` + 502。与 `quark.zig` 的
+/// `linkResult()` 是同一个坑（那边先修了，这里当时漏掉）。
+fn linkResult(
+    alloc: std.mem.Allocator,
+    url: []const u8,
+    cookie: []const u8,
+    referer: []const u8,
+    ua: []const u8,
+    proxy: bool,
+) !model.Link {
+    const hdrs = try alloc.alloc(model.Header, 3);
+    hdrs[0] = .{ .name = "Cookie", .value = cookie };
+    hdrs[1] = .{ .name = "Referer", .value = referer };
+    hdrs[2] = .{ .name = "User-Agent", .value = ua };
     return .{
         .url = url,
-        .header = &[_]model.Header{
-            .{ .name = "Cookie", .value = self.cfg.cookie },
-            .{ .name = "Referer", .value = self.conf.referer },
-            .{ .name = "User-Agent", .value = self.conf.ua },
-        },
+        .header = hdrs,
         // 对齐 Go `driver.Config.OnlyProxy`（UC 变体为 true）：直链必须经服务端
         // 代理，否则 api.zig 会 302 出去、Cookie 丢了链接就失效。
-        .proxy = self.conf.only_proxy,
+        .proxy = proxy,
     };
 }
 
@@ -489,7 +538,8 @@ fn makeDir(ptr: *anyopaque, ctx: *driver.Ctx, dir: []const u8) anyerror!void {
     const self = as(ptr);
     const a = ctx.alloc;
     const name = pathBase(dir) orelse return Error.InvalidPath;
-    const parent = try resolveEntry(self, a, pathParent(dir) orelse return Error.InvalidPath);
+    const pp = pathParent(dir) orelse return Error.InvalidPath;
+    const parent = try resolveEntry(self, a, pp, &ctx.err_detail);
     const body = try std.fmt.allocPrint(a, "{{\"dir_init_lock\":false,\"dir_path\":\"\",\"file_name\":{s},\"pdir_fid\":{s}}}", .{ try jsonQuote(a, name), try jsonQuote(a, parent.id) });
     const res_body = try requestUnchecked(self, a, "/file", "POST", body);
     const v = json.parse(a, res_body) catch return Error.UpstreamNotJson;
@@ -510,39 +560,41 @@ fn makeDir(ptr: *anyopaque, ctx: *driver.Ctx, dir: []const u8) anyerror!void {
         return error.TargetExists;
     }
     log.warn("[quark] mkdir {s}: {s}", .{ name, msg });
+    // 同样把上游 message 带出去（容量满时 mkdir 也会失败）。
+    ctx.setErrDetail(msg);
     return Error.UpstreamError;
 }
 
 fn move(ptr: *anyopaque, ctx: *driver.Ctx, src: []const u8, dst_dir: []const u8) anyerror!void {
     const self = as(ptr);
     const a = ctx.alloc;
-    const entry = try resolveEntry(self, a, src);
-    const dst = try resolveEntry(self, a, dst_dir);
+    const entry = try resolveEntry(self, a, src, &ctx.err_detail);
+    const dst = try resolveEntry(self, a, dst_dir, &ctx.err_detail);
     const body = try std.fmt.allocPrint(a, "{{\"action_type\":1,\"exclude_fids\":[],\"filelist\":[{s}],\"to_pdir_fid\":{s}}}", .{ try jsonQuote(a, entry.id), try jsonQuote(a, dst.id) });
-    _ = try self.post(a, "/file/move", body);
+    _ = try self.post(a, "/file/move", body, &ctx.err_detail);
 }
 
 fn rename(ptr: *anyopaque, ctx: *driver.Ctx, src: []const u8, new_name: []const u8) anyerror!void {
     const self = as(ptr);
     const a = ctx.alloc;
-    const entry = try resolveEntry(self, a, src);
+    const entry = try resolveEntry(self, a, src, &ctx.err_detail);
     const body = try std.fmt.allocPrint(a, "{{\"fid\":{s},\"file_name\":{s}}}", .{ try jsonQuote(a, entry.id), try jsonQuote(a, new_name) });
-    _ = try self.post(a, "/file/rename", body);
+    _ = try self.post(a, "/file/rename", body, &ctx.err_detail);
 }
 
 fn remove(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, is_dir: bool) anyerror!void {
     const self = as(ptr);
     const a = ctx.alloc;
     _ = is_dir;
-    const entry = try resolveEntry(self, a, path);
+    const entry = try resolveEntry(self, a, path, &ctx.err_detail);
     const body = try std.fmt.allocPrint(a, "{{\"action_type\":1,\"exclude_fids\":[],\"filelist\":[{s}]}}", .{try jsonQuote(a, entry.id)});
-    _ = try self.post(a, "/file/delete", body);
+    _ = try self.post(a, "/file/delete", body, &ctx.err_detail);
 }
 
 fn space(ptr: *anyopaque, ctx: *driver.Ctx) anyerror!driver.DiskUsage {
     const self = as(ptr);
     const a = ctx.alloc;
-    const body = try self.get(a, "/member", "&fetch_subscribe=false&_ch=home&fetch_identity=false");
+    const body = try self.get(a, "/member", "&fetch_subscribe=false&_ch=home&fetch_identity=false", &ctx.err_detail);
     const v = json.parse(a, body) catch return Error.UpstreamNotJson;
     return .{
         .total = v.intAt("data.total_capacity") orelse 0,
@@ -598,7 +650,8 @@ fn put(ptr: *anyopaque, ctx: *driver.Ctx, dst: []const u8, src: model.Source) an
     const size = src.size();
     if (size < 0) return Error.InvalidPath;
     const name = pathBase(dst) orelse return Error.InvalidPath;
-    const parent = try resolveEntry(self, a, pathParent(dst) orelse return Error.InvalidPath);
+    const pp = pathParent(dst) orelse return Error.InvalidPath;
+    const parent = try resolveEntry(self, a, pp, &ctx.err_detail);
 
     // 1) MD5 + SHA1（一遍读、一块 buffer）
     var md5 = hash.Md5.init(.{});
@@ -630,7 +683,7 @@ fn put(ptr: *anyopaque, ctx: *driver.Ctx, dst: []const u8, src: model.Source) an
         "{{\"ccp_hash_update\":true,\"dir_name\":\"\",\"file_name\":{s},\"format_type\":\"{s}\",\"l_created_at\":{d},\"l_updated_at\":{d},\"pdir_fid\":{s},\"size\":{d}}}",
         .{ try jsonQuote(a, name), content_type, now_ms, now_ms, try jsonQuote(a, parent.id), size },
     );
-    const pre_res = try self.post(a, "/file/upload/pre", pre_body);
+    const pre_res = try self.post(a, "/file/upload/pre", pre_body, &ctx.err_detail);
     const pv = json.parse(a, pre_res) catch return Error.UpstreamNotJson;
     const pre = UpPre{
         .task_id = pv.strAt("data.task_id") orelse return Error.InvalidResponse,
@@ -650,7 +703,7 @@ fn put(ptr: *anyopaque, ctx: *driver.Ctx, dst: []const u8, src: model.Source) an
 
     // 3) hash（秒传判定）
     const hash_body = try std.fmt.allocPrint(a, "{{\"md5\":\"{s}\",\"sha1\":\"{s}\",\"task_id\":{s}}}", .{ md5_hex, sha1_hex, try jsonQuote(a, pre.task_id) });
-    const hash_res = try self.post(a, "/file/update/hash", hash_body);
+    const hash_res = try self.post(a, "/file/update/hash", hash_body, &ctx.err_detail);
     const hv = json.parse(a, hash_res) catch return Error.UpstreamNotJson;
     if (boolAt(&hv, "data.finish") orelse false) {
         if (ctx.progress) |f| f(ctx.progress_userdata, 100);
@@ -673,7 +726,7 @@ fn put(ptr: *anyopaque, ctx: *driver.Ctx, dst: []const u8, src: model.Source) an
             etags[@intCast(idx - 1)] = blk: {
                 var attempt: u8 = 0;
                 while (true) : (attempt += 1) {
-                    if (upPart(self, a, pre, idx, chunk_buf[0..len], content_type)) |etag| {
+                    if (upPart(self, a, pre, idx, chunk_buf[0..len], content_type, &ctx.err_detail)) |etag| {
                         break :blk etag;
                     } else |e| {
                         if (attempt + 1 >= 3) return e;
@@ -688,9 +741,9 @@ fn put(ptr: *anyopaque, ctx: *driver.Ctx, dst: []const u8, src: model.Source) an
     }
 
     // 5) commit + finish
-    try upCommit(self, a, pre, etags);
+    try upCommit(self, a, pre, etags, &ctx.err_detail);
     const fin_body = try std.fmt.allocPrint(a, "{{\"obj_key\":{s},\"task_id\":{s}}}", .{ try jsonQuote(a, pre.obj_key), try jsonQuote(a, pre.task_id) });
-    _ = try self.post(a, "/file/upload/finish", fin_body);
+    _ = try self.post(a, "/file/upload/finish", fin_body, &ctx.err_detail);
     // Go: upFinish 之后固定 sleep 1s（让上游把文件挂进目录）
     rt.sleepMillis(1000);
     if (ctx.progress) |f| f(ctx.progress_userdata, 100);
@@ -707,11 +760,11 @@ fn ossUrl(a: std.mem.Allocator, pre: UpPre, extra_query: []const u8) ![]const u8
 }
 
 /// 拿一次 OSS 授权（util.go:204-225）。`auth_meta` 是要签名的规范串。
-fn upAuth(self: *Quark, a: std.mem.Allocator, pre: UpPre, auth_meta: []const u8) ![]const u8 {
+fn upAuth(self: *Quark, a: std.mem.Allocator, pre: UpPre, auth_meta: []const u8, err_detail: ?*?[]const u8) ![]const u8 {
     const body = try std.fmt.allocPrint(a, "{{\"auth_info\":{s},\"auth_meta\":{s},\"task_id\":{s}}}", .{
         try jsonQuote(a, pre.auth_info), try jsonQuote(a, auth_meta), try jsonQuote(a, pre.task_id),
     });
-    const res = try self.post(a, "/file/upload/auth", body);
+    const res = try self.post(a, "/file/upload/auth", body, err_detail);
     const v = json.parse(a, res) catch return Error.UpstreamNotJson;
     return v.strAt("data.auth_key") orelse return Error.InvalidResponse;
 }
@@ -720,7 +773,7 @@ fn httpDate(a: std.mem.Allocator) ![]const u8 {
     return cookiejar.httpDate(a, rt.nowSeconds());
 }
 
-fn upPart(self: *Quark, a: std.mem.Allocator, pre: UpPre, part_no: i64, chunk: []const u8, content_type: []const u8) ![]const u8 {
+fn upPart(self: *Quark, a: std.mem.Allocator, pre: UpPre, part_no: i64, chunk: []const u8, content_type: []const u8, err_detail: ?*?[]const u8) ![]const u8 {
     const date = try httpDate(a);
     const path = try std.fmt.allocPrint(a, "/{s}/{s}?partNumber={d}&uploadId={s}", .{ pre.bucket, pre.obj_key, part_no, pre.upload_id });
     // `Content-Type` 必须与签名串里的那个一致 —— Go 传的是 `stream.GetMimetype()`
@@ -728,7 +781,7 @@ fn upPart(self: *Quark, a: std.mem.Allocator, pre: UpPre, part_no: i64, chunk: [
     const auth_meta = try std.fmt.allocPrint(a, "PUT\n\n{s}\n{s}\nx-oss-date:{s}\nx-oss-user-agent:{s}\n{s}", .{
         content_type, date, date, oss_ua, path,
     });
-    const auth_key = try upAuth(self, a, pre, auth_meta);
+    const auth_key = try upAuth(self, a, pre, auth_meta, err_detail);
     const q = try std.fmt.allocPrint(a, "partNumber={d}&uploadId={s}", .{ part_no, pre.upload_id });
     const res = self.client.send(a, .{
         .method = "PUT",
@@ -736,7 +789,10 @@ fn upPart(self: *Quark, a: std.mem.Allocator, pre: UpPre, part_no: i64, chunk: [
         .headers = &[_]model.Header{
             .{ .name = "Authorization", .value = auth_key },
             .{ .name = "Content-Type", .value = content_type },
-            .{ .name = "Referer", .value = try std.fmt.allocPrint(a, "{s}/", .{self.conf.referer}) },
+            // L18：Go 这里**硬编码** `https://pan.quark.cn/`
+            // （util.go:241），不跟变体走 —— UC 的分片 PUT 也发夸克的
+            // Referer。照抄上游（它是不是上游的笔误与本工程无关）。
+            .{ .name = "Referer", .value = oss_referer },
             .{ .name = "x-oss-date", .value = date },
             .{ .name = "x-oss-user-agent", .value = oss_ua },
         },
@@ -750,7 +806,7 @@ fn upPart(self: *Quark, a: std.mem.Allocator, pre: UpPre, part_no: i64, chunk: [
     return res.header("ETag") orelse return Error.InvalidResponse;
 }
 
-fn upCommit(self: *Quark, a: std.mem.Allocator, pre: UpPre, etags: [][]const u8) !void {
+fn upCommit(self: *Quark, a: std.mem.Allocator, pre: UpPre, etags: [][]const u8, err_detail: ?*?[]const u8) !void {
     // <CompleteMultipartUpload><Part><PartNumber>..</PartNumber><ETag>..</ETag></Part>..
     var xml = Buf.init(a);
     try xml.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUpload>\n");
@@ -775,7 +831,7 @@ fn upCommit(self: *Quark, a: std.mem.Allocator, pre: UpPre, etags: [][]const u8)
     const auth_meta = try std.fmt.allocPrint(a, "POST\n{s}\napplication/xml\n{s}\nx-oss-callback:{s}\nx-oss-date:{s}\nx-oss-user-agent:{s}\n{s}", .{
         content_md5, date, callback_b64, date, oss_ua, path,
     });
-    const auth_key = try upAuth(self, a, pre, auth_meta);
+    const auth_key = try upAuth(self, a, pre, auth_meta, err_detail);
 
     const res = self.client.send(a, .{
         .method = "POST",
@@ -1001,6 +1057,28 @@ test "T3: the UC variant is its own registered driver, not an alias" {
 
 
 
+test "M4: transcoding criteria are Quark-only (Go config.Name == \"Quark\")" {
+    // 审计 M4：Go 的两处转码判据都带 `d.config.Name == "Quark"`
+    // （`util.go:55` 吸 `__pus`；`driver.go:66` 走转码链）。以前 Zig 只看
+    // `use_transcoding_address` 开关 —— UC 变体开了开关就会分叉。
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const q = try createWithId(a, 31, null, quark_conf);
+    defer q.client.deinit();
+    try testing.expect(q.isQuarkVariant());
+
+    const uc = try createWithId(a, 32, null, uc_conf);
+    defer uc.client.deinit();
+    try testing.expect(!uc.isQuarkVariant());
+
+    // 变体名就是 Go 的 `driver.Config.Name`，两个变体必须逐字对上
+    try testing.expectEqualStrings("Quark", q.conf.name);
+    try testing.expectEqualStrings("UC", uc.conf.name);
+}
+
+
 test "T2: copy is NotSupported, matching Go" {
     // Go `drivers/quark_uc/driver.go:116-118` 的 Copy 就是 `return errs.NotSupport`。
     // 夸克服务端没有服务端复制接口，上游因此不做。`Driver.copy` 的默认槽
@@ -1013,4 +1091,34 @@ test "T2: copy is NotSupported, matching Go" {
     const d = driver.asDriver(Quark, self);
     var ctx = driver.Ctx{ .alloc = a };
     try testing.expectError(driver.Error.NotSupported, d.copy(&ctx, "/src", "/dst"));
+}
+
+test "linkResult: header array is allocator-owned (no dangling stack literal)" {
+    // 回归测试，对应 2026-10-16 真机事故：`return .{ .header = &[_]model.Header{...} }`
+    // 的数组字面量落在被调函数栈帧里，返回后即悬垂 —— 生产表现为代理下载
+    // 拿到 len 16MB 级的垃圾头、TLS 切成 16408B 畸形记录、CDN 告警 + 502。
+    //
+    // 检测手法：linkResult 返回后大量污染栈（8KB x 若干次），再解引用。
+    // 若 header 是栈字面量，name/value 的 len 会被踩成垃圾，断言必然失败。
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cookie = "x_pan_client_id=abc; x_pan_access_token=def";
+    const lk = try linkResult(a, "https://cdn.example/f", cookie,
+        "https://pan.quark.cn", "Mozilla/5.0 quark", true);
+    var pollute_buf: [8192]u8 = undefined;
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        @memset(&pollute_buf, 0xAA);
+        std.mem.doNotOptimizeAway(&pollute_buf);
+    }
+    try testing.expect(lk.proxy);
+    try testing.expectEqualStrings("https://cdn.example/f", lk.url);
+    try testing.expectEqual(@as(usize, 3), lk.header.len);
+    try testing.expectEqualStrings("Cookie", lk.header[0].name);
+    try testing.expectEqualStrings(cookie, lk.header[0].value);
+    try testing.expectEqualStrings("Referer", lk.header[1].name);
+    try testing.expectEqualStrings("https://pan.quark.cn", lk.header[1].value);
+    try testing.expectEqualStrings("User-Agent", lk.header[2].name);
+    try testing.expectEqualStrings("Mozilla/5.0 quark", lk.header[2].value);
 }

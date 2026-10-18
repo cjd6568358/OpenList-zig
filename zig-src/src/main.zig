@@ -22,11 +22,6 @@ const http = @import("http.zig");
 const api = @import("api.zig");
 const client = @import("client.zig");
 const cookiejar = @import("cookiejar.zig");
-const model = @import("model.zig");
-const json = @import("util/json.zig");
-const hashmod = @import("util/hash.zig");
-const urlmod = @import("util/url.zig");
-const Buf = @import("util/buf.zig").Buf;
 const List = @import("util/buf.zig").List;
 const rt = @import("rt.zig");
 
@@ -116,6 +111,17 @@ pub fn main(init: std.process.Init) !void {
         builtin.zig_version_string,
         @tagName(builtin.os.tag),
     });
+
+    // Go `internal/bootstrap/run.go:88-90`：`delayed_start != 0` 时先睡 N 秒，
+    // 之后才加载存储、开监听 —— 给「先于 openlist 上电的上游」留启动窗口
+    // （典型：NAS / 软路由重启后本插件自启，上游还没起来）。
+    // 负值按 0 处理（Go 的 time.Sleep 对负值立即返回）。
+    if (cfg.delayed_start > 0) {
+        log.info("delayed start for {d} seconds", .{cfg.delayed_start});
+        std.Io.sleep(init.io, std.Io.Duration.fromSeconds(cfg.delayed_start), .awake) catch |e| {
+            log.warn("delayed start interrupted: {s}", .{@errorName(e)});
+        };
+    }
 
     // Let drivers write their own `addition` back to config.json. itvsh needs
     // this for session cookies and the per-user forwardUrl.
@@ -218,78 +224,9 @@ fn handleRequest(ctx: *anyopaque, req: *http.Request, res: *http.Response) anyer
 // Storage construction
 // ---------------------------------------------------------------------------
 
-fn buildMounts(gpa: std.mem.Allocator, app: *api.App, cfg: *config.Config) !void {
-    var mounts = List(api.Mount).init(gpa);
-    var seen_paths = List([]const u8).init(gpa);
-
-    for (cfg.storages) |*s| {
-        if (s.disabled) {
-            log.info("storage #{d} {s}: disabled, skipping", .{ s.id, s.driver });
-            continue;
-        }
-        // T6：这里可能是后台线程。归一化已由主线程的 normalizeDriverNames
-        // 完成，find 必然命中；仍保留 find 是为了在同步回退路径上也安全。
-        const f = driver.find(s.driver) orelse {
-            log.err("storage #{d}: no driver named {s} in this build (compiled in: see /api/fs/dirs)", .{ s.id, s.driver });
-            continue;
-        };
-
-        // Parse `addition` — a JSON *string*, exactly as the Go build stores it.
-        const add_text = if (s.addition.len > 0) s.addition else "{}";
-        const add_val = json.parse(gpa, add_text) catch |e| {
-            log.err("storage #{d} {s}: addition is not valid JSON ({s})", .{ s.id, s.driver, @errorName(e) });
-            continue;
-        };
-
-        // C02：把真实 storage id 传进工厂。驱动靠它把刷新后的 token/cookie
-        // 经 `persist` 写回配置；传 0 会让回写落到不存在的记录上。
-        const drv = f.create(gpa, s.id, &add_val) catch |e| {
-            log.err("storage #{d} {s}: create failed: {s}", .{ s.id, s.driver, @errorName(e) });
-            continue;
-        };
-
-        var init_ctx = driver.Ctx{ .alloc = gpa, .tag = s.mount_path };
-        drv.init(&init_ctx) catch |e| {
-            // One broken storage must not take the process down: the Go build
-            // marks it "disabled" and keeps serving the others, and a 光猫
-            // that refuses to boot because a phone number changed is worse
-            // than one with a red row in the UI.
-            log.err("storage #{d} {s}: init failed: {s} — marking as errored", .{ s.id, s.driver, @errorName(e) });
-            s.error_msg = gpa.dupe(u8, @errorName(e)) catch "";
-            // S03：init 失败的驱动也要释放，否则每次配置重载都漏一个驱动
-            // （它持有的 jar / client 都在 gpa 上）。
-            drv.deinit(&init_ctx);
-            continue;
-        };
-
-        const mp = try normalizeMountPath(gpa, s.mount_path);
-        for (seen_paths.slice()) |p| {
-            if (std.mem.eql(u8, p, mp)) {
-                log.err("storage #{d}: mount path {s} is already taken, skipping", .{ s.id, mp });
-                break;
-            }
-        } else {
-            try seen_paths.append(mp);
-            try mounts.append(.{
-                .storage = s.*,
-                .driver = drv,
-                .mount_path = mp,
-                .label = f.label,
-            });
-            log.info("storage #{d} {s} -> {s} ({s})", .{ s.id, s.driver, mp, f.label });
-        }
-    }
-
-    // Longest mount path first, so `/nas/photos` wins over `/nas`.
-    std.mem.sort(api.Mount, mounts.sliceMut(), {}, struct {
-        fn gt(_: void, a: api.Mount, b: api.Mount) bool {
-            return a.mount_path.len > b.mount_path.len;
-        }
-    }.gt);
-
-    // T6：一次性发布。发布后内容永不再变，读方拿快照即可安全用（含调用驱动）。
-    app.publishMounts(try mounts.toOwned());
-}
+// 挂载构建本体已迁到 api.zig（`buildMountsFromConfig` / `buildMountFromStorage`）：
+// 启动 worker、`load_all` 与管理面增改删需要同一套 find → parse → create →
+// init → 归一 → 去重逻辑，两份实现必漂移。这里只保留启动专用的封装。
 
 /// 用户 2026-10-12 定的规则：**写回一律用 Go 名**。
 ///
@@ -300,8 +237,9 @@ fn buildMounts(gpa: std.mem.Allocator, app: *api.App, cfg: *config.Config) !void
 /// Go 的 `driver.Config.Name`，这样 `cfg.save()`（token/cookie 回写、设置修改）
 /// 落盘的永远是 Go 认识的名字。
 ///
-/// ⚠️ 必须在**主线程**调用：`save()` → `syncStorages()` 会读 `s.driver`，
-/// 后台初始化线程写它会数据竞争（撕裂的 slice 头 → 配置里出现野指针）。
+/// ⚠️ 必须在**主线程、任何请求出现之前**调用：它直接改 `cfg.storages` 元素
+/// 字段，要和后台 init 线程 / 管理面操作错开（后两者都持有
+/// `App.storage_ops_lock`，主线程在这里先跑、不与它们重叠）。
 fn normalizeDriverNames(cfg: *config.Config) void {
     for (cfg.storages) |*s| {
         if (s.disabled) continue;
@@ -318,8 +256,14 @@ fn normalizeDriverNames(cfg: *config.Config) void {
 
 /// T6：后台线程入口 —— 构造 + init 所有存储，然后一次性发布挂载表。
 /// 绝不传播异常：init 失败的存储被跳过（记 `error_msg`），其余照常服务。
+///
+/// 持 `App.storage_ops_lock`：与网页管理面的存储增改删 / `load_all` 互斥 ——
+/// 否则启动 init 还在跑时用户加一个存储，两路重建会互相覆盖发布。
 fn buildMountsWorker(gpa: std.mem.Allocator, app: *api.App, cfg: *config.Config) void {
-    buildMounts(gpa, app, cfg) catch |e| {
+    const io = rt.io();
+    app.storage_ops_lock.lockUncancelable(io);
+    defer app.storage_ops_lock.unlock(io);
+    api.buildMountsFromConfig(gpa, app, cfg) catch |e| {
         log.err("storage: background init failed: {s}", .{@errorName(e)});
     };
     if (app.mountsSnapshot().len == 0) {
@@ -352,18 +296,24 @@ fn waitForMountsReady() void {
     }
 }
 
-fn normalizeMountPath(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
-    const cleaned = try urlmod.cleanPath(a, if (raw.len == 0) "/" else raw);
-    return if (cleaned.len == 0) try a.dupe(u8, "/") else cleaned;
-}
-
 /// Called by drivers when they mutate their own `addition` blob.
+///
+/// 改 `s.addition` 前自取 `storages_mutex`：它可能与管理面增删改、
+/// `syncStorages` 序列化并发（itvsh 在 401 自愈时会异步回写 cookie）。
+/// **改完解锁再 save**（save 内部 g_save → storages 有序嵌套，反序会死锁）。
 fn persistStorage(storage_id: i64, addition_json: []const u8) void {
     if (!config.isLoaded()) return;
     const cfg = config.get();
-    const s = cfg.storageById(storage_id) orelse return;
-    const a = cfg.allocator();
-    s.addition = a.dupe(u8, addition_json) catch return;
+    config.lockStorages();
+    var found = false;
+    if (cfg.storageById(storage_id)) |sp| {
+        if (cfg.allocator().dupe(u8, addition_json)) |owned| {
+            sp.addition = owned;
+            found = true;
+        } else |_| {}
+    }
+    config.unlockStorages();
+    if (!found) return;
     cfg.save() catch |e| {
         log.warn("could not persist storage #{d}: {s}", .{ storage_id, @errorName(e) });
     };
@@ -695,13 +645,14 @@ const USAGE =
 const testing = std.testing;
 
 test "normalizeMountPath" {
+    // 实现已迁到 api.zig（挂载构建器需要它）；这里继续钉住行为。
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expectEqualStrings("/", try normalizeMountPath(a, ""));
-    try testing.expectEqualStrings("/", try normalizeMountPath(a, "/"));
-    try testing.expectEqualStrings("/nas", try normalizeMountPath(a, "/nas/"));
-    try testing.expectEqualStrings("/a/b", try normalizeMountPath(a, "//a//b"));
+    try testing.expectEqualStrings("/", try api.normalizeMountPath(a, ""));
+    try testing.expectEqualStrings("/", try api.normalizeMountPath(a, "/"));
+    try testing.expectEqualStrings("/nas", try api.normalizeMountPath(a, "/nas/"));
+    try testing.expectEqualStrings("/a/b", try api.normalizeMountPath(a, "//a//b"));
 }
 
 test "version string is non-empty" {

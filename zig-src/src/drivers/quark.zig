@@ -376,7 +376,9 @@ pub const QuarkOpen = struct {
         defer arena.deinit();
         const a = arena.allocator();
 
-        const body = try self.request(a, path_user_info, "GET", null, .{}, false);
+        // init 不属于任何请求（没有 handler 建的槽），传 null —— 上游消息走
+        // 启动日志即可，无需透出到 API。
+        const body = try self.request(a, path_user_info, "GET", null, .{}, false, null);
         const v = json.parse(a, body) catch return Error.UpstreamNotJson;
         const uid = v.strAt("data.user_id") orelse "";
         if (uid.len == 0) return Error.NoUserId;
@@ -412,6 +414,10 @@ pub const QuarkOpen = struct {
     ///
     /// `retried` 用于保证 token 过期只重试一轮 —— Go 版靠递归，理论上可以
     /// 无限套娃（每次刷新都失败的话）；这里显式收口。
+    /// `err_detail`：请求级「上游消息出口」（`driver.Ctx.err_detail`，见
+    /// driver.zig）—— 与 quarkuc 同一机制：上游失败时把 `error_info` 写进去，
+    /// api 层拿来当响应 message，对齐 Go `errors.New(e.Message)`。
+    /// 没有请求上下文的调用传 `null`。
     fn request(
         self: *QuarkOpen,
         arena: std.mem.Allocator,
@@ -420,6 +426,7 @@ pub const QuarkOpen = struct {
         body: ?[]const u8,
         sign_in: Sign,
         retried: bool,
+        err_detail: ?*?[]const u8,
     ) ![]const u8 {
         var sign = sign_in;
         if (sign.token.len == 0) {
@@ -469,18 +476,22 @@ pub const QuarkOpen = struct {
             if (retried) return Error.TokenExpired;
             log.info("[quark] access_token expired (errno={d}), refreshing", .{errno});
             try self.refreshToken(arena);
-            return self.request(arena, pathname, method, body, .{}, true);
+            return self.request(arena, pathname, method, body, .{}, true, err_detail);
         }
 
         if (status >= 400 or errno != 0) {
             log.warn("[quark] {s} status={d} errno={d} info={s}", .{ pathname, status, errno, info });
+            // 把上游文案带出驱动（同 quarkuc）—— 只带上游自己的 `error_info`。
+            if (err_detail) |slot| {
+                if (info.len > 0) slot.* = info;
+            }
             return Error.UpstreamError;
         }
         return res.body;
     }
 
-    fn postJson(self: *QuarkOpen, arena: std.mem.Allocator, pathname: []const u8, body: []const u8) ![]const u8 {
-        return self.request(arena, pathname, "POST", body, .{}, false);
+    fn postJson(self: *QuarkOpen, arena: std.mem.Allocator, pathname: []const u8, body: []const u8, err_detail: ?*?[]const u8) ![]const u8 {
+        return self.request(arena, pathname, "POST", body, .{}, false, err_detail);
     }
 
     /// 在线 renewapi 续期。Go 版重试 3 次，这里同样。
@@ -550,20 +561,20 @@ pub const QuarkOpen = struct {
     };
 
     /// 夸克和 123pan 一样只认 ID，所以同样要逐级列目录。
-    fn resolveEntry(self: *QuarkOpen, arena: std.mem.Allocator, path: []const u8) !Entry {
+    fn resolveEntry(self: *QuarkOpen, arena: std.mem.Allocator, path: []const u8, err_detail: ?*?[]const u8) !Entry {
         var cur = Entry{ .id = self.cfg.root_folder_id, .name = "/", .is_dir = true };
         var it = std.mem.tokenizeAny(u8, path, "/\\");
         while (it.next()) |seg| {
-            cur = try self.findChild(arena, cur.id, seg);
+            cur = try self.findChild(arena, cur.id, seg, err_detail);
         }
         return cur;
     }
 
-    fn findChild(self: *QuarkOpen, arena: std.mem.Allocator, parent_fid: []const u8, name: []const u8) !Entry {
+    fn findChild(self: *QuarkOpen, arena: std.mem.Allocator, parent_fid: []const u8, name: []const u8, err_detail: ?*?[]const u8) !Entry {
         var cursor_version: []const u8 = "";
         var cursor_token: []const u8 = "";
         while (true) {
-            const body = try self.listPage(arena, parent_fid, cursor_version, cursor_token);
+            const body = try self.listPage(arena, parent_fid, cursor_version, cursor_token, err_detail);
             const v = json.parse(arena, body) catch return Error.UpstreamNotJson;
 
             const children = arrAt(&v, "data.file_list");
@@ -592,6 +603,7 @@ pub const QuarkOpen = struct {
         parent_fid: []const u8,
         cursor_version: []const u8,
         cursor_token: []const u8,
+        err_detail: ?*?[]const u8,
     ) ![]const u8 {
         var b = Buf.init(arena);
         var w = ObjWriter{ .b = &b };
@@ -608,15 +620,15 @@ pub const QuarkOpen = struct {
             try inner.end();
         }
         try w.end();
-        return self.postJson(arena, path_file_list, b.slice());
+        return self.postJson(arena, path_file_list, b.slice(), err_detail);
     }
 
-    fn listAll(self: *QuarkOpen, arena: std.mem.Allocator, parent_fid: []const u8) ![]model.Obj {
+    fn listAll(self: *QuarkOpen, arena: std.mem.Allocator, parent_fid: []const u8, err_detail: ?*?[]const u8) ![]model.Obj {
         var out = List(model.Obj).init(arena);
         var cursor_version: []const u8 = "";
         var cursor_token: []const u8 = "";
         while (true) {
-            const body = try self.listPage(arena, parent_fid, cursor_version, cursor_token);
+            const body = try self.listPage(arena, parent_fid, cursor_version, cursor_token, err_detail);
             const v = json.parse(arena, body) catch return Error.UpstreamNotJson;
             for (arrAt(&v, "data.file_list")) |item| try out.append(objFromJson(&item));
             if (boolOr(&v, "data.last_page")) break;
@@ -634,9 +646,9 @@ pub const QuarkOpen = struct {
     fn list(ptr: *anyopaque, ctx: *driver.Ctx, dir: []const u8) anyerror![]model.Obj {
         const self = as(ptr);
         const a = ctx.alloc;
-        const entry = try self.resolveEntry(a, dir);
+        const entry = try self.resolveEntry(a, dir, &ctx.err_detail);
         if (!entry.is_dir) return driver.Error.NotFound;
-        return self.listAll(a, entry.id);
+        return self.listAll(a, entry.id, &ctx.err_detail);
     }
 
     fn details(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8) anyerror!model.File {
@@ -646,7 +658,7 @@ pub const QuarkOpen = struct {
         var it = std.mem.tokenizeAny(u8, path, "/\\");
         if (it.next() == null) return .{ .name = "/", .is_dir = true };
 
-        const entry = try self.resolveEntry(a, path);
+        const entry = try self.resolveEntry(a, path, &ctx.err_detail);
         const raw = entry.raw orelse return .{ .name = entry.name, .is_dir = entry.is_dir };
         const o = objFromJson(raw);
         return .{
@@ -664,14 +676,14 @@ pub const QuarkOpen = struct {
         const a = ctx.alloc;
         _ = args;
 
-        const entry = try self.resolveEntry(a, path);
+        const entry = try self.resolveEntry(a, path, &ctx.err_detail);
         var b = Buf.init(a);
         var w = ObjWriter{ .b = &b };
         try w.begin();
         try w.str("fid", entry.id);
         try w.end();
 
-        const body = try self.postJson(a, path_download_url, b.slice());
+        const body = try self.postJson(a, path_download_url, b.slice(), &ctx.err_detail);
         const v = json.parse(a, body) catch return Error.UpstreamNotJson;
         const url = v.strAt("data.download_url") orelse return Error.InvalidResponse;
 
@@ -689,7 +701,7 @@ pub const QuarkOpen = struct {
 
         const name = lastSegment(dir);
         if (name.len == 0) return Error.InvalidPath;
-        const parent = try self.resolveEntry(a, parentOf(dir));
+        const parent = try self.resolveEntry(a, parentOf(dir), &ctx.err_detail);
 
         var b = Buf.init(a);
         var w = ObjWriter{ .b = &b };
@@ -697,15 +709,15 @@ pub const QuarkOpen = struct {
         try w.str("dir_path", name);
         try w.str("pdir_fid", parent.id);
         try w.end();
-        _ = try self.postJson(a, path_mkdir, b.slice());
+        _ = try self.postJson(a, path_mkdir, b.slice(), &ctx.err_detail);
     }
 
     fn move(ptr: *anyopaque, ctx: *driver.Ctx, src: []const u8, dst_dir: []const u8) anyerror!void {
         const self = as(ptr);
         const a = ctx.alloc;
 
-        const s = try self.resolveEntry(a, src);
-        const d = try self.resolveEntry(a, dst_dir);
+        const s = try self.resolveEntry(a, src, &ctx.err_detail);
+        const d = try self.resolveEntry(a, dst_dir, &ctx.err_detail);
 
         var b = Buf.init(a);
         var w = ObjWriter{ .b = &b };
@@ -719,7 +731,7 @@ pub const QuarkOpen = struct {
         try b.appendByte(']');
         try w.str("to_pdir_fid", d.id);
         try w.end();
-        _ = try self.postJson(a, path_move, b.slice());
+        _ = try self.postJson(a, path_move, b.slice(), &ctx.err_detail);
     }
 
     fn rename(ptr: *anyopaque, ctx: *driver.Ctx, src: []const u8, new_name: []const u8) anyerror!void {
@@ -727,7 +739,7 @@ pub const QuarkOpen = struct {
         const a = ctx.alloc;
         if (new_name.len == 0) return Error.InvalidPath;
 
-        const s = try self.resolveEntry(a, src);
+        const s = try self.resolveEntry(a, src, &ctx.err_detail);
         var b = Buf.init(a);
         var w = ObjWriter{ .b = &b };
         try w.begin();
@@ -735,7 +747,7 @@ pub const QuarkOpen = struct {
         try w.str("file_name", new_name);
         try w.str("conflict_mode", "REUSE");
         try w.end();
-        _ = try self.postJson(a, path_rename, b.slice());
+        _ = try self.postJson(a, path_rename, b.slice(), &ctx.err_detail);
     }
 
     fn remove(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, is_dir: bool) anyerror!void {
@@ -743,7 +755,7 @@ pub const QuarkOpen = struct {
         const a = ctx.alloc;
         _ = is_dir; // 夸克的删除接口对文件和目录是同一个
 
-        const s = try self.resolveEntry(a, path);
+        const s = try self.resolveEntry(a, path, &ctx.err_detail);
         var b = Buf.init(a);
         var w = ObjWriter{ .b = &b };
         try w.begin();
@@ -751,7 +763,7 @@ pub const QuarkOpen = struct {
         try w.key("fid_list");
         try json.writeString(&b, s.id);
         try w.end();
-        _ = try self.postJson(a, path_delete, b.slice());
+        _ = try self.postJson(a, path_delete, b.slice(), &ctx.err_detail);
     }
 
     // -----------------------------------------------------------------------
@@ -764,7 +776,7 @@ pub const QuarkOpen = struct {
 
         const name = lastSegment(dst);
         if (name.len == 0) return Error.InvalidPath;
-        const dst_dir = try self.resolveEntry(a, parentOf(dst));
+        const dst_dir = try self.resolveEntry(a, parentOf(dst), &ctx.err_detail);
         const size = src.size();
         if (size < 0) return Error.InvalidPath;
 
@@ -797,7 +809,7 @@ pub const QuarkOpen = struct {
         try w.str("proof_code2", proof.code2);
         try w.end();
 
-        const pre_raw = try self.request(a, path_upload_pre, "POST", pre_body.slice(), sign, false);
+        const pre_raw = try self.request(a, path_upload_pre, "POST", pre_body.slice(), sign, false, &ctx.err_detail);
         const pre = json.parse(a, pre_raw) catch return Error.UpstreamNotJson;
 
         // 秒传命中
@@ -823,7 +835,7 @@ pub const QuarkOpen = struct {
         try writePartInfoList(&urls_body, parts, null);
         try uw.end();
 
-        const urls_raw = try self.postJson(a, path_upload_urls, urls_body.slice());
+        const urls_raw = try self.postJson(a, path_upload_urls, urls_body.slice(), &ctx.err_detail);
         const urls = json.parse(a, urls_raw) catch return Error.UpstreamNotJson;
 
         const upload_urls = arrAt(&urls, "data.upload_urls");
@@ -898,7 +910,7 @@ pub const QuarkOpen = struct {
         try writePartInfoList(&fin_body, parts, etags);
         try fw.end();
 
-        const fin_raw = try self.postJson(a, path_upload_finish, fin_body.slice());
+        const fin_raw = try self.postJson(a, path_upload_finish, fin_body.slice(), &ctx.err_detail);
         const fin = json.parse(a, fin_raw) catch return Error.UpstreamNotJson;
         if (!boolOr(&fin, "data.finish")) {
             log.warn("[quark] upload_finish returned finish=false, task_id={s}", .{task_id});

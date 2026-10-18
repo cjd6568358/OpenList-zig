@@ -294,18 +294,59 @@ pub const Response = struct {
         };
     }
 
+    /// H6：头名必须 = RFC 7230 token；头值允许水平制表符，拒绝其余控制
+    /// 字符（<0x20）与 DEL。逐条对齐 Go `net/http/httpguts` 的
+    /// `ValidHeaderFieldName` / `ValidHeaderFieldValue` —— Go 的
+    /// `ResponseWriter` 写非法头值会直接报错，Zig 以前原样打印，上游
+    /// 响应体里的 CRLF 可经 `Location`/透传头注入（响应拆分）。
+    fn validHeaderName(name: []const u8) bool {
+        if (name.len == 0) return false;
+        for (name) |c| {
+            if (std.ascii.isAlphanumeric(c)) continue;
+            switch (c) {
+                '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+                else => return false,
+            }
+        }
+        return true;
+    }
+
+    fn validHeaderValue(value: []const u8) bool {
+        for (value) |c| {
+            if (c == '\t') continue;
+            if (c < 0x20 or c == 0x7f) return false;
+        }
+        return true;
+    }
+
+    /// 头名/头值一律 dupe 进 `res.arena`（请求级，活到响应写完）。
+    ///
+    /// 曾经这里只存指针：调用方传栈上 buffer（如 api.zig 导出接口用
+    /// `var name_buf: [64]u8` + bufPrint 拼 Content-Disposition），handler
+    /// 返回后栈被复用，`writeResponse` 读到的就是栈垃圾 —— 真机表现为
+    /// 响应头里出现 NUL/控制字节（curl: (8) Nul byte in header，浏览器
+    /// 直接判响应非法）。与「Zig 0.17 悬垂指针陷阱」同族：跨调用存活的值
+    /// 不能指向栈。透传上游/驱动头的调用点（res.set(h.name, h.value)）
+    /// 同样受益。
     pub fn set(self: *Response, name: []const u8, value: []const u8) !void {
+        if (!validHeaderName(name) or !validHeaderValue(value)) return error.InvalidHeader;
+        const owned_name = try self.arena.dupe(u8, name);
+        const owned_value = try self.arena.dupe(u8, value);
         for (self.headers.data[0..self.headers.len]) |*h| {
-            if (std.ascii.eqlIgnoreCase(h.name, name)) {
-                h.value = value;
+            if (std.ascii.eqlIgnoreCase(h.name, owned_name)) {
+                h.value = owned_value;
                 return;
             }
         }
-        try self.headers.append(.{ .name = name, .value = value });
+        try self.headers.append(.{ .name = owned_name, .value = owned_value });
     }
 
     pub fn add(self: *Response, name: []const u8, value: []const u8) !void {
-        try self.headers.append(.{ .name = name, .value = value });
+        if (!validHeaderName(name) or !validHeaderValue(value)) return error.InvalidHeader;
+        try self.headers.append(.{
+            .name = try self.arena.dupe(u8, name),
+            .value = try self.arena.dupe(u8, value),
+        });
     }
 
     /// Copy every header of the response into another buffer. Used when a
@@ -327,12 +368,51 @@ pub const Response = struct {
     }
 
     /// `{"code":N,"message":"...","data":null}` — OpenList's envelope.
+    ///
+    /// ⚠️ **HTTP 状态恒为 200**：Go `common.ErrorWithDataResp`
+    /// （server/common/common.go:76）用 `c.JSON(200, Resp{Code: code, ...})` ——
+    /// 业务错误码只出现在 body 里。2026-10-17 用生产实例动态对照钉死（匿名
+    /// 401、坏 JSON 400、429 全是 HTTP 200）。此前本实现按 REST 惯例回真实
+    /// 状态码，是**未对齐**（用户抓出来的整类问题之一）。
+    /// 注意：这只适用于 JSON API；下载端点（/d/ /p/）用 `errorPage`
+    /// （真状态码 + HTML），与上游两套体系一致。
     pub fn jsonError(self: *Response, code: u16, message: []const u8) !void {
-        self.status = if (code >= 400 and code <= 599) code else 400;
+        self.status = 200;
         try self.set("Content-Type", "application/json; charset=utf-8");
         try self.buf.print("{{\"code\":{d},\"message\":", .{code});
         try jsonWriteString(&self.buf, message);
         try self.buf.append(",\"data\":null}");
+    }
+
+    /// Go `common.ErrorPage`（server/common/common.go:47-75）的逐字节对齐：
+    /// 下载端点（`/d/`、`/p/`）的错误输出 —— **真实 HTTP 状态码** + 固定
+    /// 模板的 HTML（`<title>` / `<h1>` 是 `"<code> <StatusText>"`，
+    /// `<p>` 是错误消息，HTML 转义）。
+    pub fn errorPage(self: *Response, code: u16, message: []const u8) !void {
+        const codes = try std.fmt.allocPrint(self.arena, "{d} {s}", .{ code, statusText(code) });
+        try self.set("Content-Type", "text/html; charset=utf-8");
+        self.status = code;
+        try self.buf.append("<!DOCTYPE html>\n<html lang=\"en\">\n\t<head>\n\t\t<meta charset=\"utf-8\" />\n\t\t<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n\t\t<meta name=\"color-scheme\" content=\"dark light\" />\n\t\t<meta name=\"robots\" content=\"noindex\" />\n\t\t<title>");
+        try appendHtmlEscaped(&self.buf, codes);
+        try self.buf.append("</title>\n\t</head>\n\t<body>\n\t\t<h1>");
+        try appendHtmlEscaped(&self.buf, codes);
+        try self.buf.append("</h1>\n\t\t<hr>\n\t\t<p>");
+        try appendHtmlEscaped(&self.buf, message);
+        try self.buf.append("</p>\n\t</body>\n</html>");
+    }
+
+    /// Drop every header with this name (case-insensitive). Used by the
+    /// 304 path — Go `writeNotModified`（internal/net/util.go:210）deletes
+    /// Content-Type / Content-Length / Content-Encoding（and Last-Modified
+    /// when an ETag exists）before replying.
+    pub fn removeHeader(self: *Response, name: []const u8) void {
+        var w: usize = 0;
+        for (self.headers.data[0..self.headers.len]) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, name)) continue;
+            self.headers.data[w] = h;
+            w += 1;
+        }
+        self.headers.len = w;
     }
 
     pub fn jsonOk(self: *Response, data_json: []const u8) !void {
@@ -365,6 +445,52 @@ pub const Response = struct {
 fn jsonWriteString(b: *Buf, s: []const u8) !void {
     const j = @import("util/json.zig");
     try j.writeString(b, s);
+}
+
+/// Go `http.StatusText` 的子集（`ErrorPage` 的标题用 + WebDAV 的纯文本错误
+/// 响应体）。覆盖本工程会产出的状态码；其余返回空串（与 Go 对未知码的行为
+/// 一致）。
+pub fn statusText(code: u16) []const u8 {
+    return switch (code) {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        206 => "Partial Content",
+        207 => "Multi-Status",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        412 => "Precondition Failed",
+        416 => "Requested Range Not Satisfiable",
+        423 => "Locked",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        else => "",
+    };
+}
+
+/// Go `html.EscapeString` 的子集：`&<>'"` 五个字符转实体。ErrorPage 的
+/// 三处插值（title / h1 / p）都过它。
+fn appendHtmlEscaped(b: *Buf, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '&' => try b.append("&amp;"),
+            '<' => try b.append("&lt;"),
+            '>' => try b.append("&gt;"),
+            '"' => try b.append("&#34;"),
+            '\'' => try b.append("&#39;"),
+            else => try b.appendByte(c),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,4 +1383,67 @@ test "T5: run() returns after shutdown once connections drain" {
 
 fn runWorker(server: *Server) void {
     server.run() catch {};
+}
+
+test "H6: set/add reject CR/LF/NUL in header names and values" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var res = Response.init(a);
+
+    // 合法值照常收（不被误伤）。
+    try res.set("Location", "https://cdn.example.com/a?b=c&d=e");
+    try res.set("Content-Disposition", "attachment; filename=\"x.bin\"");
+
+    // 头值含 CRLF ⇒ 拒绝（Go net/http 的 httpguts 同规则）。
+    try testing.expectError(error.InvalidHeader, res.set("Location", "https://ok/\r\nSet-Cookie: a=b"));
+    try testing.expectError(error.InvalidHeader, res.add("X-Test", "v\nX-Evil: 1"));
+    try testing.expectError(error.InvalidHeader, res.set("X-Test", "v\x00w"));
+    // 头名不是 token ⇒ 拒绝。
+    try testing.expectError(error.InvalidHeader, res.set("Bad Name", "v"));
+    try testing.expectError(error.InvalidHeader, res.set("X\r\nY", "v"));
+
+    // redirect 走同一条校验。
+    try testing.expectError(error.InvalidHeader, res.redirect("https://ok/\r\nX: 1", 302));
+
+    // 被拒绝的值没有进入响应头缓冲。
+    for (res.headers.data[0..res.headers.len]) |h| {
+        try testing.expect(std.mem.indexOfScalar(u8, h.value, '\r') == null);
+        try testing.expect(std.mem.indexOfScalar(u8, h.value, '\n') == null);
+        try testing.expect(std.mem.indexOfScalar(u8, h.value, 0) == null);
+    }
+    try testing.expectEqual(@as(usize, 2), res.headers.len);
+}
+
+test "header values survive the caller's stack frame (dangling-pointer guard)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var res = Response.init(a);
+
+    {
+        // 模拟 handler 里的经典模式：栈上 buffer 拼出头值再 res.set。
+        // 修复前 set 只存指针，本块结束后栈帧即失效。
+        var buf: [32]u8 = undefined;
+        const v = try std.fmt.bufPrint(&buf, "attachment-{d}", .{42});
+        try res.set("Content-Disposition", v);
+        try res.add("X-Stack", v);
+    }
+    // 把上面那个栈帧的区域踩脏（写脏 + 消耗栈），旧实现在这里读到垃圾。
+    burnStack();
+    for (res.headers.data[0..res.headers.len]) |h| {
+        if (std.mem.eql(u8, h.name, "Content-Disposition")) {
+            try testing.expectEqualStrings("attachment-42", h.value);
+        }
+        if (std.mem.eql(u8, h.name, "X-Stack")) {
+            try testing.expectEqualStrings("attachment-42", h.value);
+        }
+    }
+}
+
+/// 故意烧栈：大数组 + 递归，保证上一个栈帧的内容被覆盖。
+fn burnStack() void {
+    var junk: [16 * 1024]u8 = undefined;
+    for (&junk) |*b| b.* = 0xAB;
+    if (junk[0] == 0) burnStack(); // 防优化掉
 }

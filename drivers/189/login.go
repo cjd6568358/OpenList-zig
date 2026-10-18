@@ -122,5 +122,18 @@ func (d *Cloud189) newLogin() error {
 	if loginResult != 0 {
 		return errors.New(utils.Json.Get(res.Body(), "msg").ToString())
 	}
+	// 登录的**最后一步**：跟随响应里的 toUrl（callbackUnify.action）完成 SSO
+	// 回跳。loginSubmit.do 只把会话种在 e.189.cn 域（SSON/OPENINFO 等），
+	// 而 API 在 cloud.189.cn —— 不走这一步就拿不到 COOKIE_LOGIN_USER /
+	// cloud.189.cn 的 JSESSIONID，后续所有 API 都报
+	// InvalidSessionKey（cookieUserSession is null），并触发重登死循环。
+	// （2026-10-17 用 Zig 版实测定位：tools/probe_189web_login.py；
+	// 老版登录实现里有这一步，见 util.go 注释中的 d.client.R().Get(loginResp.ToUrl)。）
+	toUrl := utils.Json.Get(res.Body(), "toUrl").ToString()
+	if toUrl != "" {
+		if _, err := d.client.R().Get(toUrl); err != nil {
+			return err
+		}
+	}
 	return nil
 }

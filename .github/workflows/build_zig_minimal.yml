@@ -44,7 +44,22 @@ name: Zig Minimal Build (SquashFS)
 #      且 WebVersion ∈ {"", beta, dev, rolling}。用官方 CDN 地址
 #      https://cdn.jsdelivr.net/npm/@openlist-frontend/openlist-frontend@latest/dist
 #      （别写 $version —— 它会被替换成 rolling，而 npm 上没有这个 dist-tag）。
+#    * **强烈建议同时配 `zig.cdn_fallbacks`**：CDN 是启动强依赖，取不到
+#      index.html 二进制直接退出；而 jsdelivr 在大陆网络是间歇性可用的。
+#      fallbacks 让启动先逐个试，全失败才退出。推荐一组（均经实测可达）：
+#        "zig": { "cdn_fallbacks": [
+#          "https://fastly.jsdelivr.net/npm/@openlist-frontend/openlist-frontend@latest/dist",
+#          "https://gcore.jsdelivr.net/npm/@openlist-frontend/openlist-frontend@latest/dist",
+#          "https://unpkg.com/@openlist-frontend/openlist-frontend@latest/dist"
+#        ] }
+#      也可写成逗号分隔的字符串。每个候选默认重试 2 次，最多试 8 个候选。
+#      不可用：
+#        - registry.npmmirror.com：**专门拦 .html**（451 + {"error":"blocked"}，
+#          不是法律原因，是 CDN 防滥用策略）。.js/.css/VERSION 都是 200，
+#          但前端外壳必须是 index.html，所以用不了。
+#        - jsdelivr.pai233.top：402，需付费。
 #    * 不要设 dist_dir：设了会去读镜像里不存在的前端文件然后 Fatal。
+#      更不要把前端副本打进镜像 —— 不内嵌前端正是这个构建的前提。
 #    * 被裁掉的驱动若 config.json 里还有对应存储，该存储会 init 失败并记
 #      error_msg，其余存储照常服务。
 #

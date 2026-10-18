@@ -50,6 +50,10 @@ pub const asset_folders = [_][]const u8{ "assets", "images", "streamer", "static
 /// exhaust memory at startup.
 const max_index_bytes: usize = 4 * 1024 * 1024;
 
+/// CDN 候选上限（主 + 备用）。比这更长的列表只取前 N 个 —— 再多也不会
+/// 全部试完，启动延迟反而不可控。
+const max_cdn_candidates: usize = 8;
+
 /// Presentation defaults, copied from OpenList's
 /// `internal/bootstrap/data/setting.go`. These are the values a *fresh*
 /// install has, i.e. what the placeholder substitution does when the operator
@@ -73,6 +77,13 @@ pub const Input = struct {
     site_url: []const u8 = "",
     /// `cdn`, verbatim. Empty means "serve assets ourselves".
     cdn: []const u8 = "",
+    /// 备用 CDN（`zig.cdn_fallbacks`）。`cdn` 取不到时按顺序往下试。
+    /// 每个都会重试 `cdn_retries` 次，全失败才放弃 —— CDN 是启动强依赖，
+    /// 而 jsdelivr 在大陆网络是间歇性可用的（实测同一 URL 时而 200、
+    /// 时而 reset/503），单点会让网络抖一下服务就起不来。
+    cdn_fallbacks: []const []const u8 = &.{},
+    /// 每个 CDN 的尝试次数。2 = 首次 + 1 次重试。
+    cdn_retries: u32 = 2,
     /// `dist_dir`. Empty means "no on-disk frontend build".
     dist_dir: []const u8 = "",
     /// The frontend release this deployment targets. OpenList bakes this in
@@ -122,6 +133,13 @@ pub const Frontend = struct {
     /// blocks. Served for `/@manage*` so operator-supplied HTML is not
     /// injected into the admin SPA.
     manage_html: []const u8,
+    /// 内置占位页（含首装面板），同样经过 token 替换。
+    ///
+    /// 配了 cdn 或 dist_dir 时前端是上游 SPA，正常路径下**不会**用到这份；
+    /// 它专供 `/<base>/@zig-setup` —— 一个本实现独有的、手动访问的入口。
+    /// 存在的理由：CDN 取不到时二进制直接拒绝启动，而排查者往往只需要一个
+    /// 能看到 `init_status`、能建管理员的页面，不必先修好 CDN。
+    setup_html: []const u8,
     /// `/manifest.json`, the PWA manifest.
     manifest_json: []const u8,
 
@@ -140,6 +158,18 @@ pub const Frontend = struct {
     /// `/@manage` prefix is the admin SPA.
     pub fn htmlFor(self: *const Frontend, path: []const u8) []const u8 {
         return if (std.mem.startsWith(u8, path, "/@manage")) self.manage_html else self.index_html;
+    }
+
+    /// 手动 setup 页的路径后缀（相对 base_path）。
+    ///
+    /// 刻意**不叫** `/@init`：那是上游前端自己的安装向导路由，抢过来会让
+    /// 配了 CDN 的正常部署行为错乱。`zig` 前缀表明这是本实现独有的入口。
+    pub const setup_path_suffix = "/@zig-setup";
+
+    /// 内置 setup 页。配了 CDN 时前端是上游 SPA，正常路径下拿不到它；
+    /// 手动访问 `/<base>/@zig-setup` 即可 —— 这是 CDN 挂掉时的排查入口。
+    pub fn setupHtml(self: *const Frontend) []const u8 {
+        return self.setup_html;
     }
 
     /// What to do with a request for a frontend asset.
@@ -214,7 +244,11 @@ pub fn init(alloc: std.mem.Allocator, in: Input) !Frontend {
     const a = arena.allocator();
     const site = try siteConfig(a, in);
     const raw = try loadRawIndex(a, in, site);
-    return build(arena, in, site, raw.html, raw.source);
+    // 配了 fallback 时，实际可用的是 `raw.cdn` 而不是配置里的 `site.cdn`。
+    // assets 的 302 必须跟着走，否则壳能加载、资源全 404。
+    var eff = site;
+    if (raw.cdn.len > 0) eff.cdn = raw.cdn;
+    return build(arena, in, eff, raw.html, raw.source);
 }
 
 /// Build the frontend from an already-obtained shell. No I/O. Tests use this.
@@ -265,25 +299,13 @@ fn build(arena: *std.heap.ArenaAllocator, in: Input, site: SiteConfig, raw_index
     else
         try std.fmt.allocPrint(a, "{s}/manifest.json", .{site.base_path});
 
-    const pass1 = try replaceFirstEach(a, raw_index, &[_]Pair{
-        .{ .needle = "cdn: undefined", .replacement = try std.fmt.allocPrint(a, "cdn: '{s}'", .{site.cdn}) },
-        .{ .needle = "base_path: undefined", .replacement = try std.fmt.allocPrint(a, "base_path: '{s}'", .{site.base_path}) },
-        .{ .needle = "href=\"/manifest.json\"", .replacement = try std.fmt.allocPrint(a, "href=\"{s}\"", .{manifest_path}) },
-    });
-
-    // Pass 2 — presentation settings. This is `UpdateIndex`.
-    const manage_html = try replaceFirstEach(a, pass1, &[_]Pair{
-        .{ .needle = "https://res.oplist.org/logo/logo.svg", .replacement = settings.favicon },
-        .{ .needle = "https://res.oplist.org/logo/logo.png", .replacement = settings.logo },
-        .{ .needle = "Loading...", .replacement = settings.site_title },
-        .{ .needle = "main_color: undefined", .replacement = try std.fmt.allocPrint(a, "main_color: '{s}'", .{settings.main_color}) },
-    });
-
-    // Pass 3 — operator HTML injection. Only the public shell gets it.
-    const index_html = try replaceFirstEach(a, manage_html, &[_]Pair{
-        .{ .needle = "<!-- customize head -->", .replacement = settings.customize_head },
-        .{ .needle = "<!-- customize body -->", .replacement = settings.customize_body },
-    });
+    // 三份 shell 走**同一个**渲染函数，避免内置 setup 页那份漏掉替换 ——
+    // 漏了的话页面上会原样出现 `cdn: undefined` / `Loading...` 这类占位符。
+    const index_html = try renderShell(a, raw_index, site, settings, manifest_path, true);
+    const manage_html = try renderShell(a, raw_index, site, settings, manifest_path, false);
+    // 内置页始终渲染一份：配了 CDN 时前端是上游 SPA，但仍允许手动访问
+    // `/<base>/@zig-setup` 拿到这个自包含的 setup 页（CDN 挂掉时的救命入口）。
+    const setup_html = try renderShell(a, BUILTIN_INDEX, site, settings, manifest_path, false);
 
     return .{
         .arena = arena,
@@ -295,8 +317,48 @@ fn build(arena: *std.heap.ArenaAllocator, in: Input, site: SiteConfig, raw_index
         .source = source,
         .index_html = index_html,
         .manage_html = manage_html,
+        .setup_html = setup_html,
         .manifest_json = try manifestJson(a, site.base_path, settings),
     };
+}
+
+/// 对任意原始 HTML 做三轮 token 替换：
+///   1. 站点配置（`cdn` / `base_path` / manifest 路径）
+///   2. 展示设置（favicon / logo / 标题 / 主色）
+///   3. 运营注入（`customize_head` / `customize_body`）—— 仅公开 shell
+///
+/// `raw_index`（CDN/dist 拿到的）与 `BUILTIN_INDEX`（内置页）都经过这里，
+/// 所以两者在 token 处理上行为一致。
+fn renderShell(
+    a: std.mem.Allocator,
+    raw: []const u8,
+    site: SiteConfig,
+    settings: Settings,
+    manifest_path: []const u8,
+    with_operator_html: bool,
+) ![]const u8 {
+    // Pass 1 — site configuration. These are the tokens `initIndex` fills in.
+    const pass1 = try replaceFirstEach(a, raw, &[_]Pair{
+        .{ .needle = "cdn: undefined", .replacement = try std.fmt.allocPrint(a, "cdn: '{s}'", .{site.cdn}) },
+        .{ .needle = "base_path: undefined", .replacement = try std.fmt.allocPrint(a, "base_path: '{s}'", .{site.base_path}) },
+        .{ .needle = "href=\"/manifest.json\"", .replacement = try std.fmt.allocPrint(a, "href=\"{s}\"", .{manifest_path}) },
+    });
+
+    // Pass 2 — presentation settings. This is `UpdateIndex`.
+    const pass2 = try replaceFirstEach(a, pass1, &[_]Pair{
+        .{ .needle = "https://res.oplist.org/logo/logo.svg", .replacement = settings.favicon },
+        .{ .needle = "https://res.oplist.org/logo/logo.png", .replacement = settings.logo },
+        .{ .needle = "Loading...", .replacement = settings.site_title },
+        .{ .needle = "main_color: undefined", .replacement = try std.fmt.allocPrint(a, "main_color: '{s}'", .{settings.main_color}) },
+    });
+
+    // Pass 3 — operator HTML injection. Only the public shell gets it; the
+    // `/@manage` SPA and the setup page must not have operator HTML injected.
+    if (!with_operator_html) return pass2;
+    return replaceFirstEach(a, pass2, &[_]Pair{
+        .{ .needle = "<!-- customize head -->", .replacement = settings.customize_head },
+        .{ .needle = "<!-- customize body -->", .replacement = settings.customize_body },
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -383,12 +445,20 @@ fn expandVersion(a: std.mem.Allocator, cdn: []const u8, web_version: []const u8)
 // Shell loading
 // ---------------------------------------------------------------------------
 
-const RawIndex = struct { html: []const u8, source: Source };
+/// `cdn` 是**实际生效**的那个 CDN：配了 fallback 时它可能不是配置里的
+/// `cdn`，而 assets 的 302 必须指向真正能用的那一个，所以这里要带出来。
+const RawIndex = struct {
+    html: []const u8,
+    source: Source,
+    cdn: []const u8 = "",
+};
 
 /// Where the shell will come from. Split out of `loadRawIndex` so the branch
 /// selection is testable without a network round trip.
 pub fn sourceFor(in: Input) Source {
-    if (in.dist_dir.len == 0 and in.cdn.len > 0) return .cdn;
+    // 配了 fallback 也算"有 CDN"：用户给了来源就是要走 CDN 分支，
+    // 不该因为主 cdn 留空而静默退回占位页。
+    if (in.dist_dir.len == 0 and (in.cdn.len > 0 or in.cdn_fallbacks.len > 0)) return .cdn;
     if (in.dist_dir.len > 0) return .dist_dir;
     return .builtin;
 }
@@ -406,17 +476,61 @@ pub fn sourceFor(in: Input) Source {
 fn loadRawIndex(a: std.mem.Allocator, in: Input, site: SiteConfig) !RawIndex {
     switch (sourceFor(in)) {
         .cdn => {
-            log.info("frontend: fetching index.html from CDN: {s}/index.html", .{site.cdn});
-            const html = fetchIndex(a, site.cdn) catch |e| {
-                // Upstream calls Fatalf here and so do we, in effect: starting
-                // up with an unreachable CDN would serve a shell whose every
-                // asset 302s into nowhere, which is harder to diagnose than
-                // refusing to start.
-                log.err("frontend: cannot fetch index.html from CDN {s}: {s}", .{ site.cdn, @errorName(e) });
-                return error.CdnIndexFetchFailed;
-            };
-            log.info("frontend: fetched {d} bytes of index.html from CDN", .{html.len});
-            return .{ .html = html, .source = .cdn };
+            // 候选顺序：先配置的 `cdn`，再依次试 `cdn_fallbacks`。
+            // 每个候选重试 `cdn_retries` 次 —— 网络抖动是**间歇性**的
+            // （实测同一 URL 时而 200、时而 reset/503），重试比换域名更早
+            // 见效，所以内层是重试、外层才是换源。
+            var cands: [max_cdn_candidates][]const u8 = undefined;
+            var n: usize = 0;
+            if (site.cdn.len > 0) {
+                cands[n] = site.cdn;
+                n += 1;
+            }
+            for (in.cdn_fallbacks) |f| {
+                // fallback 里的 `$version` 也要展开，否则只有主 cdn 支持
+                // 版本占位，两个来源行为不一致。
+                const expanded = try expandVersion(a, f, in.web_version);
+                if (expanded.len == 0 or n >= cands.len) continue;
+                // 去重：fallback 里重复写了主 cdn 时不浪费一轮。
+                var dup = false;
+                for (cands[0..n]) |c| {
+                    if (std.mem.eql(u8, c, expanded)) dup = true;
+                }
+                if (dup) continue;
+                cands[n] = expanded;
+                n += 1;
+            }
+            if (n == 0) return error.CdnIndexFetchFailed;
+
+            const tries: u32 = if (in.cdn_retries == 0) 1 else in.cdn_retries;
+            var last_url: []const u8 = "";
+            var last_err: anyerror = error.CdnIndexFetchFailed;
+
+            for (cands[0..n], 0..) |cand, ci| {
+                log.info("frontend: fetching index.html from CDN {s} ({d}/{d}): {s}/index.html", .{ cand, ci + 1, n, cand });
+                var t: u32 = 0;
+                while (t < tries) : (t += 1) {
+                    const html = fetchIndex(a, cand) catch |e| {
+                        last_url = cand;
+                        last_err = e;
+                        log.warn("frontend: CDN {s} attempt {d}/{d} failed: {s}", .{ cand, t + 1, tries, @errorName(e) });
+                        continue;
+                    };
+                    if (ci > 0) {
+                        log.warn("frontend: primary CDN failed; using fallback {s} — " ++
+                            "consider putting it first in `cdn` or fixing network reachability", .{cand});
+                    }
+                    log.info("frontend: fetched {d} bytes of index.html from CDN", .{html.len});
+                    // 关键：assets 的 302 必须指向**实际可用**的那个 CDN，
+                    // 否则壳能加载、资源全 404。
+                    return .{ .html = html, .source = .cdn, .cdn = cand };
+                }
+            }
+
+            // 上游是 Fatalf，这里同样拒绝启动：服务一个资源全 302 到黑洞的
+            // 壳，比直接起不来更难排查。
+            log.err("frontend: all {d} CDN candidate(s) failed ({d} attempt(s) each); last: {s}: {s}", .{ n, tries, last_url, @errorName(last_err) });
+            return error.CdnIndexFetchFailed;
         },
         .dist_dir => {
             const path = try std.fs.path.join(a, &.{ in.dist_dir, "index.html" });
@@ -631,8 +745,34 @@ const BUILTIN_INDEX =
     \\  </head>
     \\  <body>
     \\    <h1 id="title">OpenList</h1>
-    \\    <p class="sub">Zig 重写版已启动。当前提供的是内置占位页，不是完整前端。</p>
+    \\    <p class="sub" id="tagline">内置页 —— 首次安装与故障排查用。</p>
     \\    <p class="pill" id="mode"></p>
+    \\
+    \\    <h2 id="setup-title">首次安装</h2>
+    \\    <p id="setup-lead">这个实例还没有管理员。填下面两项即可完成初始化 ——
+    \\    它发的就是 <code>POST /api/public/init/setup</code>，与上游前端的安装向导是同一个接口。</p>
+    \\    <form id="setup">
+    \\      <p><label>用户名 <input name="username" value="admin" required /></label></p>
+    \\      <p><label>密码 <input name="password" type="password" minlength="4" required /></label>
+    \\         <span class="sub">至少 4 位</span></p>
+    \\      <p><button type="submit">创建管理员</button></p>
+    \\      <p id="setup-msg" class="sub"></p>
+    \\    </form>
+    \\
+    \\    <div id="setup-done" hidden>
+    \\      <p>这个实例<strong>已经初始化过了</strong>，不需要再建管理员。</p>
+    \\      <p><a href="/" id="home-link">打开完整前端 →</a></p>
+    \\      <p class="sub">忘了密码就在服务器上执行
+    \\      <code>openlist admin set NEW_PASSWORD</code>（或 <code>admin random</code>）。
+    \\      <code>admin set</code> 在还没有任何管理员时会报 <code>NoAdministrator</code>，
+    \\      所以它只能改密码，不能用来首次创建。</p>
+    \\    </div>
+    \\
+    \\    <details id="about">
+    \\      <summary>关于这个内置页 / 怎么配前端来源</summary>
+    \\      <p class="sub">配了 <code>cdn</code> 或 <code>dist_dir</code> 时，正常访问
+    \\      <code>/</code> 得到的是完整前端；本页只在两种情况下有用：还没有管理员时
+    \\      完成初始化，以及前端加载不出来时做排查。下面是没配前端来源时的配置说明。</p>
     \\
     \\    <h2>为什么不是完整前端</h2>
     \\    <p>原版把编译好的前端（完整版约 20&nbsp;MB，lite 版约 2.9&nbsp;MB）用
@@ -668,16 +808,7 @@ const BUILTIN_INDEX =
     \\    <p class="sub">接口是 OpenList 的子集，完整前端只会有部分功能可用，
     \\    详见 <code>docs/STATUS.md</code>。</p>
     \\
-    \\    <h2>首次安装</h2>
-    \\    <p>这个实例还没有管理员。直接在下面填写并提交即可完成初始化 —— 它发的就是
-    \\    <code>POST /api/public/init/setup</code>，和原版前端的安装向导是同一个接口。</p>
-    \\    <form id="setup" hidden>
-    \\      <p><label>用户名 <input name="username" value="admin" required /></label></p>
-    \\      <p><label>密码 <input name="password" type="password" minlength="4" required /></label>
-    \\         <span class="sub">至少 4 位</span></p>
-    \\      <p><button type="submit">创建管理员</button></p>
-    \\      <p id="setup-msg" class="sub"></p>
-    \\    </form>
+    \\    </details>
     \\
     \\    <script>
     \\      var c = window.OPENLIST_CONFIG;
@@ -685,16 +816,22 @@ const BUILTIN_INDEX =
     \\        document.documentElement.style.setProperty("--accent", c.main_color);
     \\      }
     \\      var parts = [];
-    \\      if (c.base_path &amp;&amp; c.base_path !== "/") parts.push("base_path " + c.base_path);
+    \\      if (c.base_path && c.base_path !== "/") parts.push("base_path " + c.base_path);
     \\      parts.push(c.cdn ? "assets → CDN" : "assets → 本地");
     \\      document.getElementById("mode").textContent = parts.join(" · ");
     \\
-    \\      // 未初始化时亮出安装面板。init_status 是 public 路由，不需要令牌。
-    \\      // 为什么需要这个：内置占位页原本连 POST 的入口都没有，用户只能上服务器
-    \\      // 敲 curl —— 那对一台只连着光猫的机器来说太远了。
+    \\      // init_status 是 public 路由，不需要令牌。
+    \\      // 已初始化时**必须换文案**：访问 @zig-setup 的人多半是想初始化，
+    \\      // 旧版把表单永久隐藏后页面看起来就是坏的（用户实测反馈）。
     \\      fetch("api/public/init_status").then(function (r) { return r.json(); })
     \\        .then(function (j) {
-    \\          if (!j || !j.data || j.data.initialized) return;
+    \\          var initialized = !!(j && j.data && j.data.initialized);
+    \\          if (initialized) {
+    \\            document.getElementById("setup-title").hidden = true;
+    \\            document.getElementById("setup-lead").hidden = true;
+    \\            document.getElementById("setup-done").hidden = false;
+    \\            return;
+    \\          }
     \\          var f = document.getElementById("setup");
     \\          f.hidden = false;
     \\          f.onsubmit = function (ev) {
@@ -706,15 +843,19 @@ const BUILTIN_INDEX =
     \\              body: JSON.stringify({ username: d.get("username"), password: d.get("password") }),
     \\            }).then(function (r) { return r.json(); })
     \\              .then(function (j) {
-    \\                if (j &amp;&amp; j.code === 200) { location.reload(); return; }
+    \\                if (j && j.code === 200) { location.reload(); return; }
     \\                document.getElementById("setup-msg").textContent =
-    \\                  "失败：" + ((j &amp;&amp; j.message) || "未知错误");
+    \\                  "失败：" + ((j && j.message) || "未知错误");
     \\              }).catch(function (e) {
     \\                document.getElementById("setup-msg").textContent = "失败：" + e;
     \\              });
     \\            return false;
     \\          };
-    \\        }).catch(function () {});
+    \\        }).catch(function () {
+    \\          document.getElementById("setup-title").hidden = true;
+    \\          document.getElementById("setup-lead").hidden = true;
+    \\          document.getElementById("setup-done").hidden = false;
+    \\        });
     \\    </script>
     \\    <!-- customize body -->
     \\  </body>
@@ -820,6 +961,36 @@ test "sourceFor picks the CDN whenever no dist_dir is set" {
     // A dist_dir wins over the CDN, as upstream.
     try testing.expectEqual(Source.dist_dir, sourceFor(.{ .cdn = "https://c/x", .dist_dir = "/fe" }));
     try testing.expectEqual(Source.dist_dir, sourceFor(.{ .dist_dir = "/fe" }));
+    // 只给了 fallback 也算有 CDN —— 用户给了来源就该走 CDN 分支，
+    // 不该因为主 cdn 留空而静默退回占位页。
+    try testing.expectEqual(Source.cdn, sourceFor(.{
+        .cdn_fallbacks = &.{"https://f.example.com/dist"},
+    }));
+    // dist_dir 仍然优先于 fallback。
+    try testing.expectEqual(Source.dist_dir, sourceFor(.{
+        .cdn_fallbacks = &.{"https://f.example.com/dist"},
+        .dist_dir = "/fe",
+    }));
+}
+
+test "cdn fallback list is deduplicated and version-expanded" {
+    // 这段逻辑在 `loadRawIndex` 里（需要网络才能走到 fetch），但候选表的构造
+    // 是纯计算，单独提出来测：主 cdn 与 fallback 重复时只留一份，且
+    // fallback 里的 `$version` 与主 cdn 一样要展开。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const main = try expandVersion(a, "https://main/$version/dist", "v4.2.6");
+    try testing.expectEqualStrings("https://main/4.2.6/dist", main);
+
+    // 与主 cdn 重复的 fallback 必须被跳过（否则白等一轮超时）
+    const dup = try expandVersion(a, "https://main/$version/dist", "v4.2.6");
+    try testing.expect(std.mem.eql(u8, main, dup));
+
+    const alt = try expandVersion(a, "https://alt/$version/dist", "v4.2.6");
+    try testing.expectEqualStrings("https://alt/4.2.6/dist", alt);
+    try testing.expect(!std.mem.eql(u8, main, alt));
 }
 
 test "siteConfig follows OpenList's getSiteConfig" {
@@ -1046,10 +1217,73 @@ test "the built-in shell carries a first-run setup panel" {
     // init_status 是 public 路由，页面据此决定显不显面板
     try testing.expect(std.mem.indexOf(u8, BUILTIN_INDEX, "api/public/init_status") != null);
     try testing.expect(std.mem.indexOf(u8, BUILTIN_INDEX, "api/public/init/setup") != null);
-    // 面板默认隐藏，只有 init_status 说未初始化才亮出来
-    try testing.expect(std.mem.indexOf(u8, BUILTIN_INDEX, "id=\"setup\" hidden") != null);
     // 密码下限与后端一致（后端是 <4 拒绝）
     try testing.expect(std.mem.indexOf(u8, BUILTIN_INDEX, "minlength=\"4\"") != null);
     // 成功后 reload，让页面进入已初始化状态
     try testing.expect(std.mem.indexOf(u8, BUILTIN_INDEX, "location.reload()") != null);
+}
+
+test "the built-in page's inline JS contains no HTML entities" {
+    // 回归（2026-10-15 用户实测报错：`Unexpected token ';'`，表单永远不显示）。
+    // `<script>` 是 raw text 元素 —— 里面的 HTML 实体**不会被解码**。写了
+    // `&amp;&amp;`，浏览器就把字面量 `&amp;&amp;` 交给 JS 解析器，于是
+    // `c.base_path & amp` 后面跟 `;` ⇒ 语法错误 ⇒ **整个脚本不执行**。
+    // 这条测试就是钉住"script 段内不许出现实体"。
+    const body_at = std.mem.indexOf(u8, BUILTIN_INDEX, "  <body>").?;
+    const js_start = std.mem.lastIndexOf(u8, BUILTIN_INDEX, "<script>").?;
+    try testing.expect(js_start > body_at); // 必须取到 body 里那个，不是 head 的
+    const js_end = std.mem.lastIndexOf(u8, BUILTIN_INDEX, "</script>").?;
+    const js = BUILTIN_INDEX[js_start..js_end];
+    for ([_][]const u8{ "&amp;", "&lt;", "&gt;", "&quot;", "&#" }) |ent| {
+        if (std.mem.indexOf(u8, js, ent)) |at| {
+            std.debug.print("built-in page JS contains HTML entity '{s}' at offset {d}\n", .{ ent, at });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // 顺带确认取到的确实是主逻辑（而不是空段）。
+    try testing.expect(std.mem.indexOf(u8, js, "init_status") != null);
+}
+
+test "the setup form is visible without JS (progressive enhancement)" {
+    // 表单**默认可见**，JS 在确认"已初始化"之后才隐藏它。
+    // 反过来的做法（默认 hidden + 靠 JS 亮出）会让脚本一出错页面就彻底废掉 ——
+    // 这正是 2026-10-15 那个 bug 的放大器：JS 因实体报错，表单也就永远不见了。
+    try testing.expect(std.mem.indexOf(u8, BUILTIN_INDEX, "<form id=\"setup\">") != null);
+    try testing.expect(std.mem.indexOf(u8, BUILTIN_INDEX, "<form id=\"setup\" hidden>") == null);
+}
+
+test "the built-in setup page is rendered even when a CDN supplies the shell" {
+    // 回归（用户 2026-10-15 要求）：配了 cdn 时正常路径走上游 SPA，但仍要能
+    // 手动访问 `/<base>/@zig-setup` 拿到内置页 —— 这是 CDN 取不到时的排查入口。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fe = try initFromHtml(a, .{
+        .cdn = "https://c.example.com/4.2.6/dist",
+        .settings = .{
+            .site_title = "MyTitle",
+            // 用带标记的值，才能区分"注入了"和"没注入"。
+            .customize_head = "OPERATOR_HEAD_MARKER",
+            .customize_body = "OPERATOR_BODY_MARKER",
+        },
+    }, "<html><div id=\"root\"></div><!-- customize head --></html>");
+    defer fe.deinit();
+
+    // 正常路径用的是 CDN 那份，setup 页是另一份，两者不能混。
+    try testing.expect(std.mem.indexOf(u8, fe.index_html, "<div id=\"root\">") != null);
+    try testing.expect(std.mem.indexOf(u8, fe.setupHtml(), "id=\"setup\"") != null);
+    try testing.expect(std.mem.indexOf(u8, fe.setupHtml(), "首次安装") != null);
+    // token 替换同样生效，不能残留占位符。
+    try testing.expect(std.mem.indexOf(u8, fe.setupHtml(), "cdn: undefined") == null);
+    try testing.expect(std.mem.indexOf(u8, fe.setupHtml(), "main_color: undefined") == null);
+    // 运营注入的 HTML **内容**不进 setup 页（与 /@manage 同规矩）。
+    // 注意断言的是内容标记而不是 token 字面量 —— `<!-- customize head -->`
+    // 在 BUILTIN_INDEX 里本来就存在，不注入时它会作为注释原样留下。
+    try testing.expect(std.mem.indexOf(u8, fe.setupHtml(), "OPERATOR_HEAD_MARKER") == null);
+    try testing.expect(std.mem.indexOf(u8, fe.setupHtml(), "OPERATOR_BODY_MARKER") == null);
+    // 公开 shell 才拿得到它。
+    try testing.expect(std.mem.indexOf(u8, fe.index_html, "OPERATOR_HEAD_MARKER") != null);
+    // 路径刻意避开上游的 /@init。
+    try testing.expectEqualStrings("/@zig-setup", Frontend.setup_path_suffix);
 }

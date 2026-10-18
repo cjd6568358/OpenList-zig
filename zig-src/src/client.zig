@@ -223,13 +223,15 @@ pub const Client = struct {
     /// Send one request. The returned `Response` borrows from `arena`, so the
     /// arena must outlive it — which it does, since callers pass the
     /// per-request arena.
-    pub fn send(self: *Client, arena: std.mem.Allocator, req: Request) !Response {
-        // N01：配置了做不到的选项就明确失败，不要静默按默认行为跑。
-        if (self.unsupported) |name| {
-            log.err("client: refusing request: unsupported option `{s}` is configured", .{name});
-            return error.UnsupportedOption;
-        }
-        var current_url = req.url;
+pub fn send(self: *Client, arena: std.mem.Allocator, req: Request) !Response {
+    // N01：配置了做不到的选项就明确失败，不要静默按默认行为跑。
+    if (self.unsupported) |name| {
+        log.err("client: refusing request: unsupported option `{s}` is configured", .{name});
+        return error.UnsupportedOption;
+    }
+    // SSRF：挡在**任何连接动作之前**（含每一跳重定向的目标）。
+    if (isCloudMetadataLiteral(hostOf(req.url))) return ssrfBlocked(req.url);
+    var current_url = req.url;
         var method = req.method;
         var hops: u8 = 0;
         var body = req.body;
@@ -275,6 +277,9 @@ pub const Client = struct {
                     const loc = res.header("Location") orelse return res;
                     current_url = try absolutize(arena, current_url, loc);
                     hops += 1;
+                    // 重定向目标同样要过 SSRF 闸门：否则
+                    // `Location: http://169.254.169.254/...` 就直接绕过去了。
+                    if (isCloudMetadataLiteral(hostOf(current_url))) return ssrfBlocked(current_url);
                     // 303, and the de-facto behaviour for 301/302 on POST,
                     // downgrade to GET and drop the body.
                     if (res.status == 303 or (method.len == 4 and std.mem.eql(u8, method, "POST") and res.status != 307 and res.status != 308)) {
@@ -391,7 +396,7 @@ pub const Client = struct {
             // useless to us (we send `identity` explicitly).
             .headers = .{ .user_agent = .omit, .accept_encoding = .omit },
         }) catch |e| {
-            log.debug("client: request {s} {s} failed: {s}", .{ method, raw_url, @errorName(e) });
+            log.warn("client: request {s} {s} failed: {s}", .{ method, raw_url, @errorName(e) });
             return e;
         };
         defer http_req.deinit();
@@ -399,6 +404,11 @@ pub const Client = struct {
         // N01：std 的 request 路径没有超时入口，必须自己挂到 socket 上，
         // 否则上游不响应就会永久阻塞。详见 applySocketTimeout 的注释。
         if (http_req.connection) |c| applySocketTimeout(c, self.opts.timeout_s);
+        // 诊断：夸克 CDN 上 zig std.http.Client 的 GET 1 秒内 WriteFailed，
+        // 而裸 std.crypto.tls.Client 同请求是 25s 静默。逐阶段打点定位。
+        log.info("client: {s} {s} connected (conn={s})", .{
+            method, raw_url, if (http_req.connection) |_| "yes" else "pooled",
+        });
 
         const total_len: u64 = if (source) |_| (content_length orelse 0) else body.len;
         if (total_len > 0) {
@@ -435,11 +445,20 @@ pub const Client = struct {
             var bw = try http_req.sendBody(&send_buf);
             try bw.end();
         } else {
-            try http_req.sendBodiless();
+            log.info("client: {s} {s} sending bodiless request", .{ method, raw_url });
+            http_req.sendBodiless() catch |e| {
+                log.warn("client: {s} {s} sendBodiless failed: {s}", .{ method, raw_url, @errorName(e) });
+                return e;
+            };
+            log.info("client: {s} {s} request sent, awaiting head", .{ method, raw_url });
         }
 
         var redirect_buf: [8 * 1024]u8 = undefined;
-        var resp = try http_req.receiveHead(&redirect_buf);
+        var resp = http_req.receiveHead(&redirect_buf) catch |e| {
+            log.warn("client: {s} {s} receiveHead failed: {s}", .{ method, raw_url, @errorName(e) });
+            return e;
+        };
+        log.info("client: {s} {s} got head, status={d}", .{ method, raw_url, @intFromEnum(resp.head.status) });
 
         const status: u16 = @intFromEnum(resp.head.status);
 
@@ -624,6 +643,13 @@ pub const Client = struct {
             // 定界头由下面统一给出；调用方重复提供会造出两个 Content-Length。
             if (std.ascii.eqlIgnoreCase(h.name, "Content-Length")) continue;
             if (std.ascii.eqlIgnoreCase(h.name, "Connection")) continue;
+            // H6（客户端侧）：驱动 link header 的值可能来自上游 JSON 响应体，
+            // 含 CRLF 会撕裂上游请求（请求拆分）。与 http.zig 的响应头校验同
+            // 规则：允许制表符，拒绝其余控制字符与 DEL。
+            for (h.value) |c| {
+                if (c == '\t') continue;
+                if (c < 0x20 or c == 0x7f) return error.InvalidHeader;
+            }
             try w.writeAll(h.name);
             try w.writeAll(": ");
             try w.writeAll(h.value);
@@ -632,8 +658,11 @@ pub const Client = struct {
 
         const total_len: u64 = if (source) |_| (content_length orelse 0) else body.len;
         if (total_len > 0) {
-            var cl_buf: [24]u8 = undefined;
-            const cl = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{total_len}) catch unreachable;
+            // L2：`Content-Length: ` 16 字节 + u64 最多 20 位 = 36 ⇒ 24 字节
+            // 缓冲区在 ≥10⁶ 时就 bufPrint 失败。以前是 `catch unreachable`
+            // （潜在 panic）；放大到 40 并真返回错误。
+            var cl_buf: [40]u8 = undefined;
+            const cl = std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{total_len}) catch return error.BadRequest;
             try w.writeAll(cl);
         }
         try w.writeAll("Connection: close\r\n\r\n");
@@ -878,6 +907,62 @@ fn absolutize(arena: std.mem.Allocator, base: []const u8, location: []const u8) 
 }
 
 // ---------------------------------------------------------------------------
+// SSRF 闸门
+// ---------------------------------------------------------------------------
+
+/// 取 URL 的 host 段（去掉 scheme、`userinfo`、端口、路径）。纯切片操作，
+/// 不做解析 —— 闸门只要能拿到字面 host 就够了。
+pub fn hostOf(raw: []const u8) []const u8 {
+    var s = raw;
+    if (std.mem.indexOf(u8, s, "://")) |i| s = s[i + 3 ..];
+    // 去掉 `user:pass@`
+    if (std.mem.indexOfScalar(u8, s, '@')) |i| s = s[i + 1 ..];
+    const end = std.mem.indexOfAny(u8, s, "/?#") orelse s.len;
+    s = s[0..end];
+    // 去掉端口。IPv6 字面量写成 `[::1]:8080` —— 只有落在 `]` **之后**的冒号
+    // 才是端口分隔符，否则会把地址内部的冒号当成端口切掉。
+    const rb = std.mem.lastIndexOfScalar(u8, s, ']');
+    if (std.mem.lastIndexOfScalar(u8, s, ':')) |i| {
+        if (rb == null or i > rb.?) s = s[0..i];
+    }
+    return std.mem.trim(u8, s, "[]");
+}
+
+/// Go `isCloudMetadataIP`（internal/net/serve.go:320-323）：只允许 IPv4，
+/// 且必须精确等于 169.254.169.254（AWS/GCP/Azure/阿里云/华为云共用的 link-local
+/// 元数据端点）。
+///
+/// 上游是在 **DNS 解析之后**逐个 IP 判定的（`safeTransport.RoundTrip`），
+/// 因此连"域名 CNAME 到元数据 IP"也能挡住。本工程的解析在 std 内部完成、
+/// 拿不到 IP 列表，所以这里只做**字面量**这一层：能挡
+/// `http://169.254.169.254/latest/meta-data/`，挡不住指向它的域名。
+/// 这是架构差异，在 STATUS 里记为已知能力差距，不是漏项。
+pub fn isCloudMetadataLiteral(host: []const u8) bool {
+    if (host.len == 0) return false;
+    var it = std.mem.splitScalar(u8, host, '.');
+    var octets: [4]u8 = undefined;
+    var n: usize = 0;
+    while (it.next()) |p| : (n += 1) {
+        if (n >= 4) return false; // 多于 4 段 => 不是 IPv4
+        if (p.len == 0 or p.len > 3) return false;
+        var v: u16 = 0;
+        for (p) |c| {
+            if (!std.ascii.isDigit(c)) return false;
+            v = v * 10 + @as(u16, c - '0');
+            if (v > 255) return false;
+        }
+        octets[n] = @intCast(v);
+    }
+    if (n != 4) return false;
+    return octets[0] == 169 and octets[1] == 254 and octets[2] == 169 and octets[3] == 254;
+}
+
+fn ssrfBlocked(url: []const u8) error{CloudMetadataEndpoint} {
+    log.err("client: refusing request to the cloud metadata endpoint: {s}", .{url});
+    return error.CloudMetadataEndpoint;
+}
+
+// ---------------------------------------------------------------------------
 // JSON convenience — every upstream API here is JSON in / JSON out
 // ---------------------------------------------------------------------------
 
@@ -905,6 +990,36 @@ pub fn postJson(
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "hostOf strips scheme, port, userinfo and path" {
+    try testing.expectEqualStrings("169.254.169.254", hostOf("http://169.254.169.254/latest/meta-data/"));
+    try testing.expectEqualStrings("169.254.169.254", hostOf("https://169.254.169.254:80/x"));
+    try testing.expectEqualStrings("169.254.169.254", hostOf("169.254.169.254/x"));
+    try testing.expectEqualStrings("169.254.169.254", hostOf("http://u:p@169.254.169.254/x#f"));
+    // IPv6 字面量要保住内部的冒号，只剥端口
+    try testing.expectEqualStrings("::1", hostOf("http://[::1]:8080/x"));
+    try testing.expectEqualStrings("::1", hostOf("http://[::1]/x"));
+    try testing.expectEqualStrings("drive.quark.cn", hostOf("https://drive.quark.cn/a/b?c=d"));
+}
+
+test "isCloudMetadataLiteral matches Go's isCloudMetadataIP, nothing else" {
+    // Go 只认这一个 IPv4（link-local 元数据端点）
+    try testing.expect(isCloudMetadataLiteral("169.254.169.254"));
+    // 相邻 IP / link-local 段的其它地址不算
+    try testing.expect(!isCloudMetadataLiteral("169.254.169.253"));
+    try testing.expect(!isCloudMetadataLiteral("169.254.1.1"));
+    try testing.expect(!isCloudMetadataLiteral("192.168.1.1"));
+    try testing.expect(!isCloudMetadataLiteral("127.0.0.1"));
+    // 域名（哪怕真的指向它）不算：上游是靠解析后的 IP 判定的，这里只管字面量
+    try testing.expect(!isCloudMetadataLiteral("metadata.google.internal"));
+    // 畸形输入一律放行（不是 IPv4）
+    try testing.expect(!isCloudMetadataLiteral(""));
+    try testing.expect(!isCloudMetadataLiteral("169.254.169.254.1"));
+    try testing.expect(!isCloudMetadataLiteral("169.254.169"));
+    try testing.expect(!isCloudMetadataLiteral("1234.1.1.1"));
+    try testing.expect(!isCloudMetadataLiteral("::1"));
+    try testing.expect(!isCloudMetadataLiteral("169.254.169.254x"));
+}
 
 test "absolutize handles absolute, root-relative and relative" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

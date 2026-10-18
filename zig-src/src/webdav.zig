@@ -18,16 +18,23 @@
 //! does send LOCK but falls back to unlocked access, so browsing still works.
 //!
 //! Authentication: WebDAV clients speak HTTP Basic. We validate the credential
-//! against the single admin account (`admin_user` / `admin_hash` == SHA-256 of
-//! the password), exactly as `/api/auth/login` does — there is no separate
-//! WebDAV password in this single-admin build.
+//! against the single admin account (`admin_user` / `admin_hash`), exactly as
+//! `/api/auth/login` does — there is no separate WebDAV password in this
+//! single-admin build.
+//!
+//! ⚠️ `admin_hash` is **not** a bare SHA-256 of the password: it is Go's
+//! `model.TwoHashPwd` = `sha256(sha256(pw + "-" + StaticHashSalt) + "-" +
+//! salt)` (see `api.twoHashPwd` and the `admin_hash` doc comment in api.zig).
+//! Comparing `sha256(pw)` against it can never succeed — that was a real bug
+//! (every WebDAV client got a 401) until the e2e regression caught it
+//! 2026-10-16. The JSON login path was always right; this path now shares the
+//! same helper.
 
 const std = @import("std");
 const model = @import("model.zig");
 const driver = @import("driver.zig");
 const http = @import("http.zig");
 const urlmod = @import("util/url.zig");
-const time = @import("util/time.zig");
 const cookiejar = @import("cookiejar.zig");
 const client_mod = @import("client.zig");
 const log = @import("log.zig");
@@ -46,47 +53,91 @@ const Depth = enum { zero, one, infinity };
 // ---------------------------------------------------------------------------
 
 pub fn handle(app: *App, req: *http.Request, res: *http.Response) !void {
-    // OPTIONS is advertised without auth so capability discovery works.
-    if (eql(u8, req.method, "OPTIONS")) return options(res);
+    // Go `WebDAVAuth`（server/webdav.go:86-90）：拿不到凭据时 **OPTIONS 会被
+    // 放行**（以 guest 身份继续），能力探测因此不需要鉴权。其余方法一律 401。
+    if (eql(u8, req.method, "OPTIONS")) return options(app, req, res);
 
     if (!try checkBasic(app, req)) {
+        // Go `WebDAVAuth`（server/webdav.go:91-93）：`c.Status(401)` + Abort
+        // —— **正文为空**，且 `WWW-Authenticate` 的 realm 是固定小写
+        // "openlist"（不随管理员用户名变化）。以前这里发的是
+        // `Basic realm="OpenList"` 加一句正文，两头都不对（虽然只影响
+        // 探测性客户端，不会让登录失败）。
         res.setStatus(401);
-        try res.set("WWW-Authenticate", "Basic realm=\"OpenList\"");
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("401 Unauthorized");
+        try res.set("WWW-Authenticate", "Basic realm=\"openlist\"");
         return;
     }
 
     const m = req.method;
     if (eql(u8, m, "PROPFIND")) return propfind(app, req, res);
-    if (eql(u8, m, "GET") or eql(u8, m, "HEAD")) return getOrHead(app, req, res, eql(u8, m, "HEAD"));
+    // Go `ServeHTTP`（webdav.go:64）：GET / HEAD / **POST** 三个方法进同一个
+    // `handleGetHeadPost`（POST 是若干下载器用来带参数取文件的写法）。
+    if (eql(u8, m, "GET") or eql(u8, m, "HEAD") or eql(u8, m, "POST")) {
+        return getOrHead(app, req, res, eql(u8, m, "HEAD"));
+    }
     if (eql(u8, m, "PUT")) return put(app, req, res);
     if (eql(u8, m, "MKCOL")) return mkcol(app, req, res);
     if (eql(u8, m, "DELETE")) return delete(app, req, res);
     if (eql(u8, m, "COPY")) return copy(app, req, res);
     if (eql(u8, m, "MOVE")) return move(app, req, res);
-    if (eql(u8, m, "PROPPATCH")) {
-        // No dead properties are stored; acknowledge with an empty multistatus.
-        var out = Buf.init(req.arena);
-        try out.append("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\"/>\n");
-        res.setStatus(207);
-        try res.set("Content-Type", "text/xml; charset=utf-8");
-        try res.write(out.slice());
-        return;
-    }
-    // LOCK/UNLOCK and anything else: method not allowed.
+    if (eql(u8, m, "PROPPATCH")) return proppatch(req, res);
+    // LOCK / UNLOCK 以及其它未注册方法。
+    //
+    // 上游真的实现了 LOCK/UNLOCK（内存锁系统），本工程没有锁，所以一律 405
+    // 并列出真实支持的方法集 —— 客户端（含 Windows MiniRedir）会自行降级为
+    // 无锁访问，浏览不受影响。
     res.setStatus(405);
-    try res.set("Allow", "OPTIONS,GET,HEAD,PUT,DELETE,MKCOL,PROPFIND,COPY,MOVE,PROPPATCH");
+    try res.set("Allow", "OPTIONS,GET,HEAD,POST,PUT,DELETE,MKCOL,PROPFIND,COPY,MOVE,PROPPATCH");
     try res.set("Content-Type", "text/plain; charset=utf-8");
-    try res.write("method not allowed");
+    try res.write("Method Not Allowed");
 }
 
-pub fn options(res: *http.Response) !void {
-    res.setStatus(200);
-    try res.set("DAV", "1");
-    try res.set("Allow", "OPTIONS,GET,HEAD,PUT,DELETE,MKCOL,PROPFIND,COPY,MOVE,PROPPATCH");
-    try res.set("Content-Length", "0");
-    try res.set("Content-Type", "text/plain; charset=utf-8");
+/// Go `handleOptions`（server/webdav/webdav.go:195-219）。
+///
+/// 三件事与之前的写法不同：
+///  1. `Allow` 是**动态的**（按目标存在与否 + 是目录还是文件给出三套值）；
+///     拿不到条目时用的是「还不存在的文件」那一套。
+///  2. `DAV` 是 `"1, 2"`（RFC 4918 的 Class 2 = 支持 LOCK，因为上游有锁系统）
+///     —— 以前只发 `"1"`。
+///  3. 带 `MS-Author-Via: DAV`：Windows 的 Web Client（MiniRedir）靠这个头
+///     决定要不要把该位置当 WebDAV 共享打开，缺了它资源管理器会退化成
+///     「只读的 Web 文件夹」。
+pub fn options(app: *App, req: *http.Request, res: *http.Response) !void {
+    const a = req.arena;
+    const vpath = vpathOf(req.path);
+    var allow: []const u8 = "OPTIONS, LOCK, PUT, MKCOL";
+    var is_dir = false;
+    var known = false;
+    if (eql(u8, vpath, "/")) {
+        // 虚拟根本身就是个集合
+        is_dir = true;
+        known = true;
+    } else if (app.resolve(vpath)) |r| {
+        var ctx = driver.Ctx{ .alloc = a, .tag = r.mount.mount_path };
+        if (r.mount.driver.details(&ctx, r.rel)) |f| {
+            is_dir = f.is_dir;
+            known = true;
+        } else |_| {}
+    }
+    if (known) {
+        allow = if (is_dir)
+            "OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND"
+        else
+            "OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT";
+    }
+    try res.set("Allow", allow);
+    try res.set("DAV", "1, 2");
+    try res.set("MS-Author-Via", "DAV");
+}
+
+/// Go `handleProppatch`（webdav.go:796-844）：本工程不存死属性，直接回一个
+/// 空的 207（上游会为每个属性回 200 `<D:propstat>`，语义等价）。
+fn proppatch(req: *http.Request, res: *http.Response) !void {
+    var out = Buf.init(req.arena);
+    try out.append("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\"/>\n");
+    res.setStatus(207);
+    try res.set("Content-Type", "text/xml; charset=utf-8");
+    try res.write(out.slice());
 }
 
 // ---------------------------------------------------------------------------
@@ -96,7 +147,15 @@ pub fn options(res: *http.Response) !void {
 fn propfind(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const vpath = vpathOf(req.path);
-    const depth = parseDepth(req.header("Depth"));
+    // Go `handlePropfind`（webdav.go:741-747）：**没带 Depth 时默认是
+    // infinity**（不是 1），带了非法值则是 400。以前本实现默认 1 且不校验，
+    // 于是 `Depth: 2` 这种请求会静默按 1 处理。
+    const depth = parseDepth(req.header("Depth")) orelse {
+        res.setStatus(400);
+        try res.set("Content-Type", "text/plain; charset=utf-8");
+        try res.write("Bad Request");
+        return;
+    };
 
     var out = Buf.init(a);
     try out.append("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
@@ -106,14 +165,12 @@ fn propfind(app: *App, req: *http.Request, res: *http.Response) !void {
         try writeColEntry(a, &out, "/", "");
         if (depth != .zero) try writeRootChildren(app, a, &out, depth);
     } else {
-        const r = app.resolve(vpath) orelse {
-            res.setStatus(404);
-            try res.set("Content-Type", "text/plain; charset=utf-8");
-            try res.write("not found");
-            return;
-        };
+        const r = app.resolve(vpath) orelse return webdavStatus(res, 404);
         var ctx = driver.Ctx{ .alloc = a, .tag = r.mount.mount_path };
-        const f = r.mount.driver.details(&ctx, r.rel) catch |e| return webdavErr(res, e);
+        // Go `handlePropfind`（webdav.go:734-740）：fs.Get 失败时 404 / 405，
+        // 但 `ServeHTTP`（webdav.go:85-88）对 PROPFIND 又统一改写成 **404**
+        // —— 注释写明「对客户端把它当空目录」。
+        const f = r.mount.driver.details(&ctx, r.rel) catch return webdavStatus(res, 404);
         if (f.is_dir) {
             try writeColEntry(a, &out, vpath, f.name);
             if (depth != .zero) try walkDir(app, a, &out, vpath, depth);
@@ -176,7 +233,10 @@ fn walkDir(app: *App, a: std.mem.Allocator, out: *Buf, vpath: []const u8, depth:
 }
 
 fn writeColEntry(a: std.mem.Allocator, out: *Buf, vpath: []const u8, name: []const u8) !void {
-    const href = try davHref(a, vpath);
+    // Go `handlePropfind`（webdav.go:778-781）：集合的 href 以 "/" 结尾
+    // （根目录除外）。缺这个斜杠时部分客户端会把目录当成文件去 GET，
+    // 拿到 405 后报「读取失败」。
+    const href = try davHref(a, vpath, true);
     try out.print("  <D:response>\n    <D:href>{s}</D:href>\n", .{href});
     try out.append("    <D:propstat>\n      <D:prop>\n        <D:resourcetype><D:collection/></D:resourcetype>\n");
     const mod = cookiejar.httpDate(a, 0) catch "Thu, 01 Jan 1970 00:00:00 GMT";
@@ -187,7 +247,7 @@ fn writeColEntry(a: std.mem.Allocator, out: *Buf, vpath: []const u8, name: []con
 }
 
 fn writeObjEntry(a: std.mem.Allocator, out: *Buf, vpath: []const u8, o: model.Obj) !void {
-    const href = try davHref(a, vpath);
+    const href = try davHref(a, vpath, o.is_dir);
     try out.print("  <D:response>\n    <D:href>{s}</D:href>\n", .{href});
     try out.append("    <D:propstat>\n      <D:prop>\n");
     if (o.is_dir) {
@@ -211,83 +271,200 @@ fn writeObjEntry(a: std.mem.Allocator, out: *Buf, vpath: []const u8, o: model.Ob
 fn getOrHead(app: *App, req: *http.Request, res: *http.Response, is_head: bool) !void {
     const a = req.arena;
     const vpath = vpathOf(req.path);
-    const r = app.resolve(vpath) orelse {
-        res.setStatus(404);
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("not found");
-        return;
-    };
+    const r = app.resolve(vpath) orelse return webdavStatus(res, 404);
     var ctx = driver.Ctx{ .alloc = a, .tag = r.mount.mount_path };
-    const f = r.mount.driver.details(&ctx, r.rel) catch |e| return webdavErr(res, e);
-    if (f.is_dir) {
-        res.setStatus(404);
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("is a directory");
-        return;
-    }
-    const lk = r.mount.driver.link(&ctx, r.rel, .{ .redirect = false }) catch |e| return webdavErr(res, e);
+    // Go `handleGetHeadPost`（webdav.go:242-245）：fs.Get 出错**一律** 404
+    // （不区分「不存在」还是「驱动炸了」）。
+    const f = r.mount.driver.details(&ctx, r.rel) catch return webdavStatus(res, 404);
 
-    if (lk.local_path) |lp| {
+    // Go webdav.go:246-253 —— 目录不是 404 而是按方法分：
+    //   HEAD → 200 + `Content-Type: httpd/unix-directory` + `Content-Length: 0`
+    //   （客户端靠这个判定「这是个目录，别下载」）
+    //   GET/POST → 405
+    // 以前本实现两种都回 404「is a directory」，浏览器挂载与 rclone 的
+    // 目录嗅探因此拿到的是「不存在」而不是「不能下载」。
+    if (f.is_dir) {
         if (is_head) {
-            try res.set("Content-Type", api.mimeFor(f.name));
-            if (lk.local_size > 0) try res.set("Content-Length", try fmtSize(a, lk.local_size));
+            try res.set("Content-Type", "httpd/unix-directory");
+            try res.set("Content-Length", "0");
             return;
         }
-        const file = std.Io.Dir.cwd().openFile(rt.io(), lp, .{}) catch |e| {
-            log.warn("webdav: open {s}: {s}", .{ lp, @errorName(e) });
-            res.setStatus(500);
-            try res.set("Content-Type", "text/plain; charset=utf-8");
-            try res.write("cannot open file");
-            return;
+        return webdavStatus(res, 405);
+    }
+
+    // Go `handleGetHeadPost`（webdav.go:255-272）的两个存储级策略。它们决定
+    // 的是"要不要 302 出去"，所以必须在 link / 本地 / 远程分支**之前**判定。
+    //
+    // ⚠ A05 的 WebDAV 半边（2026-10-18 实证，STATUS §41.6）：Go 两处都传
+    //   `model.LinkArgs{Header: r.Header}`（webdav.go:257 与 :274）。**必须**
+    //   把请求头交给驱动 —— 115 的直链签名是 **User-Agent 绑定**的：同一个
+    //   URL 用生成时的 UA 取 = 200，换任何别的 UA = 403 `invalid signature`
+    //   （设备上 Go/Zig 双侧受控实验证实）。此前 WebDAV 三处 link 都没传
+    //   headers ⇒ 驱动拿到空 UA（downurl 用空 UA 签）⇒ 回源时链接头里没有
+    //   UA、客户端默认 UA 补上 ⇒ 签名对不上 ⇒ **115 的 WebDAV 下载恒 403**。
+    const policy = r.mount.storage.webdav_policy;
+    var target: ?[]const u8 = null;
+    if (api.isWebdavPolicy(policy, "302_redirect")) {
+        // 302 直链：不回源、不通流量，交给客户端自己去取。
+        // ⚠ `link` 必须按 `redirect=true` 取：部分驱动（189/夸克）在
+        // redirect 模式下才会给出可外链的那一份 URL。
+        const lk = r.mount.driver.link(&ctx, r.rel, .{
+            .redirect = true,
+            .headers = req.headers,
+        }) catch {
+            return webdavStatus(res, 500);
         };
-        try res.set("Content-Type", api.mimeFor(f.name));
-        try res.set("Accept-Ranges", "none");
-        res.sendFile(file, lk.local_size);
+        target = lk.url;
+    } else if (api.isWebdavPolicy(policy, "use_proxy_url") and
+        r.mount.storage.down_proxy_url.len > 0)
+    {
+        // 302 到存储配置的 `down_proxy_url`（编码后的路径，默认带签名）。
+        // Go `common.GenerateDownProxyURL`（server/common/proxy.go:146-159）。
+        // 上游在 URL 为空时会**退回 native 转发**，这里同样靠上面的条件
+        // 表达式落到 native 分支，不做 500。
+        var u = Buf.init(a);
+        // Go 取 `strings.Split(DownProxyURL, "\n")[0]` —— 配置里常写多行做
+        // 负载分担，只用第一行。
+        const base = r.mount.storage.down_proxy_url;
+        const nl = std.mem.indexOfScalar(u8, base, '\n');
+        try u.append(if (nl) |i| base[0..i] else base);
+        try u.append(try urlmod.encode(a, vpath, .path));
+        if (!r.mount.storage.disable_proxy_sign) {
+            try u.append("?sign=");
+            try u.append(try api.signValue(a, app.jwt_secret, vpath, 0));
+        }
+        try res.set("Cache-Control", "max-age=0, no-cache, no-store, must-revalidate");
+        target = try u.toOwned();
+    }
+    if (target) |t| {
+        try res.redirect(t, 302);
         return;
     }
 
-    // Remote file: proxy through. Streaming is a follow-up; we buffer the
-    // response the same way the JSON download endpoint does.
-    if (is_head) {
-        try res.set("Content-Type", api.mimeFor(f.name));
-        if (f.size > 0) try res.set("Content-Length", try fmtSize(a, @intCast(f.size)));
+    // Go webdav.go:274-278：link 失败 → 500。
+    const lk = r.mount.driver.link(&ctx, r.rel, .{
+        .redirect = false,
+        .headers = req.headers,
+    }) catch |e| {
+        log.warn("webdav: link {s}: {s}", .{ vpath, @errorName(e) });
+        return webdavStatus(res, 500);
+    };
+
+    const total: u64 = if (lk.local_path) |_|
+        lk.local_size
+    else if (lk.text) |t|
+        t.len
+    else
+        @intCast(@max(f.size, 0));
+
+    // 本地文件 / 内存文本 ⇒ 走 Go `common.Proxy` 里 **link 带 RangeReader**
+    // 的那个分支：`attachHeader` + `net.ServeHTTP`，也就是有
+    // Etag / Last-Modified / 条件请求 / Range（206+416）。
+    // 远程直链 ⇒ 透明代理分支（上游头原样透传，不设 Etag）。
+    if (lk.local_path != null or lk.text != null) {
+        const ct: []const u8 = if (lk.text != null) "text/plain; charset=utf-8" else api.mimeFor(f.name);
+        const gate = try api.preconditionGate(req, res, a, f, total, ct);
+        if (gate.done) return;
+        try res.set("Accept-Ranges", "bytes");
+
+        const r0: api.ParsedRange = if (req.header("Range")) |rh| api.parseRange(rh, total) else .ignore;
+        switch (if (gate.ignore_range) api.ParsedRange.ignore else r0) {
+            .unsatisfiable => {
+                res.setStatus(416);
+                try res.set("Content-Range", try std.fmt.allocPrint(a, "bytes */{d}", .{total}));
+                return;
+            },
+            .valid => |rg| {
+                if (rg.start >= total) {
+                    res.setStatus(416);
+                    try res.set("Content-Range", try std.fmt.allocPrint(a, "bytes */{d}", .{total}));
+                    return;
+                }
+                res.setStatus(206);
+                try res.set("Content-Range", try std.fmt.allocPrint(a, "bytes {d}-{d}/{d}", .{ rg.start, rg.end, total }));
+                if (lk.local_path) |lp| {
+                    const file = std.Io.Dir.cwd().openFile(rt.io(), lp, .{}) catch {
+                        log.warn("webdav: open {s}: not found", .{lp});
+                        return webdavStatus(res, 500);
+                    };
+                    api.streamRange(res, a, file, rg.start, rg.end) catch return webdavStatus(res, 500);
+                } else if (lk.text) |txt| {
+                    try res.write(txt[rg.start..rg.end + 1]);
+                }
+                return;
+            },
+            .ignore => {},
+        }
+        if (lk.local_path) |lp| {
+            const file = std.Io.Dir.cwd().openFile(rt.io(), lp, .{}) catch {
+                log.warn("webdav: open {s}: not found", .{lp});
+                return webdavStatus(res, 500);
+            };
+            res.sendFile(file, total);
+        } else if (lk.text) |txt| {
+            try res.write(txt);
+        }
         return;
     }
+
+    // ---- 远程：透明代理（Go `common.Proxy` 的 `maps.Copy` + C-D 分支）----
     var jar = cookiejar.Jar.init(a);
     var client = client_mod.Client.init(a, .{}, &jar);
     defer client.deinit();
-    // W01：把客户端的 Range 透传给上游，并原样回传 206/Content-Range。
-    // 之前这里不传 Range、又只接受 200，`/dav` 的断点续传根本走不通
-    // （`/d` 的 Range 测试证明不了 `/dav` 支持）。
+    // W01：把客户端的 Range **原样**透传给上游。
+    //
+    // ⚠ 这里刻意**不**做本端的 Range 解析/切片/416 合成：Go 的透明代理分支
+    //   （`common.Proxy` 的末尾）只做 `maps.Copy(w.Header(), res.Header)`，
+    //   客户端的 Range 经 `net.ProcessHeader` 原样发给上游，上游回什么就转发
+    //   什么 —— 上游不支持 Range 时上游回 200，Go 也回 200。
+    //   （本地/内存那条分支才走 `net.ServeHTTP`，那才是会自己切 Range、
+    //   会合成 416 的地方；两个分支的语义本来就不一样。）
+    //   早先这里"解析 Range → 只转发能解析的 → 上游忽略就自己切"，对
+    //   `size=0` 的云盘条目会把 Range 整个丢掉，且与上游的 200 语义相左。
     var hdrs = List(model.Header).init(a);
     for (lk.header) |h| try hdrs.append(h);
-    if (req.header("Range")) |rh| try hdrs.append(.{ .name = "Range", .value = rh });
+    if (req.header("Range")) |rh| {
+        try hdrs.append(.{ .name = "Range", .value = rh });
+    }
 
     const up = client.send(a, .{
-        .method = "GET",
+        // Go `net.RequestHttp(ctx, r.Method, ...)`：方法照抄（HEAD 就是 HEAD），
+        // 拿到响应后 `if r.Method == HEAD { return nil }` 不发正文。
+        .method = req.method,
         .url = lk.url,
         .headers = hdrs.slice(),
         // N02：回源跟随 3xx，CDN 用 302 转边缘节点，不跟随就变 502。
         .follow_redirects = true,
     }) catch |e| {
         log.warn("webdav: proxy {s}: {s}", .{ lk.url, @errorName(e) });
-        res.setStatus(502);
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("upstream fetch failed");
-        return;
+        return webdavStatus(res, 500);
     };
-    if (up.status != 200 and up.status != 206) {
-        res.setStatus(502);
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("upstream error");
-        return;
+    if (up.status >= 400) {
+        // Go：RequestHttp 对 4xx/5xx 返回 error（HttpStatusCodeError），
+        // handleGetHeadPost 把它展开成真实状态码 → 客户端看到的就是上游的
+        // 403/404，正文是状态码文本。以前这里统一压成 502，夸克 cookie 过期
+        // 时用户在 WebDAV 里只看到「Bad Gateway」，排查方向被完全误导。
+        return webdavStatus(res, up.status);
     }
-    try res.set("Content-Type", api.mimeFor(f.name));
-    try res.set("Accept-Ranges", "bytes");
-    if (up.status == 206) {
-        res.setStatus(206);
-        if (up.header("Content-Range")) |cr| try res.set("Content-Range", cr);
+    if (up.status >= 300) return webdavStatus(res, up.status);
+
+    res.setStatus(up.status);
+    for (up.headers) |h| {
+        // 跳过逐跳头 + 交给响应层计算的 Content-Length；Set-Cookie 对齐
+        // Go `RequestHttp` 的 `res.Header.Del("set-cookie")`（上游 CDN 的
+        // cookie 不该借我们的域下发）。
+        if (std.ascii.eqlIgnoreCase(h.name, "Content-Length")) continue;
+        if (std.ascii.eqlIgnoreCase(h.name, "Connection")) continue;
+        if (std.ascii.eqlIgnoreCase(h.name, "Transfer-Encoding")) continue;
+        if (std.ascii.eqlIgnoreCase(h.name, "Keep-Alive")) continue;
+        if (std.ascii.eqlIgnoreCase(h.name, "Set-Cookie")) continue;
+        res.set(h.name, h.value) catch continue;
     }
+    // C-D 在透传后设置（覆盖上游同名头）：WebDAV 的 GET 也是下载语义。
+    // ⚠ 与本地分支相反，这里**不**自己补 `Accept-Ranges`：透明代理的语义是
+    //   "上游说什么就是什么"，上游带了就透传过来（koofr 等 WebDAV 上游会
+    //   带），上游没带就不带 —— 与 Go 的 `maps.Copy` 一致。
+    try res.set("Content-Disposition", try api.contentDisposition(a, f.name));
     try res.write(up.body);
 }
 
@@ -295,314 +472,104 @@ fn getOrHead(app: *App, req: *http.Request, res: *http.Response, is_head: bool) 
 // PUT / MKCOL / DELETE
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// ETag 与条件请求 —— 对齐 Go `internal/net/preconditions.go`（上游 8cfe906e
-// 把它接到 WebDAV 的 PUT 上）与 `server/common/proxy.go:90` 的 `GetEtag`。
-//
-// 为什么值得做：标准 WebDAV 客户端（挂载盘、rsync 类同步工具）靠
-// `If-None-Match: *` 表达"不存在才写入"。此前这里恒返回 201 且完全不看条件头，
-// 于是"只写新文件"的客户端每次都整份重传，冲突覆盖也无从谈起。
-// ---------------------------------------------------------------------------
-
-const Cond = enum { none, yes, no };
-
-/// Go `common.GetEtag(file, size)`：有 hash 用 hash，否则退化成
-/// `"<hex(mtime 秒)>-<hex(size)>"`。
+/// Go `handlePut`（server/webdav/webdav.go:339-424）。
 ///
-/// ⚠️ 用**秒**不是纳秒：上游注释写明存储后端不保证亚秒精度能跨缓存刷新复现，
-/// 用纳秒会让同一文件每次 stat 拿到不同 ETag，条件请求永远不成立。
-fn etagFor(a: std.mem.Allocator, f: driver.File) ![]const u8 {
-    if (f.hash_info) |hi| {
-        if (hi.hash_value.len > 0) return std.fmt.allocPrint(a, "\"{s}\"", .{hi.hash_value});
-    }
-    return std.fmt.allocPrint(a, "\"{x}-{x}\"", .{ f.modified, f.size });
-}
-
-fn trimWs(s: []const u8) []const u8 {
-    var i: usize = 0;
-    var j: usize = s.len;
-    while (i < j and (s[i] == ' ' or s[i] == '\t')) i += 1;
-    while (j > i and (s[j - 1] == ' ' or s[j - 1] == '\t')) j -= 1;
-    return s[i..j];
-}
-
-/// Go `internal/net/preconditions.go:11` 的 `scanETag`：识别 `W/"x"` 或 `"x"`，
-/// 返回 ETag 本身与剩余文本。
-fn scanETag(s: []const u8) ?struct { etag: []const u8, remain: []const u8 } {
-    const t = trimWs(s);
-    var start: usize = 0;
-    if (std.mem.startsWith(u8, t, "W/")) start = 2;
-    if (t.len < start + 2 or t[start] != '"') return null;
-    var i: usize = start + 1;
-    while (i < t.len) : (i += 1) {
-        const c = t[i];
-        if (c == '"') return .{ .etag = t[0 .. i + 1], .remain = t[i + 1 ..] };
-        // RFC 7232 §2.3 允许的 ETag 字符
-        const ok = c == 0x21 or (c >= 0x23 and c <= 0x7e) or c >= 0x80;
-        if (!ok) return null;
-    }
-    return null;
-}
-
-fn etagStrongMatch(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, a, b) and a.len > 0 and a[0] == '"';
-}
-
-/// Go `etagWeakMatch`：`strings.TrimPrefix(a, "W/") == strings.TrimPrefix(b, "W/")`。
-/// 必须是**整串前缀**，不能写成按字符集合 trim（那会把 `"W"` 开头的强 ETag 也剥掉）。
-fn stripWeakPrefix(s: []const u8) []const u8 {
-    return if (std.mem.startsWith(u8, s, "W/")) s[2..] else s;
-}
-
-fn etagWeakMatch(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, stripWeakPrefix(a), stripWeakPrefix(b));
-}
-
-/// HTTP 日期解析（Go `http.ParseTime`）。这里支持 RFC 7231 要求发送方必须
-/// 产生的 IMF-fixdate（"Mon, 02 Jan 2006 15:04:05 GMT"）以及常见的
-/// RFC 850 / asctime 两种老格式；解析不出来时**返回 null**，调用方按 Go 的
-/// 语义把它当 `condNone`（忽略该条件头），不会误判成 412。
-fn parseHttpTime(s: []const u8) ?i64 {
-    var it = std.mem.tokenizeAny(u8, s, " \t");
-    const tok = [4][]const u8{ it.next() orelse return null, it.next() orelse return null,
-        it.next() orelse return null, it.next() orelse return null };
-    var day_s: []const u8 = undefined;
-    var mon_s: []const u8 = undefined;
-    var year_s: []const u8 = undefined;
-    var time_s: []const u8 = undefined;
-    var zone_s: []const u8 = undefined;
-
-    // IMF-fixdate:  Mon,  02  Jan  2006  15:04:05  GMT
-    if (tok[1].len == 2 and std.ascii.isDigit(tok[1][0]) and std.ascii.isDigit(tok[1][1]) and
-        (tok[2].len == 3 or tok[2].len == 4 and tok[2][3] == ','))
-    {
-        day_s = tok[1];
-        mon_s = tok[2][0..3];
-        year_s = tok[3];
-        time_s = it.next() orelse return null;
-        zone_s = it.next() orelse return null;
-    } else if (std.mem.indexOfScalar(u8, tok[1], '-') != null) {
-        // RFC 850:  Monday, 02-Jan-06 15:04:05 MST   （逗号已在 tokenize 里按空白切，
-        // 但这一种的首段常带逗号，故按 '-' 分段）
-        var p = std.mem.splitScalar(u8, tok[1], '-');
-        day_s = p.next() orelse return null;
-        mon_s = p.next() orelse return null;
-        year_s = p.next() orelse return null;
-        time_s = tok[2];
-        zone_s = tok[3];
-    } else {
-        // asctime:  Mon Jan  2 15:04:05 2006  （注意年是最后一个 token）
-        mon_s = tok[1];
-        day_s = tok[2];
-        time_s = tok[3];
-        year_s = it.next() orelse return null;
-        zone_s = "GMT";
-    }
-
-    if (!std.ascii.eqlIgnoreCase(zone_s, "GMT") and !std.ascii.eqlIgnoreCase(zone_s, "UTC")) return null;
-
-    const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-    var month: i64 = -1;
-    for (month_names, 0..) |m, i| {
-        if (std.ascii.eqlIgnoreCase(m, mon_s)) month = @intCast(i + 1);
-    }
-    if (month < 0) return null;
-
-    const day = std.fmt.parseInt(i64, day_s, 10) catch return null;
-    var year = std.fmt.parseInt(i64, year_s, 10) catch return null;
-    if (year < 100) year += if (year < 70) 2000 else 1900; // RFC 850 的两位年
-
-    var tp = std.mem.splitScalar(u8, time_s, ':');
-    const hh = std.fmt.parseInt(i64, tp.next() orelse return null, 10) catch return null;
-    const mm = std.fmt.parseInt(i64, tp.next() orelse return null, 10) catch return null;
-    const ss = std.fmt.parseInt(i64, tp.next() orelse return null, 10) catch return null;
-
-    return time.daysFromCivil(year, month, day) * 86400 + hh * 3600 + mm * 60 + ss;
-}
-
-fn checkIfMatch(a: std.mem.Allocator, req: *const http.Request, etag: []const u8, exists: bool) !Cond {
-    const vals = try req.headersAll(a, "If-Match");
-    if (vals.len == 0) return .none;
-    var joined = Buf.init(a);
-    for (vals, 0..) |v, i| {
-        if (i != 0) try joined.appendByte(',');
-        try joined.append(v);
-    }
-    if (!exists) return .no;
-    var im = joined.slice();
-    while (true) {
-        im = trimWs(im);
-        if (im.len == 0) break;
-        if (im[0] == ',') {
-            im = im[1..];
-            continue;
-        }
-        if (im[0] == '*') return .yes;
-        const r = scanETag(im) orelse break;
-        if (etagStrongMatch(r.etag, etag)) return .yes;
-        im = r.remain;
-    }
-    return .no;
-}
-
-fn checkIfNoneMatch(a: std.mem.Allocator, req: *const http.Request, etag: []const u8, exists: bool) !Cond {
-    const vals = try req.headersAll(a, "If-None-Match");
-    if (vals.len == 0) return .none;
-    var joined = Buf.init(a);
-    for (vals, 0..) |v, i| {
-        if (i != 0) try joined.appendByte(',');
-        try joined.append(v);
-    }
-    if (!exists) return .yes;
-    var buf = joined.slice();
-    while (true) {
-        buf = trimWs(buf);
-        if (buf.len == 0) break;
-        if (buf[0] == ',') {
-            buf = buf[1..];
-            continue;
-        }
-        if (buf[0] == '*') return .no;
-        const r = scanETag(buf) orelse break;
-        if (etagWeakMatch(r.etag, etag)) return .no;
-        buf = r.remain;
-    }
-    return .yes;
-}
-
-fn checkIfUnmodifiedSince(req: *const http.Request, modtime: i64) Cond {
-    const v = req.header("If-Unmodified-Since") orelse return .none;
-    if (modtime == 0) return .none; // Go `isZeroTime`
-    const t = parseHttpTime(v) orelse return .none;
-    return if (modtime <= t) .yes else .no;
-}
-
-fn checkIfModifiedSince(req: *const http.Request, modtime: i64) Cond {
-    // Go：只对 GET / HEAD 生效
-    if (!eql(u8, req.method, "GET") and !eql(u8, req.method, "HEAD")) return .none;
-    const v = req.header("If-Modified-Since") orelse return .none;
-    if (modtime == 0) return .none;
-    const t = parseHttpTime(v) orelse return .none;
-    return if (modtime <= t) .no else .yes;
-}
-
-/// 对齐 Go `internal/net/preconditions.go` 末尾的 `writeNotModified`（RFC 7232 §4.1）。
-fn writeNotModified(res: *http.Response) !void {
-    res.setStatus(304);
-    try res.set("Content-Length", "0");
-}
-
-/// 对齐 Go `net.CheckPreconditions`：返回 true 表示条件头已经决定了响应
-/// （304 / 412），调用方必须就此返回、不再执行实际操作。
-fn checkPreconditions(a: std.mem.Allocator, req: *const http.Request, res: *http.Response, etag: []const u8, modtime: i64, exists: bool) !bool {
-    var ch = try checkIfMatch(a, req, etag, exists);
-    if (ch == .none) ch = checkIfUnmodifiedSince(req, modtime);
-    if (ch == .no) {
-        res.setStatus(412);
-        try res.set("Content-Length", "0");
-        return true;
-    }
-    switch (try checkIfNoneMatch(a, req, etag, exists)) {
-        .no => {
-            if (eql(u8, req.method, "GET") or eql(u8, req.method, "HEAD")) {
-                try writeNotModified(res);
-            } else {
-                res.setStatus(412);
-                try res.set("Content-Length", "0");
-            }
-            return true;
-        },
-        .none => {
-            if (checkIfModifiedSince(req, modtime) == .no) {
-                try writeNotModified(res);
-                return true;
-            }
-        },
-        .yes => {},
-    }
-    return false;
-}
-
+/// 三条与旧实现不同的语义：
+///  1. **状态码恒为 201**（不管目标是新建还是覆盖）。旧实现按 RFC 给了
+///     204/201 两种，看上去更"正确"，但上游就只有 201 —— 而某些客户端
+///     （含 rclone 的 WebDAV 后端）把 204 当成"没写进去"而报同步失败。
+///  2. **不做条件请求**（If-Match / If-None-Match）。上游 webdav.go:358 有
+///     明确的 TODO 说还没支持；强行 412 会让"存在才更新"语义的客户端写不进
+///     去 —— 而上游此时是直接覆盖。
+///  3. **写完必回 ETag**：stat 不到新对象时，退回用请求自带的
+///     `X-OC-Mtime`（或当前时间）+ `Content-Length` 拼（webdav.go:414-417）。
 fn put(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const vpath = vpathOf(req.path);
+    // Go handlePut:351 —— 根路径不能 PUT。
+    if (eql(u8, vpath, "/")) return webdavStatus(res, 405);
     const r = app.resolve(vpath) orelse {
-        res.setStatus(404);
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("not found");
-        return;
+        // 父目录不存在（fs.PutDirectly 失败）⇒ 405，与上游一致。
+        return webdavStatus(res, 405);
     };
     var ctx = driver.Ctx{ .alloc = a, .tag = r.mount.mount_path };
 
-    // 对齐上游 `handlePut`（webdav.go:398-415）：PUT **之前**先 stat ——
-    // 目标已存在且是目录 ⇒ 405 Method Not Allowed（覆盖目录没有意义）。
-    var exists = false;
-    var modtime: i64 = 0;
-    var etag: []const u8 = "";
+    // 上游是"先写、写失败才 405"。这里提前挡掉目录目标：覆盖一个集合没有
+    // 意义，状态码与上游一致，还省掉一次注定失败的上传（云盘侧可能是几 MB
+    // 的上行流量）。
     if (r.mount.driver.details(&ctx, r.rel)) |f| {
         if (f.is_dir) {
             res.setStatus(405);
             try res.set("Content-Length", "0");
             return;
         }
-        exists = true;
-        modtime = f.modified;
-        etag = try etagFor(a, f);
     } else |_| {}
 
-    // 条件请求：If-Match / If-Unmodified-Since / If-None-Match 不满足 ⇒ 412，
-    // 且**不执行**上传。
-    if (try checkPreconditions(a, req, res, etag, modtime, exists)) return;
-
-    r.mount.driver.put(&ctx, r.rel, req.body.source()) catch |e| return webdavErr(res, e);
-    // 上游：已存在 ⇒ 204，新建 ⇒ 201（此前这里恒 201，客户端无法区分覆盖与新建）。
-    res.setStatus(if (exists) 204 else 201);
-    // 上游写完会再 stat 一次拿新 ETag；拿不到就干脆不发这个头，
-    // 也好过发一个已经过期的旧值。
-    if (r.mount.driver.details(&ctx, r.rel)) |f| {
-        try res.set("ETag", try etagFor(a, f));
-    } else |_| {}
-    try res.set("Content-Length", "0");
+    r.mount.driver.put(&ctx, r.rel, req.body.source()) catch {
+        return webdavStatus(res, 405);
+    };
+    res.setStatus(201);
+    // ETag：优先写后 stat 的真实值；stat 不到就退回请求推导值。
+    // 头名用 Go 的大小写 `Etag`（`w.Header().Set("Etag", etag)`）—— 有些
+    // 客户端（含 litmus）对大小写敏感。
+    if (r.mount.driver.details(&ctx, r.rel)) |nf| {
+        try res.set("Etag", try api.etagFor(a, nf, @intCast(@max(nf.size, 0))));
+    } else |_| {
+        const size = req.body.len();
+        const mtime = headerUnix(req, "X-OC-Mtime") orelse rt.nowSeconds();
+        try res.set("Etag", try std.fmt.allocPrint(a, "\"{x}-{x}\"", .{ mtime, size }));
+    }
 }
 
+/// 解析 `X-OC-Mtime` / `X-OC-Ctime`（ownCloud 系客户端用来带 mtime 的私有头，
+/// Go `webdav/util.go:20-36`）。解析失败时 Go 会打一条 warn 并用 `time.Now()`，
+/// 这里同样返回 null 让调用方回落。
+fn headerUnix(req: *http.Request, name: []const u8) ?i64 {
+    const v = req.header(name) orelse return null;
+    return std.fmt.parseInt(i64, std.mem.trim(u8, v, " \t"), 10) catch null;
+}
+
+/// Go `handleMkcol`（webdav.go:426-479）。
 fn mkcol(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const vpath = vpathOf(req.path);
-    const r = app.resolve(vpath) orelse {
-        res.setStatus(404);
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("not found");
-        return;
-    };
+    const r = app.resolve(vpath) orelse return webdavStatus(res, 405);
     var ctx = driver.Ctx{ .alloc = a, .tag = r.mount.mount_path };
-    // RFC 4918 §9.3.1：目标集合已存在时 MKCOL 必须返回 405，而不是 502。
-    // 真机上这里曾经把「已存在」报成 502（错误名 `Unexpected` 被 webdavErr
-    // 兜到默认分支）。驱动侧虽然已经容错，但协议上仍应显式区分。
-    if (r.mount.driver.details(&ctx, r.rel)) |f| {
-        if (f.is_dir) {
-            res.setStatus(405);
-            try res.set("Content-Length", "0");
-            return;
-        }
+    // RFC 4918 §9.3.1：目标**已存在**（文件或目录都算）⇒ 405。
+    // 旧实现只对目录挡 405，对同名文件会试图 makeDir，把驱动的错误再兜成
+    // 502 —— 而协议上这是"URL 已被映射"，就是 405。
+    if (r.mount.driver.details(&ctx, r.rel)) |_| {
+        res.setStatus(405);
+        try res.set("Content-Length", "0");
+        return;
     } else |_| {}
+    // RFC 4918 §9.3.1：父集合不存在 ⇒ 409（服务器不得自动创建中间层）。
+    if (parentMissing(app, a, vpath)) return webdavStatus(res, 409);
 
-    r.mount.driver.makeDir(&ctx, r.rel) catch |e| return webdavErr(res, e);
+    r.mount.driver.makeDir(&ctx, r.rel) catch return webdavStatus(res, 409);
     res.setStatus(201);
     try res.set("Content-Length", "0");
 }
 
+/// 父路径是否不可解析 / 不存在。虚拟根的父级视为存在。
+fn parentMissing(app: *App, a: std.mem.Allocator, vpath: []const u8) bool {
+    const parent = urlmod.parentPath(vpath);
+    if (eql(u8, parent, "/") or parent.len == 0) return false;
+    const pr = app.resolve(parent) orelse return true;
+    var ctx = driver.Ctx{ .alloc = a, .tag = pr.mount.mount_path };
+    const pf = pr.mount.driver.details(&ctx, pr.rel) catch return true;
+    return !pf.is_dir;
+}
+
+/// Go `handleDelete`（webdav.go:293-337）：先 stat（不存在 ⇒ 404），
+/// 再删（失败 ⇒ 405），成功 204。
 fn delete(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const vpath = vpathOf(req.path);
-    const r = app.resolve(vpath) orelse {
-        res.setStatus(404);
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("not found");
-        return;
-    };
+    const r = app.resolve(vpath) orelse return webdavStatus(res, 404);
     var ctx = driver.Ctx{ .alloc = a, .tag = r.mount.mount_path };
-    const f = r.mount.driver.details(&ctx, r.rel) catch |e| return webdavErr(res, e);
-    r.mount.driver.remove(&ctx, r.rel, f.is_dir) catch |e| return webdavErr(res, e);
+    const f = r.mount.driver.details(&ctx, r.rel) catch return webdavStatus(res, 404);
+    r.mount.driver.remove(&ctx, r.rel, f.is_dir) catch return webdavStatus(res, 405);
     res.setStatus(204);
 }
 
@@ -610,33 +577,42 @@ fn delete(app: *App, req: *http.Request, res: *http.Response) !void {
 // MOVE / COPY
 // ---------------------------------------------------------------------------
 
+/// Go `handleCopyMove`（webdav.go:481-509）的公共前置段：取 Destination 头、
+/// 剥前缀、再做两个 RFC 4918 的硬校验。失败时响应已经写好，返回 null。
+fn copyMovePaths(app: *App, req: *http.Request, res: *http.Response, a: std.mem.Allocator) !?struct { src: []const u8, dst: []const u8 } {
+    _ = app;
+    const src = vpathOf(req.path);
+    // 缺 Destination ⇒ 400（Go:482-485）
+    const dest_hdr = req.header("Destination") orelse {
+        try webdavStatus(res, 400);
+        return null;
+    };
+    // 解析不出路径（不是本机的 URL / 不含 /dav 前缀）⇒ 400
+    const dst = (try destVpath(a, dest_hdr)) orelse {
+        try webdavStatus(res, 400);
+        return null;
+    };
+    // Go:504-509 —— 目标为空 ⇒ 502；**目标 == 源 ⇒ 403**（不是 204 成功）。
+    // 旧实现把"移到自己身上"当成 204 空操作返回，而协议上这是被禁止的。
+    if (dst.len == 0) {
+        try webdavStatus(res, 502);
+        return null;
+    }
+    if (eql(u8, dst, src)) {
+        try webdavStatus(res, 403);
+        return null;
+    }
+    return .{ .src = src, .dst = dst };
+}
+
+/// Go `handleCopyMove` + `moveFiles`（webdav/file.go:35-74）。
 fn move(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
-    const src = vpathOf(req.path);
-    const dest_hdr = req.header("Destination") orelse {
-        res.setStatus(400);
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("Destination header required");
-        return;
-    };
-    const dst = try destVpath(a, dest_hdr) orelse {
-        res.setStatus(400);
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("bad Destination");
-        return;
-    };
-    const sr = app.resolve(src) orelse {
-        res.setStatus(404);
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("source not found");
-        return;
-    };
-    const dr = app.resolve(dst) orelse {
-        res.setStatus(404);
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("destination not found");
-        return;
-    };
+    const cm = (try copyMovePaths(app, req, res, a)) orelse return;
+    const sr = app.resolve(cm.src) orelse return webdavStatus(res, 404);
+    const dr = app.resolve(cm.dst) orelse return webdavStatus(res, 404);
+    // ⚠ 已知偏离：上游 `fs.Move` 走任务系统，跨存储也能搬；本工程没有任务
+    //  系统，driver 的 move/rename 只在同存储内有效，跨存储只能 502 说明。
     if (sr.mount != dr.mount) {
         res.setStatus(502);
         try res.set("Content-Type", "text/plain; charset=utf-8");
@@ -650,77 +626,69 @@ fn move(app: *App, req: *http.Request, res: *http.Response) !void {
     const src_name = urlmod.baseName(sr.rel);
     const dst_name = urlmod.baseName(dr.rel);
 
+    // 与 Go `moveFiles`（file.go:58-68）同构：同目录 ⇒ 直接改名；
+    // 跨目录 ⇒ 先 move 到目标目录，名字不同再补一次 rename。
     if (eql(u8, src_parent, dst_parent)) {
-        if (eql(u8, src_name, dst_name)) {
-            res.setStatus(204); // same place: no-op
-            return;
-        }
-        sr.mount.driver.rename(&ctx, sr.rel, dst_name) catch |e| return webdavErr(res, e);
+        sr.mount.driver.rename(&ctx, sr.rel, dst_name) catch {
+            log.warn("webdav: move {s}: failed", .{cm.src});
+            return webdavStatus(res, 500);
+        };
     } else {
-        sr.mount.driver.move(&ctx, sr.rel, dst_parent) catch |e| return webdavErr(res, e);
+        sr.mount.driver.move(&ctx, sr.rel, dst_parent) catch {
+            log.warn("webdav: move {s}: failed", .{cm.src});
+            return webdavStatus(res, 500);
+        };
         if (!eql(u8, src_name, dst_name)) {
             const moved_rel = try urlmod.joinPath(a, dst_parent, src_name);
-            sr.mount.driver.rename(&ctx, moved_rel, dst_name) catch |e| return webdavErr(res, e);
+            sr.mount.driver.rename(&ctx, moved_rel, dst_name) catch {
+                log.warn("webdav: rename {s}: failed", .{moved_rel});
+                return webdavStatus(res, 500);
+            };
         }
     }
+    // Go moveFiles 结尾：`return http.StatusCreated` —— 恒 201。
     res.setStatus(201);
-    try res.set("Content-Length", "0");
 }
 
+/// Go `handleCopyMove` + `copyFiles`（webdav/file.go:80-107）。
 fn copy(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
-    const src = vpathOf(req.path);
-    const dest_hdr = req.header("Destination") orelse {
-        res.setStatus(400);
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("Destination header required");
-        return;
-    };
-    const dst = try destVpath(a, dest_hdr) orelse {
-        res.setStatus(400);
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("bad Destination");
-        return;
-    };
-    const sr = app.resolve(src) orelse {
-        res.setStatus(404);
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("source not found");
-        return;
-    };
-    const dr = app.resolve(dst) orelse {
-        res.setStatus(404);
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("destination not found");
-        return;
-    };
-    if (sr.mount != dr.mount) {
-        res.setStatus(502);
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("cross-storage copy not supported");
-        return;
-    }
+    const cm = (try copyMovePaths(app, req, res, a)) orelse return;
+    const sr = app.resolve(cm.src) orelse return webdavStatus(res, 404);
+    const dr = app.resolve(cm.dst) orelse return webdavStatus(res, 404);
 
-    var ctx = driver.Ctx{ .alloc = a, .tag = sr.mount.mount_path };
-    const f = sr.mount.driver.details(&ctx, sr.rel) catch |e| return webdavErr(res, e);
+    var sctx = driver.Ctx{ .alloc = a, .tag = sr.mount.mount_path };
+    const f = sr.mount.driver.details(&sctx, sr.rel) catch return webdavStatus(res, 404);
+    // ⚠ 已知偏离：上游 `fs.Copy` 递归拷贝整个集合。本工程的 HTTP 客户端是
+    //  整体缓冲式的（`client.send` 一次拿全量），递归拷贝整棵树会把整棵树的
+    //  内容同时压进内存，所以只对单个文件实现；目录明确回 501 让客户端自己
+    //  逐条 COPY（rclone/Cyberduck 都会这么做），而不是悄悄少拷一半。
     if (f.is_dir) {
         res.setStatus(501);
         try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("directory copy not supported");
+        try res.write("Not Implemented");
         return;
     }
-    const lk = sr.mount.driver.link(&ctx, sr.rel, .{ .redirect = false }) catch |e| return webdavErr(res, e);
-    const data = fetchBytes(a, lk) catch |e| {
-        log.warn("webdav: copy fetch: {s}", .{@errorName(e)});
-        res.setStatus(502);
-        try res.set("Content-Type", "text/plain; charset=utf-8");
-        try res.write("copy source fetch failed");
-        return;
+    const lk = sr.mount.driver.link(&sctx, sr.rel, .{
+        .redirect = false,
+        .headers = req.headers,
+    }) catch {
+        return webdavStatus(res, 500);
     };
+    const data = fetchBytes(a, lk) catch |e| {
+        log.warn("webdav: copy fetch {s}: {s}", .{ cm.src, @errorName(e) });
+        return webdavStatus(res, 500);
+    };
+    // 跨存储是允许的（本实现是"下载 + 上传"，不依赖驱动的 move/rename，
+    // 这一点反而比只支持同存储的 MOVE 更接近上游）。
+    var dctx = driver.Ctx{ .alloc = a, .tag = dr.mount.mount_path };
     const src_mem = memSource(&data);
-    dr.mount.driver.put(&ctx, dr.rel, src_mem) catch |e| return webdavErr(res, e);
+    dr.mount.driver.put(&dctx, dr.rel, src_mem) catch {
+        log.warn("webdav: copy put {s}: failed", .{cm.dst});
+        return webdavStatus(res, 500);
+    };
+    // Go copyFiles 结尾：`return http.StatusCreated` —— 恒 201。
     res.setStatus(201);
-    try res.set("Content-Length", "0");
 }
 
 /// Read a link's bytes into memory. Used by COPY (and would be by a future
@@ -779,8 +747,12 @@ fn vpathOf(rp: []const u8) []const u8 {
     return rp;
 }
 
-fn davHref(alloc: std.mem.Allocator, vpath: []const u8) ![]u8 {
+fn davHref(alloc: std.mem.Allocator, vpath: []const u8, is_dir: bool) ![]u8 {
     const enc = try urlmod.encode(alloc, vpath, .path);
+    // 与 Go 一致：集合补尾斜杠，根（"/"）不补。
+    if (is_dir and !eql(u8, vpath, "/")) {
+        return std.fmt.allocPrint(alloc, "/dav{s}/", .{enc});
+    }
     return std.fmt.allocPrint(alloc, "/dav{s}", .{enc});
 }
 
@@ -796,11 +768,15 @@ fn destVpath(a: std.mem.Allocator, dest: []const u8) !?[]u8 {
     return urlmod.decode(a, path) catch null;
 }
 
-fn parseDepth(h: ?[]const u8) Depth {
-    const d = (h orelse "1");
+/// Go `parseDepth`（webdav.go:881-891）：只认 "0" / "1" / "infinity"，
+/// 其它一律非法（invalidDepth）。不带头时返回 null 让调用方用默认的
+/// infinity。
+fn parseDepth(h: ?[]const u8) ?Depth {
+    const d = h orelse return .infinity;
     if (eql(u8, d, "0")) return .zero;
+    if (eql(u8, d, "1")) return .one;
     if (eql(u8, d, "infinity")) return .infinity;
-    return .one;
+    return null;
 }
 
 fn xmlEscape(out: *Buf, s: []const u8) !void {
@@ -814,21 +790,17 @@ fn xmlEscape(out: *Buf, s: []const u8) !void {
     };
 }
 
-fn fmtSize(a: std.mem.Allocator, n: u64) ![]u8 {
-    return std.fmt.allocPrint(a, "{d}", .{n});
-}
-
-fn webdavErr(res: *http.Response, e: anyerror) !void {
-    const st: u16 = switch (e) {
-        error.NotFound => 404,
-        error.AuthFailed, error.ConfiguredTokenExpired => 401,
-        error.NotSupported => 501,
-        error.RateLimited => 429,
-        else => 502,
-    };
-    res.setStatus(st);
+/// Go `ServeHTTP`（server/webdav/webdav.go:94-98）的收尾：
+/// `w.WriteHeader(status); w.Write([]byte(StatusText(status)))`。
+///
+/// 也就是说 WebDAV 的错误响应体**就是状态码文本**（"Not Found" /
+/// "Method Not Allowed"…），不是自定义文案 —— 绝大多数 WebDAV 客户端只看
+/// 状态码，但少数（含 litmus 测试套件）会比对这段文本。以前这里写的是
+/// "not found"、"is a directory"、"upstream error" 之类自造文案。
+fn webdavStatus(res: *http.Response, status: u16) !void {
+    res.setStatus(status);
     try res.set("Content-Type", "text/plain; charset=utf-8");
-    try res.write(@errorName(e));
+    try res.write(http.statusText(status));
 }
 
 fn checkBasic(app: *App, req: *http.Request) !bool {
@@ -843,20 +815,12 @@ fn checkBasic(app: *App, req: *http.Request) !bool {
     const user = buf[0..colon];
     const pass = buf[colon + 1 ..];
     if (!eql(u8, user, app.admin_user)) return false;
-    const hash = sha256Hex(req.arena, pass);
-    return ctEqual(hash, app.admin_hash);
-}
-
-fn sha256Hex(a: std.mem.Allocator, s: []const u8) []u8 {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(s, &digest, .{});
-    const out = a.alloc(u8, 64) catch return "";
-    const hex = "0123456789abcdef";
-    for (digest, 0..) |c, i| {
-        out[i * 2] = hex[c >> 4];
-        out[i * 2 + 1] = hex[c & 0x0F];
-    }
-    return out;
+    // Same derivation as /api/auth/login: StaticHash first, then the salted
+    // HashPwd. `admin_salt` empty (older configs / test doubles) would make
+    // twoHashPwd disagree with however the hash was produced, so require it.
+    if (app.admin_salt.len == 0) return false;
+    const expect = api.twoHashPwd(req.arena, pass, app.admin_salt) catch return false;
+    return ctEqual(expect, app.admin_hash);
 }
 
 fn ctEqual(a: []const u8, b: []const u8) bool {
@@ -907,22 +871,7 @@ test "webdav: PROPFIND requires auth and lists a mounted directory" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var stub = Stub{};
-    const drv = stub.toDriver();
-    var mounts = try a.alloc(api.Mount, 1);
-    mounts[0] = .{ .storage = .{ .driver = "Stub" }, .driver = drv, .mount_path = "/v", .label = "v" };
-    var app = App{
-        .alloc = a,
-        .mounts = mounts,
-        .admin_hash = sha256Hex(a, "pass"),
-        .admin_user = "admin",
-        .admin_pwd_ts = 0,
-        .jwt_secret = "s",
-        .site_url = "",
-        .cdn = "",
-        .token_expires_in_hours = 48,
-        .frontend = undefined,
-    };
+    var app = try mkApp(a);
 
     // No credential -> 401.
     var req = http.Request{ .arena = a, .method = "PROPFIND", .path = "/dav/v", .target = "/dav/v" };
@@ -930,10 +879,16 @@ test "webdav: PROPFIND requires auth and lists a mounted directory" {
     try handle(&app, &req, &res);
     try testing.expectEqual(@as(u16, 401), res.status);
 
-    // With Basic auth -> 207 multistatus containing both children.
+    // With Basic auth + Depth 1 -> 207 multistatus containing both children.
+    //
+    // ⚠ 必须显式带 Depth：不带时按上游语义是 infinity，而 Stub 的 list 对
+    // 任何路径都返回同样的两个孩子 —— 递归永不终止。
     var req2 = http.Request{ .arena = a, .method = "PROPFIND", .path = "/dav/v", .target = "/dav/v" };
-    var auth_hdr = [_]model.Header{ .{ .name = "Authorization", .value = "Basic YWRtaW46cGFzcw==" } };
-    req2.headers = &auth_hdr;
+    var hs = [_]model.Header{
+        .{ .name = "Authorization", .value = "Basic YWRtaW46cGFzcw==" },
+        .{ .name = "Depth", .value = "1" },
+    };
+    req2.headers = &hs;
     var res2 = http.Response.init(a);
     try handle(&app, &req2, &res2);
     try testing.expectEqual(@as(u16, 207), res2.status);
@@ -942,21 +897,183 @@ test "webdav: PROPFIND requires auth and lists a mounted directory" {
     try testing.expect(std.mem.indexOf(u8, body, "a.txt") != null);
     try testing.expect(std.mem.indexOf(u8, body, "sub") != null);
     try testing.expect(std.mem.indexOf(u8, body, "getcontentlength") != null);
+    // 集合的 href 必须以 "/" 结尾（Go handlePropfind:778-781）
+    try testing.expect(std.mem.indexOf(u8, body, "<D:href>/dav/v/sub/</D:href>") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "<D:href>/dav/v/a.txt</D:href>") != null);
 }
 
-test "webdav: OPTIONS advertises DAV without auth" {
+test "webdav: OPTIONS advertises DAV 1,2 + MS-Author-Via without auth" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
+    // 文件（/v/a.txt → stub 的 details 报"文件"）
+    var app = try mkApp(a);
+    var req = http.Request{ .arena = a, .method = "OPTIONS", .path = "/dav/v/a.txt", .target = "/dav/v/a.txt" };
     var res = http.Response.init(a);
-    try options(&res);
+    try handle(&app, &req, &res);
     try testing.expectEqual(@as(u16, 200), res.status);
-    var found: bool = false;
+    try testing.expectEqualStrings("1, 2", hdr(&res, "DAV").?);
+    try testing.expectEqualStrings("DAV", hdr(&res, "MS-Author-Via").?);
+    try testing.expectEqualStrings(
+        "OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT",
+        hdr(&res, "Allow").?,
+    );
+
+    // 目录（/v → stub 的 details("/") 报"集合"）
+    var req2 = http.Request{ .arena = a, .method = "OPTIONS", .path = "/dav/v", .target = "/dav/v" };
+    var res2 = http.Response.init(a);
+    try handle(&app, &req2, &res2);
+    try testing.expectEqualStrings(
+        "OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND",
+        hdr(&res2, "Allow").?,
+    );
+}
+
+test "webdav: 401 uses Go's lowercase realm and an empty body" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var app = try mkApp(a);
+    var req = http.Request{ .arena = a, .method = "PROPFIND", .path = "/dav/v", .target = "/dav/v" };
+    var res = http.Response.init(a);
+    try handle(&app, &req, &res);
+    try testing.expectEqual(@as(u16, 401), res.status);
+    try testing.expectEqualStrings("Basic realm=\"openlist\"", hdr(&res, "WWW-Authenticate").?);
+    try testing.expectEqual(@as(usize, 0), res.buf.len);
+}
+
+test "webdav: HEAD on a directory is 200 httpd/unix-directory, GET is 405" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var app = try mkApp(a);
+    var auth = [_]model.Header{.{ .name = "Authorization", .value = "Basic YWRtaW46cGFzcw==" }};
+
+    var req_h = http.Request{ .arena = a, .method = "HEAD", .path = "/dav/v", .target = "/dav/v", .headers = &auth };
+    var res_h = http.Response.init(a);
+    try handle(&app, &req_h, &res_h);
+    try testing.expectEqual(@as(u16, 200), res_h.status);
+    try testing.expectEqualStrings("httpd/unix-directory", hdr(&res_h, "Content-Type").?);
+    try testing.expectEqualStrings("0", hdr(&res_h, "Content-Length").?);
+
+    var req_g = http.Request{ .arena = a, .method = "GET", .path = "/dav/v", .target = "/dav/v", .headers = &auth };
+    var res_g = http.Response.init(a);
+    try handle(&app, &req_g, &res_g);
+    try testing.expectEqual(@as(u16, 405), res_g.status);
+    try testing.expectEqualStrings("Method Not Allowed", res_g.buf.slice());
+}
+
+test "webdav: PROPFIND rejects an invalid Depth with 400" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var app = try mkApp(a);
+    var hs = [_]model.Header{
+        .{ .name = "Authorization", .value = "Basic YWRtaW46cGFzcw==" },
+        .{ .name = "Depth", .value = "2" },
+    };
+    var req = http.Request{ .arena = a, .method = "PROPFIND", .path = "/dav/v", .target = "/dav/v", .headers = &hs };
+    var res = http.Response.init(a);
+    try handle(&app, &req, &res);
+    try testing.expectEqual(@as(u16, 400), res.status);
+    try testing.expectEqualStrings("Bad Request", res.buf.slice());
+}
+
+test "webdav: MOVE onto itself is 403 (not 204)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var app = try mkApp(a);
+    var hs = [_]model.Header{
+        .{ .name = "Authorization", .value = "Basic YWRtaW46cGFzcw==" },
+        .{ .name = "Destination", .value = "/dav/v/a.txt" },
+    };
+    var req = http.Request{ .arena = a, .method = "MOVE", .path = "/dav/v/a.txt", .target = "/dav/v/a.txt", .headers = &hs };
+    var res = http.Response.init(a);
+    try handle(&app, &req, &res);
+    try testing.expectEqual(@as(u16, 403), res.status);
+    try testing.expectEqualStrings("Forbidden", res.buf.slice());
+}
+
+test "webdav: PUT is always 201 and carries an ETag" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var app = try mkApp(a);
+    var auth = [_]model.Header{.{ .name = "Authorization", .value = "Basic YWRtaW46cGFzcw==" }};
+    var req = http.Request{
+        .arena = a,
+        .method = "PUT",
+        .path = "/dav/v/new.txt",
+        .target = "/dav/v/new.txt",
+        .headers = &auth,
+        .body = .{ .memory = "hello" },
+    };
+    var res = http.Response.init(a);
+    try handle(&app, &req, &res);
+    try testing.expectEqual(@as(u16, 201), res.status);
+    // stub 写完后 details 仍然报同一个文件 ⇒ ETag 是 `"<mtime hex>-<size hex>"`。
+    try testing.expectEqualStrings("\"0-a\"", hdr(&res, "ETag").?);
+}
+
+test "webdav: PUT onto a directory is 405" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var app = try mkApp(a);
+    var auth = [_]model.Header{.{ .name = "Authorization", .value = "Basic YWRtaW46cGFzcw==" }};
+    var req = http.Request{
+        .arena = a,
+        .method = "PUT",
+        .path = "/dav/v",
+        .target = "/dav/v",
+        .headers = &auth,
+        .body = .{ .memory = "hello" },
+    };
+    var res = http.Response.init(a);
+    try handle(&app, &req, &res);
+    try testing.expectEqual(@as(u16, 405), res.status);
+}
+
+/// 取响应头（大小写不敏感），测试里用来断言 WebDAV 的三个新头。
+fn hdr(res: *http.Response, name: []const u8) ?[]const u8 {
     for (res.headers.slice()) |h| {
-        if (std.ascii.eqlIgnoreCase(h.name, "DAV") and std.mem.eql(u8, h.value, "1")) found = true;
+        if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
     }
-    try testing.expect(found);
+    return null;
+}
+
+/// 测试用的 App：一个 Stub 驱动挂在 /v，口令 pass（与既有 PROPFIND 测试同源）。
+fn mkApp(a: std.mem.Allocator) !App {
+    // ⚠ 驱动对象必须**分配在 arena 上**：返回局部 `Stub` 的地址就是典型的
+    // 悬垂指针（mkApp 返回后栈帧失效，ReleaseSmall 下不报错、只是读到垃圾）。
+    // 跨函数返回指针一律用分配器 —— 2026-10-16 的夸克 502 就是这么来的。
+    const stub = try a.create(Stub);
+    stub.* = Stub{};
+    const drv = stub.toDriver();
+    var mounts = try a.alloc(api.Mount, 1);
+    mounts[0] = .{ .storage = .{ .driver = "Stub" }, .driver = drv, .mount_path = "/v", .label = "v" };
+    const salt = "0123456789abcdef";
+    return .{
+        .alloc = a,
+        .mounts = mounts,
+        .admin_hash = try api.twoHashPwd(a, "pass", salt),
+        .admin_salt = salt,
+        .admin_user = "admin",
+        .admin_pwd_ts = 0,
+        .jwt_secret = "s",
+        .site_url = "",
+        .cdn = "",
+        .token_expires_in_hours = 48,
+        .frontend = undefined,
+    };
 }
 
 /// In-test driver that returns a fixed directory, so PROPFIND can be exercised

@@ -15,9 +15,11 @@
 //! 与 Go 版的差异（都是有意为之，不是遗漏）：
 //!   * `Copy` 不存在：上游没有复制接口，Go 版也是返回 NotSupport。这里干脆
 //!     不提供 vtable 入口。
-//!   * 上传进度回调 `UpdateProgress` 未移植：Zig 骨架没有任务中心，进度由
-//!     调用方从日志推断。属于已知缺口，见 docs/STATUS.md。
-//!   * 重试策略用固定退避而非 `retry-go` 的指数退避，次数一致（3 次）。
+//!   * 重试策略：次数与 Go 的 `retry-go` 一致（3 次、1s 起指数退避），但由
+//!     本工程自己的循环实现，不引第三方库。
+//!   * 上传进度：Go 把 `UpdateProgress` 传进 `StreamSectionReader`，由读线程
+//!     直接回调；Zig 侧 worker 只累加原子计数，另起一个轮询线程换算百分比
+//!     （用户回调非线程安全，多 worker 直调是数据竞争）。语义等价。
 
 const std = @import("std");
 const driver = @import("../driver.zig");
@@ -245,7 +247,10 @@ pub const Itvsh = struct {
     };
 
     fn drvName(_: *anyopaque) []const u8 {
-        return "Itvsh";
+        // L21：驱动自报的名字必须等于 Go 的 `driver.Config.Name`
+        // （`drivers/itvsh/meta.go:34`）。以前返回历史名 "Itvsh"，
+        // fs/get 的 `provider` 因此与生产实例不一致。
+        return "上海电信智家硬盘";
     }
 
     fn as(self: *anyopaque) *Itvsh {
@@ -694,10 +699,15 @@ pub const Itvsh = struct {
             const em = inner.strAt("errorMsg") orelse "";
             if (!quiet) {
                 log.warn("[itvsh] {s} business error: errorCode {s}, errorMsg {s}", .{ method, ec, em });
+                // 业务层也可能报鉴权失效
+                try classifyUpstream(0, em, method);
+                try classifyUpstream(0, ec, method);
+            } else {
+                // quiet：判定照做（鉴权失效要照常上报，让 nasProxy 重登），
+                // 只是别把「预期内的失败」刷成 WARN。
+                try classifyUpstreamLog(0, em, method, false);
+                try classifyUpstreamLog(0, ec, method, false);
             }
-            // 业务层也可能报鉴权失效
-            try classifyUpstream(0, em, method);
-            try classifyUpstream(0, ec, method);
             return Error.UpstreamError;
         }
         return inner.getPath("data") orelse return Error.UpstreamError;
@@ -1089,6 +1099,19 @@ pub const Itvsh = struct {
             log.err("[itvsh] upload failed: {s}", .{@errorName(e)});
             // 走到这里说明有分块重试耗尽后仍失败（或被取消）。
             // 服务器上必然留着 name.crash，明确告诉调用方它在哪。
+            //
+            // Go 的 `residual()`（upload.go:56-58）把这个位置**包进错误消息**：
+            // `fmt.Errorf("%w；服务器上残留未完成文件 %s，可重新上传覆盖或手动删除", ...)`。
+            // Zig 的 error 无 payload，但 `ctx.err_detail` 就是为此存在的通道
+            // （`driver.Ctx.err_detail`，api.zig 的 mapDriverError 会用它当响应
+            // message）—— 信息量与 Go 逐字对齐，不是新增行为。
+            // ⚠ 只能在请求线程写：worker 只往 `state.first_err` 存错误，消息在
+            // 这里（join 之后、请求线程上）合成。
+            ctx.err_detail = ctx.alloc.dupe(u8, try std.fmt.allocPrint(
+                ctx.alloc,
+                "上传失败；服务器上残留未完成文件 {s}，可重新上传覆盖或手动删除",
+                .{crash_path},
+            )) catch null;
             log.err("[itvsh] 服务器上残留未完成文件 {s}，可重新上传覆盖或手动删除", .{crash_path});
             return e;
         }
@@ -1097,7 +1120,7 @@ pub const Itvsh = struct {
         _ = self.saveCookies();
 
         if (ctx.progress) |f| f(ctx.progress_userdata, 100);
-        return self.finalizeUpload(a, dir, name);
+        return self.finalizeUpload(ctx, a, dir, name);
     }
 
     fn deleteFileQuiet(self: *Itvsh, a: std.mem.Allocator, dir: []const u8, name: []const u8) void {
@@ -1119,28 +1142,38 @@ pub const Itvsh = struct {
     ///   3. 删除 .openlist_to_delete
     ///
     /// 第 2 步失败时把备份改回原名，确保不丢数据。
-    fn finalizeUpload(self: *Itvsh, a: std.mem.Allocator, dir: []const u8, name: []const u8) !void {
+    fn finalizeUpload(self: *Itvsh, ctx: *driver.Ctx, a: std.mem.Allocator, dir: []const u8, name: []const u8) !void {
         const crash = try std.fmt.allocPrint(a, "{s}.crash", .{name});
         const backup = try std.fmt.allocPrint(a, "{s}.openlist_to_delete", .{name});
 
         // D12：查询失败**不能**当成"没有同名文件"。吞掉这个错误会跳过下面的
         // 备份步骤，直接用 `.crash` 覆盖真文件 —— 后续任一步失败就是数据丢失。
         // Go 的调用方同样让 fileExist 的错误向上传播。
-        const exists = try self.fileExist(a, dir, name);
+        const exists = self.fileExist(a, dir, name) catch |e| {
+            // Go：`%w；数据已传完但收尾未执行，服务器上残留 %s，可重新上传覆盖或手动改名`
+            try setErrDetail(ctx, "数据已传完但收尾未执行，服务器上残留 {s}，可重新上传覆盖或手动改名", .{crash});
+            return e;
+        };
         if (!exists) {
-            try self.renameWithRetry(a, dir, crash, name);
+            self.renameWithRetry(a, dir, crash, name) catch |e| {
+                try setErrDetail(ctx, "数据已传完但改名失败，服务器上残留 {s}，可重新上传覆盖或手动改名", .{crash});
+                return e;
+            };
             return;
         }
         // 先把真文件挪到备份名，腾出 name 给新文件用
-        try self.renameWithRetry(a, dir, name, backup);
+        self.renameWithRetry(a, dir, name, backup) catch |e| {
+            try setErrDetail(ctx, "数据已传完但无法移开同名旧文件，服务器上残留 {s}，可重新上传覆盖或手动改名", .{crash});
+            return e;
+        };
         // 第 2 步失败则回滚第 1 步：宁可回到「新旧并存」的初始状态，也不能丢旧文件
         self.renameWithRetry(a, dir, crash, name) catch |e| {
             self.renameWithRetry(a, dir, backup, name) catch {
-                log.err("[itvsh] 改名失败，且旧文件回滚也失败（旧文件现为 {s}/{s}，新数据在 {s}/{s}），请手动处理", .{
-                    dir, backup, dir, crash,
-                });
+                // Go：`%w；改名失败，且旧文件回滚也失败（旧文件现为 %s ，新数据在 %s），请手动处理`
+                try setErrDetail(ctx, "改名失败，且旧文件回滚也失败（旧文件现为 {s} ，新数据在 {s}），请手动处理", .{ backup, crash });
                 return e;
             };
+            try setErrDetail(ctx, "数据已传完但改名失败，服务器上残留 {s}，可重新上传覆盖或手动改名", .{crash});
             return e;
         };
         // 新文件已就位，清理备份。这步失败只留下垃圾文件，不影响正确性，不向上报错
@@ -1148,27 +1181,40 @@ pub const Itvsh = struct {
         self.deleteFileQuiet(a, dir, backup);
     }
 
-    /// 收尾阶段数据已经完整传完，纯属元数据操作，值得重试
-    /// —— 这里失败一次，用户看到的就是「白传了」，代价不对等。
-    fn renameWithRetry(self: *Itvsh, a: std.mem.Allocator, dir: []const u8, from: []const u8, to: []const u8) !void {
-        var attempt: u8 = 0;
-        while (true) : (attempt += 1) {
-            var b = Buf.init(a);
-            var w = ObjWriter{ .b = &b };
-            try w.begin();
-            try w.str("directory", dir);
-            try w.str("filename", from);
-            try w.str("newFilename", to);
-            try w.end();
-            if (self.nasProxy(a, method_file_rename, b.slice(), 1, false)) |_| {
-                return;
-            } else |e| {
-                if (attempt + 1 >= finalize_attempts) return e;
-                log.warn("[itvsh] rename {s} -> {s} failed ({s}), retrying", .{ from, to, @errorName(e) });
-                rt.sleepMillis(retry_delay_ms);
-            }
+/// 把一条格式化消息写进 `ctx.err_detail`（请求线程专用）。
+///
+/// Go 用 `fmt.Errorf("%w；…")` 把上下文包进 error；Zig 的 error 无 payload，
+/// 这条通道就是对应物（`api.zig` 的 mapDriverError 优先拿它当响应 message）。
+/// 写失败（OOM）无所谓：日志里已有同样内容，消息只是增强。
+fn setErrDetail(ctx: *driver.Ctx, comptime fmt: []const u8, args: anytype) !void {
+    ctx.err_detail = ctx.alloc.dupe(u8, try std.fmt.allocPrint(ctx.alloc, fmt, args)) catch null;
+}
+
+/// 收尾阶段数据已经完整传完，纯属元数据操作，值得重试
+/// —— 这里失败一次，用户看到的就是「白传了」，代价不对等。
+fn renameWithRetry(self: *Itvsh, a: std.mem.Allocator, dir: []const u8, from: []const u8, to: []const u8) !void {
+    var attempt: u8 = 0;
+    while (true) : (attempt += 1) {
+        var b = Buf.init(a);
+        var w = ObjWriter{ .b = &b };
+        try w.begin();
+        try w.str("directory", dir);
+        try w.str("filename", from);
+        try w.str("newFilename", to);
+        try w.end();
+        if (self.nasProxy(a, method_file_rename, b.slice(), 1, false)) |_| {
+            return;
+        } else |e| {
+            if (attempt + 1 >= finalize_attempts) return e;
+            log.warn("[itvsh] rename {s} -> {s} failed ({s}), retrying", .{ from, to, @errorName(e) });
+            // Go 的 `retry.Delay(1s)` + `DelayType(BackOffDelay)`
+            // （upload.go:157-160）：第 n 次重试前退避 1s·2ⁿ。以前这里写死
+            // 1s 平退避，次数一致但节奏不对齐 —— 收尾失败多半是上游限流，
+            // 指数退避正是给它让路。
+            rt.sleepMillis(@intCast(retry_delay_ms << @intCast(attempt)));
         }
     }
+}
 };
 
 // ---------------------------------------------------------------------------
@@ -1258,22 +1304,54 @@ fn uploadChunk(state: *UploadState, client: *httpclient.Client, a: std.mem.Alloc
     // 鉴权失效时刷新会话再重传这一块。
     // 下面整段会重跑，所以 body 必须在每次尝试时重新申请，
     // 否则第二次尝试会读到已耗尽的 buffer。
+    //
+    // M6（审计）：重试范围对齐 Go `drivers/itvsh/upload.go:73-76`
+    // —— `errgroup.NewOrderedGroupWithContext(..., retry.Attempts(3),
+    // retry.Delay(time.Second), retry.DelayType(retry.BackOffDelay))`
+    // 对**任何**分片错误都重试，不只是鉴权失败。以前这里只有 `AuthFailed`
+    // 才重试，弱网 / 上游 5xx 抖动时整单立刻失败，成功率明显低于 Go。
     var attempt: u8 = 0;
     while (true) : (attempt += 1) {
         if (uploadChunkOnce(state, client, a, index, offset, length)) |_| {
             return;
         } else |e| {
-            if (e != Error.AuthFailed or attempt + 1 >= chunk_attempts) return e;
-            log.warn("[itvsh] chunk {d} auth failed, restoring session", .{index});
-            self.relogin(a) catch |re| {
-                // token 是手工配置的，驱动续不了，只能让用户自己换 ——
-                // 这条比原始的上游错误更能说明该做什么，故替换掉。
-                if (re == Error.ConfiguredTokenExpired) return re;
-                return e;
-            };
-            rt.sleepMillis(retry_delay_ms);
+            // 重试已经没有意义的错误直接交回上层（Go 会白等 3 轮）。
+            if (!chunkRetryable(e)) return e;
+            if (attempt + 1 >= chunk_attempts) return e;
+            if (state.cancel.load(.acquire)) return e;
+
+            // Go 的 `withRelogin`（util.go:352-370）：只在鉴权失败时重登，
+            // 重登结果决定要不要换错误信息。
+            if (e == Error.AuthFailed) {
+                log.warn("[itvsh] chunk {d} auth failed, restoring session", .{index});
+                self.relogin(a) catch |re| {
+                    // token 是手工配置的，驱动续不了，只能让用户自己换 ——
+                    // 这条比原始的上游错误更能说明该做什么，故替换掉。
+                    if (re == Error.ConfiguredTokenExpired) return re;
+                    // 其余恢复失败：Go 返回**原始**错误（更有诊断价值），
+                    // 外层仍会继续重试。
+                };
+            } else {
+                log.warn("[itvsh] chunk {d} failed ({s}), attempt {d}/{d}", .{
+                    index, @errorName(e), attempt + 1, chunk_attempts,
+                });
+            }
+            // Go 是 `Delay(1s)` + `BackOffDelay`（第 n 次退避 1s·2ⁿ）。
+            rt.sleepMillis(@intCast(retry_delay_ms * (@as(u64, 1) << @intCast(attempt))));
         }
     }
+}
+
+/// 分片错误值不值得重试（Go 侧由 errgroup 统一重试，这里只挑出「重来一次也
+/// 不会变、只会白等」的两种）。
+fn chunkRetryable(e: anyerror) bool {
+    return switch (e) {
+        // 重读同一个 offset 得到的还是同样长度，重试纯属浪费。
+        Error.ShortRead => false,
+        // 手工配置的 token 已过期，驱动续不了 —— 换错误之前重试没有意义。
+        Error.ConfiguredTokenExpired => false,
+        else => true,
+    };
 }
 
 fn uploadChunkOnce(
@@ -1390,19 +1468,27 @@ fn checkChunkResult(a: std.mem.Allocator, body: []const u8, index: u64) !void {
 /// 注意 code 用等值比较而不是 `strings.Contains`：Go 版之所以要
 /// `Contains(msg, "code 1009")` 是因为它只有字符串，这里不必重蹈覆辙。
 fn classifyUpstream(code: i64, msg: []const u8, what: []const u8) !void {
+    return classifyUpstreamLog(code, msg, what, true);
+}
+
+/// `verbose=false`：只判定不刷日志。给 `quiet` 调用链用 —— 上传前清理不存在
+/// 的 `.crash` 残留属于预期内的失败（`deleteFileQuiet`），日志里刷
+/// `failed: code 0` 纯属噪音，会淹掉真问题。判定结果与 `classifyUpstream`
+/// 完全一致（含鉴权失效识别，让上层重登逻辑不受影响）。
+fn classifyUpstreamLog(code: i64, msg: []const u8, what: []const u8, verbose: bool) !void {
     for (auth_failure_codes) |c| {
         if (code == c) {
-            log.warn("[itvsh] {s} auth failure: code {d}, msg: {s}", .{ what, code, msg });
+            if (verbose) log.warn("[itvsh] {s} auth failure: code {d}, msg: {s}", .{ what, code, msg });
             return Error.AuthFailed;
         }
     }
     for (auth_failure_markers) |m| {
         if (std.mem.indexOf(u8, msg, m) != null) {
-            log.warn("[itvsh] {s} auth failure marker: code {d}, msg: {s}", .{ what, code, msg });
+            if (verbose) log.warn("[itvsh] {s} auth failure marker: code {d}, msg: {s}", .{ what, code, msg });
             return Error.AuthFailed;
         }
     }
-    log.warn("[itvsh] {s} failed: code {d}, msg: {s}", .{ what, code, msg });
+    if (verbose) log.warn("[itvsh] {s} failed: code {d}, msg: {s}", .{ what, code, msg });
     return Error.UpstreamError;
 }
 
@@ -1754,4 +1840,25 @@ test "progressReporter clamps to 100 and tolerates a null callback" {
     state.done_blocks.store(99, .release);
     progressReporter(&state);
     try testing.expectEqual(@as(u64, 99), state.done_blocks.load(.acquire));
+}
+
+test "M6: chunk retry covers every retryable error, not just AuthFailed" {
+    // 审计 M6：Go `upload.go:73-76` 对**任何**分片错误都重试 3 次
+    // （`retry.Attempts(3)` + `BackOffDelay`）。以前只有 `AuthFailed`
+    // 才重试，弱网/上游 5xx 抖动时整单立刻失败。
+    //
+    // `chunkRetryable` 是这条策略的判据，单测钉住它：网络/上游类必须重试，
+    // 短读与「手工 token 过期」重试没有意义（重来一次结果完全一样）。
+    try testing.expect(chunkRetryable(Error.AuthFailed));
+    try testing.expect(chunkRetryable(Error.UpstreamHttp));
+    try testing.expect(chunkRetryable(Error.UpstreamError));
+    try testing.expect(chunkRetryable(Error.UpstreamNotJson));
+    try testing.expect(chunkRetryable(Error.WafBlocked));
+    // 客户端侧的网络错误（不在本驱动 Error 集里）同样要重试 —— 这是 Go
+    // errgroup 覆盖面里最重要的一类。
+    try testing.expect(chunkRetryable(error.ConnectionResetByPeer));
+    try testing.expect(chunkRetryable(error.WriteFailed));
+
+    try testing.expect(!chunkRetryable(Error.ShortRead));
+    try testing.expect(!chunkRetryable(Error.ConfiguredTokenExpired));
 }

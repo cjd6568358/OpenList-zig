@@ -397,8 +397,11 @@ pub const Jar = struct {
                 .domain = domain,
                 .expires = if (item.strAt("Expires")) |s| (parseHttpDate(s) orelse 0) else 0,
                 .max_age = item.intAt("MaxAge") orelse 0,
-                .secure = item.getPath("Secure").?.asBool() orelse false,
-                .http_only = item.getPath("HttpOnly").?.asBool() orelse false,
+                // H7：缺键（手改配置 / 旧版 / 第三方工具写出的最小 blob）时
+                // 回落 false，不能 `.?` 解包 —— 那会直接 panic 崩掉进程
+                // （itvsh 每次 init/relogin 都走这里，崩了只能改配置恢复）。
+                .secure = if (item.getPath("Secure")) |sv| sv.asBool() orelse false else false,
+                .http_only = if (item.getPath("HttpOnly")) |hv| hv.asBool() orelse false else false,
                 .same_site = @intCast(std.math.clamp(item.intAt("SameSite") orelse 0, 0, 4)),
                 .host_only = false,
             };
@@ -685,6 +688,19 @@ test "go-format roundtrip" {
     var out = Buf.init(a);
     try testing.expect(try jar2.headerFor("cdn.itvsh.cn", "/", true, 1001, &out));
     try testing.expect(std.mem.indexOf(u8, out.slice(), "WAF=xyz") != null);
+}
+
+test "fromJson tolerates minimal blob without Secure/HttpOnly" {
+    // H7 regression: 手改/外部 blob 缺 Secure/HttpOnly 时不能 panic。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var jar = Jar.init(a);
+    try jar.fromJson("[{\"Name\":\"S\",\"Value\":\"1\",\"Path\":\"/\",\"Domain\":\"pan.itvsh.cn\",\"MaxAge\":0}]");
+    try testing.expectEqual(@as(usize, 1), jar.count());
+    var out = Buf.init(a);
+    try testing.expect(try jar.headerFor("pan.itvsh.cn", "/", false, 1001, &out));
+    try testing.expect(std.mem.indexOf(u8, out.slice(), "S=1") != null);
 }
 
 test "regraft moves cookies onto a new host" {

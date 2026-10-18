@@ -88,6 +88,21 @@ const max_redirects: usize = 5;
 /// 分片基准 10 MiB。`partSize` 在此基础上按文件大小放大。
 const slice_base: i64 = 10 * 1024 * 1024;
 
+/// M3：实际分片并发度 = min(配置值, 片数, 内存上限 / 单片大小)，最小 1。
+/// 抽成纯函数是为了能单测（真正的并发上传要联网）。
+fn uploadConcurrency(thread_cfg: i64, count: i64, slice: i64) usize {
+    const by_mem = @max(@divTrunc(max_upload_buffer_bytes, @max(slice, 1)), 1);
+    return @intCast(@max(@min(@min(@max(thread_cfg, 1), @max(count, 1)), by_mem), 1));
+}
+
+/// M3：并发上传时**所有 worker 的分片缓冲合计**上限。
+///
+/// Go 侧无条件持有 `uploadThread × sliceSize`（`utils.go:739` 的 errgroup
+/// 每个分片先在 `Before` 里读进内存），服务器无所谓，光猫不行 —— `partSize`
+/// 的阶梯在超大文件上会涨到几十 MB 一片，3 个 worker 就是几百 MB。这里按
+/// 内存再夹一次并发度：并发度 = min(配置值, 片数, 本上限 / 单片大小)。
+const max_upload_buffer_bytes: i64 = 32 * 1024 * 1024;
+
 const user_agent = "Mozilla/5.0 (Macintosh; Apple macOS 26_1_0) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36 Chrome/142.0.0.0 OpenList/425.6.30";
 
 const hex_digits = "0123456789abcdef";
@@ -428,8 +443,19 @@ fn normalizeDownloadUrl(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
 }
 
 /// `normalizeCloud189Name` —— 名字里的 `\'` 还原成 `'`。
-fn normalizeName(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
-    if (std.mem.indexOf(u8, name, "\\'") == null) return name;
+    /// 可选字符串深拷进 `alloc`；缺键回落空串（H2）。
+    fn dupeOrEmpty(alloc: std.mem.Allocator, s: ?[]const u8) ![]const u8 {
+        return alloc.dupe(u8, s orelse "");
+    }
+
+    /// 规范化名字并**深拷进 `alloc`**（H2：所有权契约）。
+    ///
+    /// 以前「无 `\'` 时原样返回」——看起来省一次拷贝，实际上 getFiles 是在
+    /// 内层 arena 里解析的 JSON，原样返回等于把悬垂切片交出去（无 `\'` 才是
+    /// 常见路径！）。契约改为：**返回值永远归 `alloc` 所有**，调用方（请求级
+    /// arena）统一回收。
+    fn normalizeName(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
+        if (std.mem.indexOf(u8, name, "\\'") == null) return alloc.dupe(u8, name);
     var b = Buf.init(alloc);
     defer b.deinit();
     var i: usize = 0;
@@ -1439,6 +1465,11 @@ pub const Cloud189PC = struct {
         id: []const u8,
         name: []const u8,
         is_dir: bool,
+        // fs/get（details）要用：此前只带 id/name/is_dir，fs/get 对 189PC
+        // 恒报 size=0（真机 2026-10-17：list 是 20MB、get 是 0）。
+        size: i64 = 0,
+        modified: i64 = 0,
+        created: i64 = 0,
     };
 
     const Page = struct {
@@ -1516,9 +1547,11 @@ pub const Cloud189PC = struct {
                     .is_dir = false,
                     .modified = parse189Time(item.strAt("lastOpTime") orelse "") orelse 0,
                     .created = parse189Time(item.strAt("createDate") orelse "") orelse 0,
-                    .thumb = if (icon) |ic| ic.strAt("smallUrl") orelse "" else "",
+                    // H2：thumb/hash 与 name 一样，必须深拷进 `alloc` —— 这里
+                    // 解析用的 page arena 在函数返回时就 deinit 了。
+                    .thumb = if (icon) |ic| try dupeOrEmpty(alloc, ic.strAt("smallUrl")) else "",
                     .hash_info = if (item.strAt("md5")) |m|
-                        model.HashInfo{ .hash_name = "md5", .hash_value = m }
+                        model.HashInfo{ .hash_name = "md5", .hash_value = try alloc.dupe(u8, m) }
                     else
                         null,
                 });
@@ -1556,7 +1589,14 @@ pub const Cloud189PC = struct {
             }
             for (page.files) |item| {
                 if (std.mem.eql(u8, try normalizeName(arena, item.strAt("name") orelse ""), name)) {
-                    return .{ .id = try idOf(arena, &item), .name = name, .is_dir = false };
+                    return .{
+                        .id = try idOf(arena, &item),
+                        .name = name,
+                        .is_dir = false,
+                        .size = item.intAt("size") orelse 0,
+                        .modified = parse189Time(item.strAt("lastOpTime") orelse "") orelse 0,
+                        .created = parse189Time(item.strAt("createDate") orelse "") orelse 0,
+                    };
                 }
             }
             if (page.folders.len + page.files.len < page_size) return driver.Error.NotFound;
@@ -1664,7 +1704,13 @@ pub const Cloud189PC = struct {
     fn details(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8) anyerror!model.File {
         const self = as(ptr);
         const e = try self.resolve(ctx.alloc, path);
-        return model.File.fromObj(.{ .name = e.name, .is_dir = e.is_dir });
+        return model.File.fromObj(.{
+            .name = e.name,
+            .size = e.size,
+            .is_dir = e.is_dir,
+            .modified = e.modified,
+            .created = e.created,
+        });
     }
 
     fn link(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, args: model.LinkArgs) anyerror!model.Link {
@@ -1874,7 +1920,7 @@ pub const Cloud189PC = struct {
         return .{ .url = request_url, .headers = try hs.toOwned() };
     }
 
-    /// 上传一个分片。分片 URL 上也要带 `clientSuffix`（Go 的 `put` 显式加）。
+    /// 上传一个分片：换 URL（串行、走 `self.client`）→ PUT（可并发）。
     fn putPart(
         self: *Cloud189PC,
         arena: std.mem.Allocator,
@@ -1885,7 +1931,21 @@ pub const Cloud189PC = struct {
     ) !void {
         const part_info = try std.fmt.allocPrint(arena, "{d}-{s}", .{ part_number, md5_b64 });
         const target = try self.getMultiUploadUrls(arena, upload_file_id, part_info);
+        return putPartRaw(&self.client, arena, target, part_number, chunk);
+    }
 
+    /// 只做 PUT 这一步（分片 URL 已换好）。分片 URL 上也要带 `clientSuffix`
+    /// （Go 的 `put` 显式加）。
+    ///
+    /// 不碰 `self`：`M3` 的并发上传让每个 worker 用自己的 `httpclient.Client`
+    /// 调它（`Client.send` 内部有全局锁，共用 `self.client` 等于没并发）。
+    fn putPartRaw(
+        client: *httpclient.Client,
+        arena: std.mem.Allocator,
+        target: UploadTarget,
+        part_number: i64,
+        chunk: []const u8,
+    ) !void {
         var src = std.Random.IoSource{ .io = rt.io() };
         const suffix = try clientSuffix(arena, src.interface());
         var q = urlmod.Query.init(arena);
@@ -1897,7 +1957,7 @@ pub const Cloud189PC = struct {
             q.slice(),
         });
 
-        const res = try self.client.send(arena, .{
+        const res = try client.send(arena, .{
             .method = "PUT",
             .url = full,
             .headers = target.headers,
@@ -1910,6 +1970,46 @@ pub const Cloud189PC = struct {
             });
             return Error.UpstreamHttp;
         }
+    }
+
+    /// M3（审计）：一批分片的并发上传状态。Go 侧是
+    /// `errgroup.NewOrderedGroupWithContext(ctx, y.uploadThread, ...)`
+    /// （`drivers/189pc/utils.go:739`）—— 其中 `Lifecycle.Before`（读片 + 算
+    /// MD5）在 OrderedGroup 里**串行且有序**，只有 `Do`（PUT）是并发的。
+    /// 所以这里也一样：主线程按片序读 + 算 MD5，整批发出去并发 PUT。
+    const PartBatch = struct {
+        alloc: std.mem.Allocator,
+        clients: []httpclient.Client,
+        bufs: [][]u8,
+        targets: []UploadTarget,
+        lens: []usize,
+        /// 本批第一片的片号（从 1 开始）。
+        part0: i64,
+        mu: std.Io.Mutex = .init,
+        first_err: ?anyerror = null,
+
+        fn fail(self: *PartBatch, e: anyerror) void {
+            self.mu.lockUncancelable(rt.io());
+            defer self.mu.unlock(rt.io());
+            if (self.first_err == null) self.first_err = e;
+        }
+    };
+
+    fn partWorker(state: *PartBatch, i: usize) void {
+        // Arena 不是线程安全的，每个 worker 一个（同 pan123 / itvsh）。
+        var arena = std.heap.ArenaAllocator.init(state.alloc);
+        defer arena.deinit();
+        const part = state.part0 + @as(i64, @intCast(i));
+        putPartRaw(
+            &state.clients[i],
+            arena.allocator(),
+            state.targets[i],
+            part,
+            state.bufs[i][0..state.lens[i]],
+        ) catch |e| {
+            log.warn("[189pc] 第 {d} 片上传失败: {s}", .{ part, @errorName(e) });
+            state.fail(e);
+        };
     }
 
     /// 各分片 MD5（大写）用 "\n" 连起来再 MD5 —— 同样大写。
@@ -1952,27 +2052,85 @@ pub const Cloud189PC = struct {
         const data = init_v.getPath("data") orelse return Error.InvalidResponse;
         const upload_file_id = data.strAt("uploadFileId") orelse return Error.InvalidResponse;
 
-        // T7：整份上传复用同一个块缓冲。旧的 `readAll` 每块都往请求 arena
-        // 新分配 —— 1 GB 文件（slice 阶梯最大到几十 MB）能把 arena 堆到
-        // 1 GB，直到请求结束才释放；fastUpload 还有第二遍读，峰值翻倍。
-        // 光猫上几个并发上传就 OOM。改成 slice 大小的一个 buffer，
-        // 逐块读入 / 算 MD5 / putPart 同步发送 / 覆盖复用。
-        const chunk_buf = try a.alloc(u8, @intCast(slice));
+        // M3（审计）：`upload_thread` 现在真的生效。以前本工程串行上传
+        // （meta 里写「保留字段：HTTP 客户端有全局锁」），Go 是 errgroup
+        // 并发（`drivers/189pc/utils.go:739`），大文件吞吐差数倍。
+        //
+        // 每个 worker 一个 client：`Client.send` 内部一把全局锁，共用
+        // `self.client` 等于没并发（pan123 / itvsh 都这么做）。
+        //
+        // 光猫内存约束：`partSize` 的阶梯在超大文件上会涨到几十 MB 一片，
+        // 无脑开满 `upload_thread` 会把内存吃穿（Go 侧同样持有
+        // `thread × sliceSize`，但光猫不是服务器）。这里再叠一个总内存上限，
+        // 保证 worker buffer 合计不超过 `max_upload_buffer_bytes`。
+        const nthreads = uploadConcurrency(self.cfg.uploadThread(), count, slice);
+        const clients = try a.alloc(httpclient.Client, nthreads);
+        for (clients) |*c| {
+            c.* = httpclient.Client.init(self.alloc, .{
+                .timeout_s = 0, // 10 MiB 单片的 PUT 可能超过默认 60s
+                .insecure_skip_verify = self.client.opts.insecure_skip_verify,
+                .ca_bundle_path = self.client.opts.ca_bundle_path,
+            }, self.client.jar);
+        }
+        defer for (clients) |*c| c.deinit();
+
+        // T7：整份上传复用块缓冲（每 worker 一块）。旧的 `readAll` 每块都往
+        // 请求 arena 新分配 —— 1 GB 文件能把 arena 堆到 1 GB，直到请求结束
+        // 才释放；fastUpload 还有第二遍读，峰值翻倍。光猫上几个并发上传就
+        // OOM。改成按**实际最大片**分配的定长 buffer，逐块读入 / 算 MD5 /
+        // 并发发送 / 覆盖复用。
+        const per_buf: usize = @intCast(@min(slice, @max(size, 1)));
+        const bufs = try a.alloc([]u8, nthreads);
+        for (bufs) |*b| b.* = try a.alloc(u8, per_buf);
+
         var full = hash.Md5Stream{};
         var slice_md5s = List([]const u8).init(a);
         var part: i64 = 1;
         var offset: i64 = 0;
-        while (part <= count) : (part += 1) {
-            const want = partLen(size, slice, part, count);
-            const real: i64 = @min(want, @max(size - offset, 0));
-            const chunk = chunk_buf[0..@intCast(real)];
-            try src.readAllInto(@intCast(offset), chunk);
-            full.update(chunk);
-            const d = hash.md5(chunk);
-            try slice_md5s.append(try hash.hexUpper(a, &d));
-            offset += real;
-            try self.putPart(a, upload_file_id, part, try hash.base64Std(a, &d), chunk);
-            // 每片报一次百分比（0–100，Go `model.UpdateProgress` 语义）。
+        while (part <= count) {
+            // 一批最多 nthreads 片。读片 + 算 MD5 必须**按片序**在主线程做
+            // （整文件 MD5 与 `sliceMd5` 的拼接都依赖顺序），对应 Go 的
+            // `Lifecycle.Before`（OrderedGroup 保证串行有序，utils.go:768）。
+            const batch_n: usize = @intCast(@min(@as(i64, @intCast(nthreads)), count - part + 1));
+            const targets = try a.alloc(UploadTarget, batch_n);
+            const lens = try a.alloc(usize, batch_n);
+            for (0..batch_n) |i| {
+                const p = part + @as(i64, @intCast(i));
+                const want = partLen(size, slice, p, count);
+                const real: i64 = @min(want, @max(size - offset, 0));
+                const chunk = bufs[i][0..@intCast(real)];
+                try src.readAllInto(@intCast(offset), chunk);
+                full.update(chunk);
+                const d = hash.md5(chunk);
+                try slice_md5s.append(try hash.hexUpper(a, &d));
+                offset += real;
+                lens[i] = @intCast(real);
+                // 换分片 URL 是小请求，刻意留在主线程的 `self.client` 上串行
+                // 做：它带签名 + 会话刷新，并发调用会互相把 session 刷没。
+                // 真正的带宽消耗在下面的并发 PUT 上。
+                const info = try std.fmt.allocPrint(a, "{d}-{s}", .{ p, try hash.base64Std(a, &d) });
+                targets[i] = try self.getMultiUploadUrls(a, upload_file_id, info);
+            }
+
+            var state = PartBatch{
+                .alloc = self.alloc,
+                .clients = clients,
+                .bufs = bufs,
+                .targets = targets,
+                .lens = lens,
+                .part0 = part,
+            };
+            const threads = try a.alloc(std.Thread, batch_n);
+            for (threads, 0..) |*t, i| {
+                t.* = try std.Thread.spawn(.{}, partWorker, .{ &state, i });
+            }
+            for (threads) |t| t.join();
+            if (state.first_err) |e| {
+                log.err("[189pc] 分片上传失败（第 {d} 片起）: {s}", .{ part, @errorName(e) });
+                return e;
+            }
+            part += @as(i64, @intCast(batch_n));
+            // 每批报一次百分比（0–100，Go `model.UpdateProgress` 语义）。
             if (ctx.progress) |f| {
                 const pct: u64 = @intCast(@min(@divTrunc(offset * 100, @max(size, 1)), 100));
                 f(ctx.progress_userdata, pct);
@@ -2135,7 +2293,7 @@ pub const factory = driver.Factory{
     \\  "type":             {"type":"select","default":"personal","options":["personal","family"]},
     \\  "family_id":        {"type":"string","help":"留空会自动获取"},
     \\  "upload_method":    {"type":"select","default":"stream","options":["stream","rapid"],"help":"rapid 先算 MD5 可秒传；stream 边传边算"},
-    \\  "upload_thread":    {"type":"string","default":"3","help":"保留字段：本工程串行上传（HTTP 客户端有全局锁）"},
+    \\  "upload_thread":    {"type":"string","default":"3","help":"上传并发上限（1-32）。实际并发还受分片大小与设备内存限制"},
     \\  "family_transfer":  {"type":"bool","default":false,"help":"保留字段：家庭云转存本工程未实现"},
     \\  "rapid_upload":     {"type":"bool","default":false,"help":"保留字段：旧接口的秒传本工程未实现"},
     \\  "no_use_ocr":       {"type":"bool","default":false,"help":"保留字段：本工程从不使用 OCR"},
@@ -2497,4 +2655,45 @@ test "createWithId builds a driver with the expected name" {
     try testing.expectEqual(@as(i64, 11), self.storage_id);
     try testing.expectEqualStrings("189CloudPC", Cloud189PC.drvName(@ptrCast(self)));
     try testing.expectEqualStrings("189CloudPC", factory.key);
+}
+
+test "H2: normalizeName always returns an owned copy (no borrowed fast path)" {
+    // H2 回归：以前「无 \' 时原样返回」——而 getFiles 的源串在内层 arena 里，
+    // 原样返回恰好在最常见路径（不带 \'）上悬垂。
+    var live = std.heap.ArenaAllocator.init(testing.allocator);
+    defer live.deinit();
+    const la = live.allocator();
+
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    const raw = try scratch.allocator().dupe(u8, "plain-name");
+    const name = try normalizeName(la, raw);
+
+    _ = scratch.reset(.retain_capacity);
+    _ = try scratch.allocator().dupe(u8, "OVERWRITTEN!"); // 原地覆盖 raw
+
+    try testing.expectEqualStrings("plain-name", name);
+}
+
+test "M3: upload concurrency is bounded by config, part count and device memory" {
+    // 审计 M3：Go 用 errgroup 并发上传分片（`drivers/189pc/utils.go:739`），
+    // 本工程以前是串行的，`upload_thread` 只被记录（`meta` 里写着"保留字
+    // 段"）。现在它真的生效，但光猫内存有限 —— 并发度还要按单片大小再夹
+    // 一次，避免超大文件（单片几十 MB）把内存吃穿。
+    const slice_base_local: i64 = 10 * 1024 * 1024;
+
+    // 小文件只有 1 片：再高的配置也只能是 1
+    try testing.expectEqual(@as(usize, 1), uploadConcurrency(8, 1, slice_base_local));
+    // 常规：3 线程 + 3 片 → 3
+    try testing.expectEqual(@as(usize, 3), uploadConcurrency(3, 3, slice_base_local));
+    // 片数少于线程数
+    try testing.expectEqual(@as(usize, 2), uploadConcurrency(8, 2, slice_base_local));
+    // 10 MiB 片 × 3 = 30 MiB < 32 MiB 上限，仍允许 3
+    try testing.expectEqual(@as(usize, 3), uploadConcurrency(3, 100, slice_base_local));
+    // 60 MiB 片：32 MiB / 60 MiB = 0 → 落到 1（绝不退化成 0）
+    try testing.expectEqual(@as(usize, 1), uploadConcurrency(3, 100, 60 * 1024 * 1024));
+    // 16 MiB 片：32 / 16 = 2 → 配置 3 被内存夹到 2
+    try testing.expectEqual(@as(usize, 2), uploadConcurrency(3, 100, 16 * 1024 * 1024));
+    // 非法配置值（<=0）也不能退化成 0
+    try testing.expectEqual(@as(usize, 1), uploadConcurrency(0, 4, slice_base_local));
 }

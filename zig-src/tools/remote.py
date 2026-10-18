@@ -23,6 +23,7 @@ with a *nonexistent parent directory* kills the whole SSH session
 (EOFError) instead of returning a clean SFTP error, so never probe paths.
 """
 import re
+import socket
 import sys
 
 import paramiko
@@ -30,6 +31,17 @@ import paramiko
 USER = "root"
 PWD = "REDACTED"
 DEFAULT_PORT = 22
+
+# Hard bound on every remote command. Previously `sh()` had no timeout at
+# all: a hung remote command (e.g. a Debug-mode Zig build that never
+# finishes) blocked the caller forever. Callers that legitimately need
+# longer (multi-minute builds in build_remote.py) pass a larger value
+# explicitly.
+DEFAULT_CMD_TIMEOUT = 120
+
+
+class RemoteTimeout(Exception):
+    """A remote command exceeded its timeout."""
 
 
 def connect(host, port):
@@ -40,10 +52,21 @@ def connect(host, port):
     return c
 
 
-def sh(c, cmd):
-    _, out, err = c.exec_command(cmd)
-    o = out.read().decode(errors="replace")
-    e = err.read().decode(errors="replace")
+def sh(c, cmd, timeout=DEFAULT_CMD_TIMEOUT):
+    """Run a command remotely, bounded by `timeout` seconds.
+
+    Raises `RemoteTimeout` if the command has not finished within the
+    bound — the channel is abandoned in that case, so the caller fails
+    fast instead of blocking forever.
+    """
+    _, out, err = c.exec_command(cmd, timeout=timeout)
+    try:
+        o = out.read().decode(errors="replace")
+        e = err.read().decode(errors="replace")
+    except socket.timeout:
+        raise RemoteTimeout(
+            "remote command timed out after %ds: %s" % (timeout, cmd[:160])
+        )
     return o, e, out.channel.recv_exit_status()
 
 

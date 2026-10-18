@@ -646,7 +646,11 @@ fn link(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, args: driver.LinkAr
     // yun.123pan.com。以前这里写死 origin，CDN 域名一变 Referer 就对不上。
     const orig = try urlmod.Url.parse(download_url);
     const link_referer = try std.fmt.allocPrint(a, "{s}://{s}/", .{ orig.scheme, orig.host });
-    return .{ .url = final_url, .header = &[_]model.Header{.{ .name = "Referer", .value = link_referer }} };
+    // `header` 必须是分配器拥有的切片 —— `&[_]model.Header{...}` 会落在本函数
+    // 栈帧里、返回即悬空（与 quarkuc.zig link() 同一个坑，真机抓包实锤）。
+    const hdrs = try a.alloc(model.Header, 1);
+    hdrs[0] = .{ .name = "Referer", .value = link_referer };
+    return .{ .url = final_url, .header = hdrs };
 }
 
 fn makeDir(ptr: *anyopaque, ctx: *driver.Ctx, dir: []const u8) anyerror!void {
@@ -870,6 +874,7 @@ fn uploadPresigned(self: *Pan123, a: std.mem.Allocator, data: *const json.Value,
             .ep = ep,
             .auth_body = auth_body,
             .end = end,
+            .refetch_arena = std.heap.ArenaAllocator.init(self.alloc),
         };
         state.next.store(start, .monotonic);
 
@@ -879,6 +884,8 @@ fn uploadPresigned(self: *Pan123, a: std.mem.Allocator, data: *const json.Value,
             t.* = try std.Thread.spawn(.{}, batchWorker, .{ &state, &clients[i], bufs[i] });
         }
         for (threads) |t| t.join();
+        // worker 全部退出后才能拆换批宿主 arena；此后无人再读 refetch 过的 urls。
+        state.refetch_arena.deinit();
         if (state.first_err) |e| {
             log.err("[123pan] batch upload failed: {s}", .{@errorName(e)});
             return e;
@@ -903,6 +910,7 @@ const BatchState = struct {
     size: i64,
     chunk_size: i64,
     /// `data.presignedUrls`。403 时会整批换一次（见 `refetch`）。
+    /// 初始值由调用方（请求 arena）持有；换批后的值由 `refetch_arena` 持有。
     urls: *const json.Value,
     ep: []const u8,
     auth_body: []const u8,
@@ -913,6 +921,11 @@ const BatchState = struct {
     mu: std.Io.Mutex = .init,
     first_err: ?anyerror = null,
     refetched: bool = false,
+    /// H5：换批结果的宿主 arena（生命周期 = 整个 batch，比任何 worker 的
+    /// 临时 arena 都长）。以前换批结果解析进「触发 403 的那个 worker 的
+    /// arena」，随后被该 worker 的 `arena.reset(.retain_capacity)` 原地覆盖
+    /// 或 `arena.deinit()` 释放，而其他 worker 仍无锁读 ⇒ 撕裂读/悬垂。
+    refetch_arena: std.heap.ArenaAllocator = undefined,
 
     fn fail(self: *BatchState, e: anyerror) void {
         self.mu.lockUncancelable(rt.io());
@@ -921,13 +934,26 @@ const BatchState = struct {
         self.cancel.store(true, .release);
     }
 
+    /// 当前生效的 `presignedUrls`。**读也必须持 `mu`** —— refetch 会换指针，
+    /// 且旧值指向的正是被复用的那块内存。
+    fn currentUrls(self: *BatchState) *const json.Value {
+        self.mu.lockUncancelable(rt.io());
+        defer self.mu.unlock(rt.io());
+        return self.urls;
+    }
+
     /// 403 = 预签名 URL 过期：整批换一次。对齐 Go 的 singleflight —— 只换一次，
     /// 避免每个 worker 各自去打一遍 auth 接口。
-    fn refetch(self: *BatchState, a: std.mem.Allocator) void {
+    ///
+    /// H5：解析目标从「调用方传入的 worker arena」改为 `refetch_arena`
+    /// （batch 自有、活到整批结束），否则其他 worker 读到的是会被
+    /// `reset(.retain_capacity)` 覆盖的内存。
+    fn refetch(self: *BatchState) void {
         self.mu.lockUncancelable(rt.io());
         defer self.mu.unlock(rt.io());
         if (self.refetched) return;
         self.refetched = true;
+        const a = self.refetch_arena.allocator();
         const body = self.self.post(a, self.ep, self.auth_body) catch return;
         const v = json.parse(a, body) catch return;
         if (v.getPath("data.presignedUrls")) |u| self.urls = u;
@@ -960,7 +986,7 @@ fn putPart(state: *BatchState, client: *httpclient.Client, a: std.mem.Allocator,
     // Go：`retry.Attempts(3)` + `BackOffDelay` + `Delay(1s)`（upload.go:106-107）。
     var attempt: u8 = 0;
     while (true) : (attempt += 1) {
-        const url = urlFor(state.urls, part_no) orelse return Error.MissingUploadUrl;
+        const url = urlFor(state.currentUrls(), part_no) orelse return Error.MissingUploadUrl;
         const res = client.send(a, .{
             .method = "PUT",
             .url = url,
@@ -977,7 +1003,7 @@ fn putPart(state: *BatchState, client: *httpclient.Client, a: std.mem.Allocator,
         if (res.status == 200) return;
         // 403 = URL 过期：整批换一次再重试这一片。
         if (res.status == 403) {
-            state.refetch(a);
+            state.refetch();
             if (attempt + 1 >= 3) return Error.UploadFailed;
             continue;
         }
@@ -1260,12 +1286,14 @@ pub const factory = driver.Factory{
     .label = "123 云盘",
     .secrets = &.{ "password", "AccessToken" },
     // 字段名与 Go `Addition` 的 json tag 逐字一致（无 tag 字段用字段名）。
+    // L15：`UploadThread` 的并发上限**真的生效**了（每个 worker 一个 HTTP
+    // client，见 `uploadPresigned`）；以前 help 里写"本实现串行上传"是文档漂移。
     .addition_schema =
     \\{
     \\  "username":       {"type":"string","required":true,"help":"手机号或邮箱"},
     \\  "password":       {"type":"string","required":true,"secret":true,"help":"登录密码"},
     \\  "root_folder_id": {"type":"string","default":"0","help":"根目录 ID，123 的根是 0"},
-    \\  "UploadThread":   {"type":"number","default":3,"min":1,"max":32,"help":"上传并发上限（本实现串行上传，该值仅作记录）"},
+    \\  "UploadThread":   {"type":"number","default":3,"min":1,"max":32,"help":"上传并发上限"},
     \\  "platform":       {"type":"string","default":"web","help":"platform 请求头，默认 web"}
     \\}
     ,
@@ -1479,4 +1507,26 @@ test "T2: copy is NotSupported, matching Go" {
     const d = driver.asDriver(Pan123, self);
     var ctx = driver.Ctx{ .alloc = a };
     try testing.expectError(driver.Error.NotSupported, d.copy(&ctx, "/src", "/dst"));
+}
+
+test "H5: batch-owned URLs outlive a worker arena reset" {
+    // H5 回归：换批解析结果必须活在 batch 自有的 arena 里。worker 每片之后
+    // `arena.reset(.retain_capacity)` 会**原地复用**同一块内存 —— 若换批结果
+    // 曾被解析进 worker arena，其他 worker 读到的就是被覆盖的数据。
+    var worker_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer worker_arena.deinit();
+    const wa = worker_arena.allocator();
+
+    var batch_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer batch_arena.deinit();
+    const kept = try batch_arena.allocator().dupe(u8, "https://presigned/3");
+    const doomed = try wa.dupe(u8, "https://stale/3");
+
+    // worker 每片之后的回收：reset 复用同一块内存。
+    _ = worker_arena.reset(.retain_capacity);
+    const reused = try wa.dupe(u8, "XXXXXXXXXXXXXXXXXXXXXXXX");
+
+    // batch 宿主 arena 的分配不受影响；worker arena 的原分配确实被原地复用。
+    try testing.expectEqualStrings("https://presigned/3", kept);
+    try testing.expectEqual(@intFromPtr(doomed.ptr), @intFromPtr(reused.ptr));
 }

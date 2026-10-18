@@ -1,0 +1,21 @@
+tools/cfg-restore.json
+
+# ---- 抓包 / 探针二进制 / 调试日志（本地产物，不入库）----
+dist/*.pcap
+dist/keys*.log
+dist/hello_probe
+dist/https_probe*
+dist/tls_probe
+dist/*.baseline
+dist/*.prev
+dist/*.trimmed
+
+# ---- Python 缓存 ----
+__pycache__/
+*.pyc
+
+# ---- 从网盘/前端抓下来的一次性研究素材 ----
+/umi.js
+/web_main.js
+/h5_*.js
+/fix_test_block.py

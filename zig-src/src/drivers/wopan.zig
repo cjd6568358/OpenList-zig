@@ -45,6 +45,18 @@ const rt = @import("../rt.zig");
 
 const client_id = "1001000021";
 const client_secret = "XFmi9GS2hzk98jGX";
+/// ⚠️ **AppRefreshToken 必须用 app 渠道身份**（1001000035/iELf0UL07o6I8eRK，
+/// SDK consts 注释里的那对）：真机变体矩阵实证，同一个 refreshToken 用 web
+/// 身份（1001000021/XFmi9GS2hzk98jGX）恒 8005「登录失败」，换 app 身份立即
+/// 0000 —— 联通按渠道校验令牌。网页 H5（wocloud_ai）的会话令牌就是 app
+/// 渠道（LoginByMobileV2）发的。
+const app_client_id = "1001000035";
+const app_client_secret = "iELf0UL07o6I8eRK";
+/// PC 渠道（yunpanPC）：clientId 在 umi.js 的环境映射里，secret 在它的
+/// ae() 身份表里（`1001000209:"s72g2VY46ahlK588"`）。此前用 web secret 配
+/// PC clientId 会 9002「解密失败」—— 服务端解不开 param，即 key 不配对。
+const pc_client_id = "1001000209";
+const pc_client_secret = "s72g2VY46ahlK588";
 const app_id = "10000001";
 const base_url = "https://panservice.mail.wo.cn";
 /// `GetZoneInfo` 拿不到地址时的兜底（SDK 的 `DefaultZoneURL`）。
@@ -111,6 +123,23 @@ const Addition = struct {
             .access_token = try a.dupe(u8, n.strAt("access_token") orelse ""),
         };
     }
+
+    /// 键名与 Go `drivers/wopan/meta.go` 的 json tag 逐字一致（持久化回写用）。
+    fn toJson(self: Addition, a: std.mem.Allocator) ![]u8 {
+        var b = Buf.init(a);
+        try b.append("{\"root_folder_id\":");
+        try json.writeString(&b, self.root_id);
+        try b.append(",\"refresh_token\":");
+        try json.writeString(&b, self.refresh_token);
+        try b.append(",\"family_id\":");
+        try json.writeString(&b, self.family_id);
+        try b.append(",\"sort_rule\":");
+        try json.writeString(&b, self.sort_rule);
+        try b.append(",\"access_token\":");
+        try json.writeString(&b, self.access_token);
+        try b.append("}");
+        return b.toOwned();
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -134,6 +163,8 @@ pub const Wopan = struct {
     zone_url: []const u8 = "",
     /// 扩展名 → 沃云盘 fileType，来自 `ClassifyRule`。
     classify: ?std.StringHashMap([]const u8) = null,
+    /// 上一次落盘的 addition 序列化文本（避免重复写盘，模式同 189pc）。
+    last_saved: []const u8 = "",
 
     const Error = error{
         InvalidResponse,
@@ -187,21 +218,70 @@ pub const Wopan = struct {
         self.default_family_id = self.familyCurrent(a) catch "";
     }
 
+    /// 多渠道尝试刷新（用户要求：优先 WEB/app/PC）。联通按**渠道身份**校验
+    /// 令牌：令牌由哪个渠道发，就必须用那个渠道的 clientId + secret 去刷
+    /// （§36B.6 的对照矩阵）。身份全表见 H5 前端 umi.js 的 ae()：
+    ///   web=1001000021/XFmi9GS2hzk98jGX  app=1001000035/iELf0UL07o6I8eRK
+    ///   pc =1001000209/s72g2VY46ahlK588
+    /// 失败渠道（8005/9002）**不消耗**令牌（真机实证：连打多次 8005 后再用
+    /// 正确身份仍 0000），只有成功的那个会轮换令牌 —— 所以逐个试是安全的。
+    /// 加密 param 的 AES key 也必须用**同渠道**的 secret（9002 = key 不配对）。
+    const refresh_identities = [_][2][]const u8{
+        .{ client_id, client_secret }, // web
+        .{ app_client_id, app_client_secret }, // app
+        .{ pc_client_id, pc_client_secret }, // pc
+    };
+
     fn refreshToken(self: *Wopan, a: std.mem.Allocator) !void {
-        var p = Buf.init(a);
-        try p.append("{\"refreshToken\":");
-        try json.writeString(&p, self.cfg.refresh_token);
-        try p.append(",\"clientSecret\":");
-        try json.writeString(&p, client_secret);
-        try p.append("}");
-        const param = try encryptParam(a, chan_api_user, self.access_token, p.slice());
-        const raw = try self.post(a, chan_api_user, k_refresh_token, param, true);
-        const v = json.parse(a, raw) catch return Error.InvalidResponse;
-        const at = v.strAt("access_token") orelse return Error.AuthFailed;
-        const nrt = v.strAt("refresh_token") orelse return Error.AuthFailed;
-        self.access_token = try self.alloc.dupe(u8, at);
-        self.cfg.access_token = self.access_token;
-        self.cfg.refresh_token = try self.alloc.dupe(u8, nrt);
+        var last: anyerror = Error.AuthFailed;
+        for (refresh_identities) |id| {
+            var p = Buf.init(a);
+            try p.append("{\"refreshToken\":");
+            try json.writeString(&p, self.cfg.refresh_token);
+            try p.append(",\"clientSecret\":");
+            try json.writeString(&p, id[1]);
+            try p.append("}");
+            const param = encryptParamKey(a, id[1], p.slice()) catch |e| {
+                last = e;
+                continue;
+            };
+            // retry=false：post 内部的「刷新后重试」不能再递归回 refreshToken。
+            const raw = self.postRaw(a, chan_api_user, k_refresh_token, param, "", false, true, id[0]) catch |e| {
+                last = e;
+                continue;
+            };
+            const v = json.parse(a, raw) catch {
+                last = Error.InvalidResponse;
+                continue;
+            };
+            const at = v.strAt("access_token") orelse {
+                last = Error.AuthFailed;
+                continue;
+            };
+            const nrt = v.strAt("refresh_token") orelse {
+                last = Error.AuthFailed;
+                continue;
+            };
+            self.access_token = try self.alloc.dupe(u8, at);
+            self.cfg.access_token = self.access_token;
+            self.cfg.refresh_token = try self.alloc.dupe(u8, nrt);
+            // ⚠ 沃盘的 refresh_token 是**一次性的**：这次刷新之后旧令牌立即作废，
+            // 新令牌只在这条响应里 —— 不落盘的话进程一重启，磁盘上就是废令牌，
+            // 永远 8005「登录失败」。模式同 189pc 的 `save()`。
+            self.save();
+            return;
+        }
+        log.warn("[wopan] refreshToken: 三个渠道（web/app/pc）均失败: {s}", .{@errorName(last)});
+        return last;
+    }
+
+    fn save(self: *Wopan) void {
+        if (self.storage_id == 0) return;
+        const text = self.cfg.toJson(self.alloc) catch return;
+        if (text.len == self.last_saved.len and std.mem.eql(u8, text, self.last_saved)) return;
+        if (self.last_saved.len > 0) self.alloc.free(self.last_saved);
+        self.last_saved = self.alloc.dupe(u8, text) catch return;
+        driver.persist(self.storage_id, self.last_saved);
     }
 
     fn initPhone(self: *Wopan, a: std.mem.Allocator) !void {
@@ -210,8 +290,7 @@ pub const Wopan = struct {
         try p.append("{\"accessToken\":");
         try json.writeString(&p, self.access_token);
         try p.append("}");
-        const param = try encryptParam(a, chan_api_user, self.access_token, p.slice());
-        const raw = try self.post(a, chan_api_user, k_query_user, param, true);
+        const raw = try self.post(a, chan_api_user, k_query_user, p.slice(), true, true, client_id);
         const v = json.parse(a, raw) catch return Error.InvalidResponse;
         self.phone = try self.alloc.dupe(u8, v.strAt("userId") orelse "");
     }
@@ -221,11 +300,7 @@ pub const Wopan = struct {
     fn initClassify(self: *Wopan, a: std.mem.Allocator) void {
         if (self.classify != null) return;
         var m = std.StringHashMap([]const u8).init(self.alloc);
-        const param = encryptParam(a, chan_wohome, self.access_token, "{}") catch {
-            self.classify = m;
-            return;
-        };
-        const raw = self.post(a, chan_wohome, k_classify, param, true) catch {
+        const raw = self.post(a, chan_wohome, k_classify, "{}", true, true, client_id) catch {
             self.classify = m;
             return;
         };
@@ -250,8 +325,7 @@ pub const Wopan = struct {
         try p.append("{\"appId\":");
         try json.writeString(&p, app_id);
         try p.append("}");
-        const param = encryptParam(a, chan_wohome, self.access_token, p.slice()) catch return;
-        const raw = self.post(a, chan_wohome, k_zone, param, true) catch return;
+        const raw = self.post(a, chan_wohome, k_zone, p.slice(), true, true, client_id) catch return;
         const v = json.parse(a, raw) catch return;
         self.zone_url = self.alloc.dupe(u8, v.strAt("url") orelse "") catch "";
     }
@@ -261,8 +335,7 @@ pub const Wopan = struct {
         try p.append("{\"clientId\":");
         try json.writeString(&p, client_id);
         try p.append("}");
-        const param = try encryptParam(a, chan_wohome, self.access_token, p.slice());
-        const raw = try self.post(a, chan_wohome, k_family_current, param, true);
+        const raw = try self.post(a, chan_wohome, k_family_current, p.slice(), true, true, client_id);
         const v = json.parse(a, raw) catch return Error.InvalidResponse;
         if (v.intAt("defaultHomeId")) |n| {
             return std.fmt.allocPrint(self.alloc, "{d}", .{n});
@@ -289,13 +362,38 @@ pub const Wopan = struct {
     // -----------------------------------------------------------------------
 
     /// 发一次 dispatcher 请求，返回**已解密**的 DATA 文本（DATA 为空时返回 ""）。
+    ///
+    /// `param_plain` 是**明文** param —— 内部按通道现加密（对齐 SDK 每次请求
+    /// 都 `NewBody` 的行为）。**H3**：以前调用方自己加密、刷新 token 后的重试
+    /// 直接重放旧密文；wohome 通道的 key 是 `accessToken[:16]`，刷新后 key 已
+    /// 变 ⇒ 服务端解不开（9002）。改为明文进、内部加密，重试自然用新 token。
     fn post(
         self: *Wopan,
         a: std.mem.Allocator,
         channel: []const u8,
         key: []const u8,
-        param_b64: []const u8,
+        param_plain: []const u8,
         retry: bool,
+        want_payload: bool,
+        body_client_id: []const u8,
+    ) anyerror![]const u8 {
+        const param_b64 = try encryptParam(a, channel, self.access_token, param_plain);
+        return self.postRaw(a, channel, key, param_b64, param_plain, retry, want_payload, body_client_id);
+    }
+
+    /// 已加密 param 的发送路径。目前只有 `refreshToken` 用 —— 它的加密 key 是
+    /// **渠道 secret**（不是 access_token 派生），且重试恒 false。
+    fn postRaw(
+        self: *Wopan,
+        a: std.mem.Allocator,
+        channel: []const u8,
+        key: []const u8,
+        param_b64: []const u8,
+        /// 仅重试用：刷新 token 后按新密钥重新加密的明文源。
+        param_plain: []const u8,
+        retry: bool,
+        want_payload: bool,
+        body_client_id: []const u8,
     ) anyerror![]const u8 {
         const ts = rt.nowMillis();
         const seq = reqSeqValue();
@@ -308,9 +406,22 @@ pub const Wopan = struct {
         try json.writeString(&b, channel);
         try b.append(",\"sign\":");
         try json.writeString(&b, sign);
-        try b.append(",\"version\":\"\"},\"body\":{\"param\":");
+        try b.append(",\"version\":\"\"},\"body\":{");
+        // body = `other` + param。SDK 的 `NewBody`（req_body.go:15-24）把调用方
+        // 传进来的 `other` 原样并入 body 再放 param：
+        //   * api-user 通道 → `JsonClientIDSecret` = {"clientId","secret":true}
+        //   * wohome 通道   → `JsonSecret`      = {"secret":true}
+        // ⚠️ api-user 缺 `clientId` 会被网关直接拒：STATUS 1000「请求参数错误」
+        //   （真机实证：AppRefreshToken 恒失败 → 挂载 InvalidResponse，
+        //   2026-10-17 tools/probe_wopan_login.py + req_body.go 对照定位）。
+        if (std.mem.eql(u8, channel, chan_api_user)) {
+            try b.append("\"clientId\":");
+            try json.writeString(&b, body_client_id);
+            try b.append(",");
+        }
+        try b.append("\"secret\":true,\"param\":");
         try json.writeString(&b, param_b64);
-        try b.append(",\"secret\":true}}");
+        try b.append("}}");
 
         var headers = List(model.Header).init(a);
         try headers.append(.{ .name = "Origin", .value = "https://pan.wo.cn" });
@@ -341,23 +452,40 @@ pub const Wopan = struct {
         const rsp = v.getPath("RSP") orelse return Error.InvalidResponse;
         const code = rsp.strAt("RSP_CODE") orelse return Error.InvalidResponse;
         if (!std.mem.eql(u8, code, "0000")) {
-            if (retry and !std.mem.eql(u8, channel, chan_api_user)) {
+            // M5（审计）：刷新条件收敛到 SDK 的判据 —— `request.go:42`
+            // 是 `if channel != ChannelAPIUser && retry && RspCode == "9999"`，
+            // **只有 9999**（令牌失效）才刷。以前是「任何非 0000 都刷」，
+            // 业务错误（配额、参数、限流）也会白刷一轮。
+            if (retry and !std.mem.eql(u8, channel, chan_api_user) and
+                std.mem.eql(u8, code, "9999"))
+            {
                 log.info("[wopan] {s}: rsp_code={s}, refreshing token and retrying", .{ key, code });
                 try self.refreshToken(a);
-                return self.post(a, channel, key, param_b64, false);
+                // H3：重试必须**重新加密**（新 accessToken ⇒ 新 key），不能重放
+                // 旧 param_b64。重走 `post` 的明文入口即可。
+                return self.post(a, channel, key, param_plain, false, want_payload, body_client_id);
             }
             log.warn("[wopan] {s}: rsp_code={s} desc={s}", .{ key, code, rsp.strAt("RSP_DESC") orelse "" });
             return Error.InvalidResponse;
         }
         const data = rsp.getPath("DATA") orelse return "";
-        // DATA 是 `"..."` 包裹的密文才解密；否则是明文 JSON。
-        if (data.asStr()) |s| {
-            if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') {
-                return decryptData(a, chan_wohome, self.access_token, s[1 .. s.len - 1]);
-            }
-            return s;
+        // SDK request.go:66-77 —— DATA 是 **JSON 字符串**（raw 带引号）⇒ 密文，
+        // 按请求的**通道**解密（api-user 用 clientSecret，wohome 用 accessToken
+        // 前 16 字节）；对象/数组则是明文。
+        //
+        // ⚠⚠ 不能用 `asStr()` 判断首尾引号：json.Value 的 string 存的是**去引
+        // 号后**的内容，首尾引号检查永远不成立 → DATA 从来没被解密过，即使
+        // access_token 有效，init 也死在 InvalidResponse（2026-10-17 真机，
+        // AppQueryUser 返回 0000 仍挂载失败的根因）。
+        // SDK：resp == nil 的调用（MoveFile/DeleteFile/Rename/Copy 这些
+        // "无返回值"操作）**跳过解密** —— 它们的 DATA 常是空串或异形串，
+        // 硬解会炸 InvalidPadding。want_payload=false 的调用方本来就不看
+        // 返回值，直接回空。
+        if (!want_payload) return "";
+        switch (data.*) {
+            .string => |s| return decryptData(a, channel, self.access_token, s),
+            else => return json.stringify(a, data) catch "",
         }
-        return json.stringify(a, data) catch "";
     }
 
     // -----------------------------------------------------------------------
@@ -385,8 +513,7 @@ pub const Wopan = struct {
                 try json.writeString(&b, self.cfg.family_id);
             }
             try b.append("}");
-            const param = try encryptParam(a, chan_wohome, self.access_token, b.slice());
-            const raw = try self.post(a, chan_wohome, k_query_all_files, param, true);
+            const raw = try self.post(a, chan_wohome, k_query_all_files, b.slice(), true, true, client_id);
             const v = json.parse(a, raw) catch return Error.InvalidResponse;
             const files = v.getPath("files") orelse break;
             const arr = files.asArray() orelse break;
@@ -409,24 +536,28 @@ pub const Wopan = struct {
     fn details(p: *anyopaque, ctx: *driver.Ctx, path: []const u8) anyerror!model.File {
         const self = as(p);
         const a = ctx.alloc;
-        const obj = try self.findEntry(a, path) orelse return Error.NotFound;
+        const found = try self.findEntry(a, path) orelse return Error.NotFound;
+        const obj = found.obj;
         return .{ .name = obj.name, .size = obj.size, .is_dir = obj.is_dir, .modified = obj.modified, .sign = obj.sign };
     }
 
     fn link(p: *anyopaque, ctx: *driver.Ctx, path: []const u8, _: driver.LinkArgs) anyerror!driver.Link {
         const self = as(p);
         const a = ctx.alloc;
-        const obj = try self.findEntry(a, path) orelse return Error.NotFound;
+        const found = try self.findEntry(a, path) orelse return Error.NotFound;
+        const obj = found.obj;
         if (obj.is_dir) return Error.InvalidPath;
 
+        // ⚠ 下载要用 `fid`（Go `f.FID`），不是 `id` —— fid 空时 GetDownloadUrlV2
+        // 回 9999「系统异常」（真机 2026-10-17 实证；响应里 fid 对文件才有值）。
+        const fid = if (found.fid.len > 0) found.fid else obj.sign;
         var b = Buf.init(a);
         try b.append("{\"type\":\"1\",\"fidList\":[");
-        try json.writeString(&b, obj.sign);
+        try json.writeString(&b, fid);
         try b.append("],\"clientId\":");
         try json.writeString(&b, client_id);
         try b.append("}");
-        const param = try encryptParam(a, chan_wohome, self.access_token, b.slice());
-        const raw = try self.post(a, chan_wohome, k_download_url_v2, param, true);
+        const raw = try self.post(a, chan_wohome, k_download_url_v2, b.slice(), true, true, client_id);
         const v = json.parse(a, raw) catch return Error.InvalidResponse;
         const lst = v.getPath("list") orelse return Error.InvalidResponse;
         const arr = lst.asArray() orelse return Error.InvalidResponse;
@@ -456,14 +587,14 @@ pub const Wopan = struct {
         try b.append(",\"clientId\":");
         try json.writeString(&b, client_id);
         try b.append("}");
-        const param = try encryptParam(a, chan_wohome, self.access_token, b.slice());
-        _ = try self.post(a, chan_wohome, k_create_dir, param, true);
+        _ = try self.post(a, chan_wohome, k_create_dir, b.slice(), true, false, client_id);
     }
 
     fn rename(p: *anyopaque, ctx: *driver.Ctx, path: []const u8, new_name: []const u8) anyerror!void {
         const self = as(p);
         const a = ctx.alloc;
-        const obj = try self.findEntry(a, path) orelse return Error.NotFound;
+        const found = try self.findEntry(a, path) orelse return Error.NotFound;
+        const obj = found.obj;
         // Go driver.go:116-124 —— `type`: 1 = 文件, 0 = 目录。
         var b = Buf.init(a);
         try b.append("{\"spaceType\":");
@@ -481,15 +612,15 @@ pub const Wopan = struct {
             try json.writeString(&b, self.cfg.family_id);
         }
         try b.append("}");
-        const param = try encryptParam(a, chan_wohome, self.access_token, b.slice());
-        _ = try self.post(a, chan_wohome, k_rename, param, true);
+        _ = try self.post(a, chan_wohome, k_rename, b.slice(), true, false, client_id);
     }
 
     /// move / copy 的上游参数是**同一套**（dirList + fileList + 两个 spaceType）。
     fn moveOrCopy(p: *anyopaque, ctx: *driver.Ctx, src: []const u8, dst_dir: []const u8, is_copy: bool) anyerror!void {
         const self = as(p);
         const a = ctx.alloc;
-        const obj = try self.findEntry(a, src) orelse return Error.NotFound;
+        const found = try self.findEntry(a, src) orelse return Error.NotFound;
+        const obj = found.obj;
         const dst = try self.resolveId(a, dst_dir);
         const st = self.spaceType();
 
@@ -513,8 +644,7 @@ pub const Wopan = struct {
             try json.writeString(&b, self.cfg.family_id);
         }
         try b.append("}");
-        const param = try encryptParam(a, chan_wohome, self.access_token, b.slice());
-        _ = try self.post(a, chan_wohome, if (is_copy) k_copy else k_move, param, true);
+        _ = try self.post(a, chan_wohome, if (is_copy) k_copy else k_move, b.slice(), true, false, client_id);
     }
 
     fn move(p: *anyopaque, ctx: *driver.Ctx, src: []const u8, dst_dir: []const u8) anyerror!void {
@@ -528,7 +658,8 @@ pub const Wopan = struct {
     fn remove(p: *anyopaque, ctx: *driver.Ctx, path: []const u8, is_dir: bool) anyerror!void {
         const self = as(p);
         const a = ctx.alloc;
-        const obj = try self.findEntry(a, path) orelse return Error.NotFound;
+        const found = try self.findEntry(a, path) orelse return Error.NotFound;
+        const obj = found.obj;
 
         var b = Buf.init(a);
         try b.append("{\"spaceType\":");
@@ -540,8 +671,7 @@ pub const Wopan = struct {
         try b.append("],\"clientId\":");
         try json.writeString(&b, client_id);
         try b.append("}");
-        const param = try encryptParam(a, chan_wohome, self.access_token, b.slice());
-        _ = try self.post(a, chan_wohome, k_delete, param, true);
+        _ = try self.post(a, chan_wohome, k_delete, b.slice(), true, false, client_id);
     }
 
     fn put(p: *anyopaque, ctx: *driver.Ctx, dst: []const u8, src: model.Source) anyerror!void {
@@ -572,18 +702,33 @@ pub const Wopan = struct {
         }
         try fb.append("}");
         const file_info = try encryptParam(a, chan_wohome, self.access_token, fb.slice());
+        // SDK 的 formData 在循环外构建、所有分片共用（upload.go:66-83）——
+        // 服务端按 uniqueId 聚合同一文件的分片。此前每片生成新 uniqueId，
+        // 多片上传被服务端当成多个互不相干的单片，文件永远拼不出来。
+        const unique_id = try std.fmt.allocPrint(a, "{d}_{s}", .{
+            rt.nowMillis(), "olzzig",
+        });
 
-        const total_parts: i64 = if (size == 0) 1 else @divTrunc(size + part_size - 1, part_size);
+        // ⚠ 分片语义必须逐字对齐 SDK `upload.go` 的 Upload2C：
+        //   totalPart = fileSize / 8MiB（**整除**，0 → 1）—— 不是 ceil！
+        //   除最后一片外每片固定 8MiB；**最后一片 = fileSize - finishedSize**，
+        //   可以大于 8MiB。此前按 ceil 切（20MB → 3 片 8+8+4），三片全都
+        //   返回 0000 但服务端等不到它语义里的"最后一片"（12MiB），文件永远
+        //   不落库（真机 2026-10-17：20MB 上传 200 云端无文件）。
+        const total_parts: i64 = if (size == 0) 1 else @max(@divTrunc(size, part_size), 1);
+        const last_size: i64 = if (total_parts == 1) size else size - (total_parts - 1) * part_size;
         var done: i64 = 0;
         var part: i64 = 1;
-        const buf = try a.alloc(u8, @intCast(@min(part_size, @max(size, 1))));
+        // 缓冲区要装得下最大的一片（最后一片可能 > part_size）。
+        const buf_max: i64 = @max(part_size, last_size);
+        const buf = try a.alloc(u8, @intCast(buf_max));
         while (part <= total_parts) {
-            const want: i64 = @min(part_size, size - done);
+            const want: i64 = if (part == total_parts) last_size else part_size;
             const chunk = buf[0..@intCast(@max(want, 0))];
             if (chunk.len > 0) try src.readAllInto(@intCast(done), chunk);
 
             var fields = List([2][]const u8).init(a);
-            try fields.append(.{ "uniqueId", try std.fmt.allocPrint(a, "{d}", .{rt.nowMillis()}) });
+            try fields.append(.{ "uniqueId", unique_id });
             try fields.append(.{ "accessToken", self.access_token });
             try fields.append(.{ "fileName", name });
             try fields.append(.{ "psToken", "undefined" });
@@ -641,8 +786,7 @@ pub const Wopan = struct {
         try b.append(",\"clientId\":");
         try json.writeString(&b, client_id);
         try b.append("}");
-        const param = try encryptParam(a, chan_wohome, self.access_token, b.slice());
-        const raw = try self.post(a, chan_wohome, k_usage, param, true);
+        const raw = try self.post(a, chan_wohome, k_usage, b.slice(), true, true, client_id);
         const v = json.parse(a, raw) catch return Error.InvalidResponse;
         const u = v.getPath("usageInfo") orelse return Error.InvalidResponse;
         const total = std.fmt.parseInt(i64, u.strAt("byteTotalSize") orelse "0", 10) catch 0;
@@ -655,26 +799,33 @@ pub const Wopan = struct {
 
     fn resolveId(self: *Wopan, a: std.mem.Allocator, dir: []const u8) ![]const u8 {
         if (dir.len == 0 or std.mem.eql(u8, dir, "/")) return self.cfg.root_id;
-        const obj = try self.findEntry(a, dir) orelse return Error.NotFound;
+        const found = try self.findEntry(a, dir) orelse return Error.NotFound;
+        const obj = found.obj;
         if (!obj.is_dir) return Error.InvalidPath;
         return obj.sign;
     }
 
     /// 逐段下钻；`sign` 承载上游 id。
-    fn findEntry(self: *Wopan, a: std.mem.Allocator, path: []const u8) !?model.Obj {
+    fn findEntry(self: *Wopan, a: std.mem.Allocator, path: []const u8) !?Found {
         var cur: []const u8 = self.cfg.root_id;
-        var result: ?model.Obj = null;
+        var result: ?Found = null;
         var it = std.mem.splitScalar(u8, path, '/');
         while (it.next()) |seg| {
             if (seg.len == 0) continue;
             const found = try self.childByName(a, cur, seg) orelse return null;
-            cur = try a.dupe(u8, found.sign);
+            cur = try a.dupe(u8, found.obj.sign);
             result = found;
         }
         return result;
     }
 
-    fn childByName(self: *Wopan, a: std.mem.Allocator, parent_id: []const u8, name: []const u8) !?model.Obj {
+    /// 沃盘的列表项有**两个 id**：`id`（MoveFile/DeleteFile/RenameFileOrDirectory
+    /// 的 dirList/fileList 用）和 `fid`（**GetDownloadUrlV2 的 fidList 专用**，
+    /// Go 是 `Object.FID`，Link 里用 `f.FID`）。`model.Obj` 只有一个 sign 槽，
+    /// 所以这里把两个都带出去，调用方各取所需。
+    const Found = struct { obj: model.Obj, fid: []const u8 };
+
+    fn childByName(self: *Wopan, a: std.mem.Allocator, parent_id: []const u8, name: []const u8) !?Found {
         var page: i64 = 0;
         while (true) {
             var b = Buf.init(a);
@@ -691,21 +842,20 @@ pub const Wopan = struct {
                 try json.writeString(&b, self.cfg.family_id);
             }
             try b.append("}");
-            const param = try encryptParam(a, chan_wohome, self.access_token, b.slice());
-            const raw = try self.post(a, chan_wohome, k_query_all_files, param, true);
+            const raw = try self.post(a, chan_wohome, k_query_all_files, b.slice(), true, true, client_id);
             const v = json.parse(a, raw) catch return null;
             const files = v.getPath("files") orelse return null;
             const arr = files.asArray() orelse return null;
             for (arr) |*f| {
                 const n = f.strAt("name") orelse continue;
                 if (!std.mem.eql(u8, n, name)) continue;
-                return .{
+                return .{ .obj = .{
                     .name = try a.dupe(u8, n),
                     .size = f.intAt("size") orelse 0,
                     .is_dir = (f.intAt("type") orelse 1) == 0,
                     .modified = parseWopanTime(f.strAt("createTime") orelse ""),
                     .sign = try a.dupe(u8, f.strAt("id") orelse ""),
-                };
+                }, .fid = try a.dupe(u8, f.strAt("fid") orelse "") };
             }
             if (arr.len < page_size) return null;
             page += 1;
@@ -723,6 +873,18 @@ fn cryptoKey(channel: []const u8, access_token: []const u8) ![]const u8 {
     if (std.mem.eql(u8, channel, chan_api_user)) return client_secret[0..];
     if (access_token.len < 16) return error.InvalidAccessToken;
     return access_token[0..16];
+}
+
+/// 同 encryptParam，但 AES key 由调用方显式给出（AppRefreshToken 的 app
+/// 渠道身份用）。
+fn encryptParamKey(a: std.mem.Allocator, key_hex_or_raw: []const u8, plain: []const u8) ![]const u8 {
+    const padded = try aes.pkcs7Pad(a, plain, aes.BLOCK);
+    defer a.free(padded);
+    const ct = try aes.cbcEncrypt(a, key_hex_or_raw, crypto_iv[0..], padded);
+    defer a.free(ct);
+    const enc = std.base64.standard.Encoder;
+    const out = try a.alloc(u8, enc.calcSize(ct.len));
+    return enc.encode(out, ct);
 }
 
 fn encryptParam(a: std.mem.Allocator, channel: []const u8, access_token: []const u8, plain: []const u8) ![]const u8 {
