@@ -142,7 +142,17 @@ jobs:
           mkdir -p "$HOME/.local"
           curl -fsSL "$URL" -o "$TARBALL"
           tar -C "$HOME/.local" -xf "$TARBALL"
-          echo "$HOME/.local/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          ZIG_DIR="$HOME/.local/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}"
+          # tarball 解压根目录即 bin 目录（zig 可执行文件就在这一层，无 bin/ 子目录）
+          test -x "$ZIG_DIR/zig" || {
+            echo "::error::$ZIG_DIR/zig missing after extract (tarball layout changed?)"
+            exit 1
+          }
+          # ★ $GITHUB_PATH 只对**后续步骤**生效，对本步骤的 shell 无效 ——
+          #   原先在这里直接跑 `zig version`，必然 command not found（exit 127，
+          #   2026-10-19 首次手动 dispatch 实测）。所以必须步骤内再 export 一次。
+          echo "$ZIG_DIR" >> "$GITHUB_PATH"
+          export PATH="$ZIG_DIR:$PATH"
           zig version
 
       - name: Show build.zig options
