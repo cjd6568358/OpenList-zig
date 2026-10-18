@@ -69,10 +69,28 @@ printf 'user = "%s:%s"\n' "$(esc "$WEBDAV_USERNAME")" "$(esc "$WEBDAV_PASSWORD")
 # 用 --retry 吸收瞬时 5xx（反代限流）。
 # 注意 curl 失败时 -w '%{http_code}' 仍会打印 000，所以补 `|| true` 压掉
 # 非零退出码（否则 set -e 会中断），不能再 echo 一次 000。
+# 发一次请求，只把 HTTP 码写到 stdout；curl 自身的错误（DNS/TLS/连接超时）
+# 打到 stderr（= 进 job 日志）。
+#
+# ⚠ 2026-10-18 实踩：以前这里 `|| true` 把 curl 的 stderr 全吞了，失败时
+#   annotation 只剩「HTTP 」（码是空的），看不出是 000（连不上）还是别的。
+#   现在 curl 的报错原样进日志，下次一眼能分清「配置错」还是「网络不通」。
+http_call() {
+  local out code err
+  out="$(curl -sS -o /dev/null -w '\n%{http_code}' -K "$rc" \
+    --connect-timeout 10 \
+    --retry 3 --retry-delay 2 --retry-max-time 120 \
+    "$@" 2>&1)" || true
+  code="$(printf '%s' "$out" | tail -n1)"
+  err="$(printf '%s' "$out" | sed '$d')"
+  if [ -n "$err" ]; then
+    echo "  curl: $err" >&2
+  fi
+  printf '%s' "$code"
+}
+
 mkcol_once() {
-  curl -sS -o /dev/null -w '%{http_code}' -K "$rc" \
-    --retry 3 --retry-delay 2 --retry-max-time 60 \
-    -X MKCOL "$1" || true
+  http_call -X MKCOL "$1"
 }
 
 ensure_dir() {
@@ -133,12 +151,10 @@ for f in "$@"; do
   fi
   name="$(basename "$f")"
   # --retry 同样吸收瞬时 5xx；4xx（如权限、路径不对）不重试。
-  code=$(curl -sS -o /dev/null -w '%{http_code}' -K "$rc" \
-    --retry 3 --retry-delay 2 --retry-max-time 120 \
-    -T "$f" "$dest/$name" || true)
+  code="$(http_call -T "$f" "$dest/$name")"
   case "$code" in
     200|201|204) echo "  已上传 $name -> $dest/$name (HTTP $code)" ;;
-    *) echo "::error::上传失败 $f -> $dest/$name (HTTP $code)"; exit 1 ;;
+    *) echo "::error::上传失败 $f -> $dest/$name (HTTP $code；000 = 连不上/超时，不是服务端拒绝)"; exit 1 ;;
   esac
 done
 

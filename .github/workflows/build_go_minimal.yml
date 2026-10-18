@@ -1701,6 +1701,13 @@ jobs:
         #
         # WEBDAV_DIR 必须配：留空等于把文件倒进 WebDAV 根目录（脚本对空
         #   remote_dir 的行为正是「传到根目录」），所以在这里挡住。
+        #
+        # continue-on-error：WebDAV 只是**镜像分发**（产物已在 ci-<sha> Release
+        #   里），配置/网络故障不该把整个构建判红 —— 与下面的邮件步骤同一原则。
+        #   失败仍会以 ::error:: annotation 显示，不会静默。
+        #   2026-10-18：该步骤首次真正执行时因 MKCOL 失败拖红了整个 run
+        #   （build 4/4 全绿），故改为非阻断。
+        continue-on-error: true
         env:
           WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
           WEBDAV_USERNAME: ${{ secrets.WEBDAV_USERNAME }}
