@@ -34,6 +34,9 @@
 
 ## 构建约定
 
+- **下载 GitHub 产物（Release 等）走 `https://ghfast.top/<原始URL>` 代理**（用户 2026-10-19
+  指定）：本机直连 release 资产域名卡死不起步；api.github.com 的 JSON 可直连但共享 IP
+  60 次/小时限额。
 - **本机无 Zig 工具链**；编译/测试一律走打包机 **10.0.0.4**（`tools/build_remote.py`，
   /tmp/olz-build，zig 0.17.0，目标 `aarch64-linux-musl`，`-lc -fstrip`）。本机产物只能自测。
 - `build.zig` 的 `-Ddrivers=` 编译期白名单：名字收 Go 名或 Zig 源文件名；
