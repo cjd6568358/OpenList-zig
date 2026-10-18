@@ -198,19 +198,15 @@ python tools/import_go_config.py <backup.json> <out_config.json> \
   quarkuc（`Quark`，用户实际变体）全链路接入；真机验证上传撞容量时响应
   `"capacity limit[{0}]"`（与 Go 一致）。构建 371/371。详见 STATUS §31.9。
   （状态码**保持** 502 的既有细粒度映射，未改成 Go 的 500 —— 既有设计取舍。）
-- **`err_detail` 逐驱动接入（进行中）**：机制已就位。quarkuc（用户实际在用的
-  `Quark`）全链路接入并真机验证；**QuarkOpen（`quark.zig`）同轮接入完成**
-  （2026-10-17，编译+单测验证即可 —— 该驱动不在产物注册表，见 STATUS §32）；
-  其余驱动（aliyundrive / pan123 / itvsh…）按需接。**⚠ 有 worker 线程的驱动
-  （itvsh）只能在请求线程写** —— 跨线程写请求线程栈上的字段是数据竞争
-  （driver.zig 注释已写明）。
-- **驱动覆盖收官（2026-10-17，见 STATUS §36）**：12 个注册驱动 **9 个已真机
-  全矩阵验证**（本轮新增：**189Cloud(web) ✅** —— 修好登录缺 SSO 回跳的真 bug
-  后用 /ecloud_self 的账密实测；测完即删，不建议与 PC 驱动常驻同挂）。
-  剩 **UC / 115 Cloud / WoPan** 三个**只差凭据**（UC Cookie /
-  115 Cookie 含 UID·CID·SEID·KID / WoPan refresh_token），不依赖凭据的链路
-  （注册表/表单/哑凭据添加闭环）已由 `tools/driver_matrix.py` 测完（26/26），
-  表单字段与 Go meta 逐项对齐。**顺带修出两个真 bug**：
+- ~~**`err_detail` 逐驱动接入（进行中）**~~ ✅ **已完成 2026-10-18**：8 个驱动
+  全链接入 —— quarkuc / quark / itvsh / pan115 / **cloud189 / cloud189pc /
+  aliyundrive / wopan**（后四个见 STATUS §44）。**worker 线程与上传链一律传
+  null**（跨线程写请求线程栈上的字段是数据竞争）；local（OS 错误）、strm
+  （无上游）、webdav（只有 HTTP 状态码）不适用。
+- ~~**驱动覆盖收官（2026-10-17）**~~ ✅ **12/12 已真机覆盖**（2026-10-17 收官，
+  见 STATUS §36A/§36B.5）：UC 全矩阵通过、115 Cloud 写入/mkdir/上传通过、
+  WoPan 四连修后 20MB 分片 md5 全链一致。`tools/driver_matrix.py` 仍作为
+  「无凭据回归」（注册表/表单/哑凭据添加闭环）保留。**顺带修出两个真 bug**：
   query 参数未解码（`115 Cloud`/`上海电信智家硬盘` 表单恒 404）、
   189 驱动对非 JSON 响应静默吞掉。
 - ~~**下载响应头遗留**~~ ✅ **已修 2026-10-17（见 STATUS §35，用户实测驱动）**

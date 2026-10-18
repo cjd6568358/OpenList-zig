@@ -6,13 +6,15 @@
 //! measurable next to the network round-trip every one of these performs.
 //!
 //! The method set is a deliberate subset of OpenList's `driver.Driver`
-//! interface: only what `local / webdav / itvsh / 189 / 189pc / 123_open /
-//! aliyundrive_open / quark_open / 115_open` actually need, plus `put`, which
-//! most of them override. Deliberately absent: `copy`, `putURL`, `getArchive`,
+//! interface: only what the twelve registered drivers (`Local / WebDav /
+//! 上海电信智家硬盘 / 189Cloud / 189CloudPC / 123Pan / AliyundriveOpen /
+//! Quark+UC / 115 Cloud / WoPan / Strm`) actually need. `copy` is **optional**
+//! (`null` = the upstream driver's `Copy` is `NotSupport`), and `space` is
+//! optional too (null = no quota). Still absent: `putURL`, `getArchive`,
 //! `extractArchive`, `mkdir`-with-recursion, and every optional capability
-//! interface (`ObjThumb`, `ObjUpload`, `ObjReader`, `ArchiveReader`, ...).
-//! Each of those is a documented, budgeted extension point rather than a
-//! blank check.
+//! interface (`ObjThumb`, `ObjUpload`, `ObjReader`, `ArchiveReader`, `Other`,
+//! `DirectUploader`, ...). Each of those is a documented, budgeted extension
+//! point rather than a blank check — see docs/AUDIT_2026-10-18-drivers.md §2.
 
 const std = @import("std");
 const testing = std.testing;

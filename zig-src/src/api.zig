@@ -6,6 +6,8 @@
 //!   GET  /ping                         liveness
 //!   GET  /api/public/settings          site config + whether setup is done
 //!   POST /api/auth/login               -> JWT
+//!   POST /api/auth/login/hash          same, StaticHash variant (frontend uses this)
+//!   GET  /api/auth/logout              invalidate the caller's token
 //!   GET  /api/public/init_status       whether the system is initialised
 //!   POST /api/public/init/setup        first-run admin creation
 //!   POST /api/fs/list                  browse a directory
@@ -14,12 +16,15 @@
 //!   POST /api/fs/mkdir                 create a directory
 //!   POST /api/fs/rename                rename in place
 //!   POST /api/fs/move                  move across directories
+//!   POST /api/fs/copy                  copy (501 when the driver cannot copy)
 //!   POST /api/fs/remove                delete
 //!   PUT  /api/fs/put                   upload (body = raw bytes, File-Path header)
+//!   POST /api/fs/archive/list          browse one level inside a local ZIP/TAR
 //!   GET  /d/* and /p/*                 download / proxied download (Range-aware)
 //!
 //! Admin surface (single-admin build: every authenticated user is the admin):
 //!   GET  /api/me                       current user
+//!   POST /api/me/update                change username / password
 //!   GET  /api/admin/storage[/list]     all configured storages (settings UI)
 //!   GET  /api/admin/storage/get?id=     one record (edit form)
 //!   POST /api/admin/storage/create      add a storage, init it, persist cfg.json
@@ -32,6 +37,11 @@
 //!   GET  /api/admin/driver/info?driver= one driver's form metadata
 //!   GET  /api/admin/setting/{list,get,default}
 //!   POST /api/admin/setting/{save,delete}  persist / reset config-backed settings
+//!   POST /api/admin/setting/reset_token    rotate `zig.token` (also re-keys
+//!                                          download links, matching Go's sign.Instance)
+//!   GET  /api/admin/config/export       full config.json (backup)
+//!   POST /api/admin/config/import       merge/replace storages from a backup
+//!   POST /api/admin/user/del_cache      CLI 改完密码后通知在线服务重载凭据
 //!   GET  /api/task/<kind>/{undone,done} empty lists (no job queue in this build)
 //!   GET  /api/admin/setting + PUT      compact compatibility alias
 //!
@@ -42,8 +52,11 @@
 //!
 //! Deliberately absent, with reasons in docs/STATUS.md: search (needs
 //! bleve), share links, and the full task-centre CRUD (the tasks listed above
-//! are read-only admin lookups; there is no background job queue yet). SSO
-//! admin, archives browsing, and offline download are also not implemented.
+//! are read-only admin lookups; there is no background job queue yet). SSO,
+//! 2FA/LDAP, offline download and remote archive browsing are also not
+//! implemented; archive browsing is **local ZIP/TAR only** (see
+//! `handleFsArchiveList`, remote archives return 501). `fs/form` (multipart
+//! upload) and `fs/archive/meta` are intentionally skipped — see STATUS §45.3.
 //! (A WebDAV server is served at /dav — see webdav.zig.)
 
 const std = @import("std");

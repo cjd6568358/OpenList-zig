@@ -2,12 +2,15 @@
 """驱动覆盖测试：12 个注册驱动逐个过「添加 → init → 状态 → 删除」闭环。
 
 背景（用户 2026-10-17 要求"每个驱动都要测上传/下载/删除/添加"）：
-  * 已有真实凭据并挂载的驱动，走 `tools/e2e_test.py`（全操作矩阵 + 云盘写）；
-  * **没有凭据的驱动**（UC / 115 Cloud / WoPan / 189Cloud web），凭据只能
-    用户提供 —— 但「添加」这条链路不依赖真凭据也能测：用哑凭据创建，期望
-    **优雅失败**（HTTP 200 + code 500 的信封、"failed init storage but
-    storage is already created"、行保留 + error_msg），再删掉。
-    崩溃 / 挂死 / 整行消失才是真缺陷。
+  * 有真实凭据并挂载的驱动，走 `tools/e2e_test.py`（全操作矩阵 + 云盘写）；
+  * 本脚本不依赖真凭据：「添加」这条链路用哑凭据创建，期望**优雅失败**
+    （HTTP 200 + code 500 的信封、"failed init storage but storage is
+    already created"、行保留 + error_msg），再删掉。崩溃 / 挂死 / 整行消失
+    才是真缺陷。
+  * **覆盖现状（2026-10-18）**：12 个注册驱动已全部真机覆盖（含 UC / 115 Cloud /
+    WoPan / 189Cloud web，见 STATUS §36A/§36B/§36.2），所以本脚本现在的定位是
+    「无凭据回归」：注册表完整性 + 表单字段 + 哑凭据添加闭环，改驱动注册/表单
+    时先跑它，不必碰真实账号。
 
 为什么在创建后要等：`create` 是"先建行再 init"，init 是异步的（它就是
 真机回归里那个"created but errored"路径，Go 同款语义）。

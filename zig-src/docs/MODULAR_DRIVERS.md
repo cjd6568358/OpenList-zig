@@ -124,3 +124,13 @@ xz -6 -c libpan115.so | wc -c
 const pan115 = @import("drivers/pan115.zig");
 export fn olz_force() usize { return @intFromPtr(&pan115.factory.create); }
 ```
+
+---
+
+## 5. 现状（2026-10-18 补记）
+
+本文是 **2026-10-15 的可行性调研**，结论（不采用 `.so`，改用编译期白名单）已落地：
+`build.zig -Ddrivers=` + `driver.zig` 的 comptime 分支（见 STATUS §14.1）。
+本文的静态/dynamic 体积数字是当时实测，**未随每轮代码增长刷新**；要看当前产物
+大小看 STATUS 顶部「当前基线」。如果将来真要做运行时插件，第 1 节「静态二进制
+不能 dlopen」的约束仍然成立，是绕不过去的前提。

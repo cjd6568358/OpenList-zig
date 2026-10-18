@@ -1,22 +1,35 @@
-# openlist-zig —— 当前状态与结论（2026-10-15 更新）
+# openlist-zig —— 当前状态与结论（2026-10-18 更新）
 
-> 本文是项目**唯一的最新结论文档**。历史审计报告（GO_ZIG_AUDIT / AUDIT_VERIFY /
-> DRIVER_COMPARE / CHECKLIST / T2_COMPLETE / TODO）与早期可行性评估（FEASIBILITY.md）
-> 均已删除 —— 它们承载的过时结论已汇入此处，设计/可行性背景因项目已完成而不再适用。
+> **阅读指引（2026-10-18 重写）**
 >
-> **2026-10-14**：重新拉取上游后做了一轮全量比对（基准见 §12.0），比对结果与
-> 待二次校验的疑问点全部列在 **§12**。此前 §1–§11 的结论除 §12 特别标注的外均未变。
+> - **当前基线**见下面的「当前基线」表；§1–§3 是当前态，随时更新。
+> - **§4 起是编年日志**：按日期记录每一轮的修复与验证，里面的测试数、e2e 数、
+>   二进制大小都是**当时**的基线，不要当现状读（例如 §13 的 350 单测、§20 的
+>   364、§38 的 400 都是历史）。需要现状只看顶部基线表。
+> - `docs/AUDIT_*.md` 是各轮审计**快照**：`AUDIT_2026-10-18-drivers.md` 是最新
+>   且权威的驱动维度对账（含逐条落地状态）；2026-10-17 及更早的审计已被它和
+>   §37–§45 取代，文首有「历史快照」横幅。
+> - **待办以 `TODO.md` 为准**；功能边界见 §22。
 >
-> **2026-10-15**：按本文 §12 的清单逐条核实并修复，详见 **§13**。
-> A2 / A3 / A4 / A5 / A10 **已修**（含回归测试，打包机 350 全绿）；
-> A6 / A7 经核实属"需真机验证 / 需先定并发模型"，维持现状并说明理由。
+> **当前基线（2026-10-18 22:38，构建 `73027007e1763f51…`）**
+>
+> | 项 | 值 |
+> |---|---|
+> | 单元测试（打包机 10.0.0.4，全量驱动） | **411 / 411 通过** |
+> | 交叉编译（aarch64-linux-musl，`-lc -fstrip`） | 通过，产物 **1,260,816 B** |
+> | 真机 e2e（光猫，13 挂载点） | **464 通过 / 0 失败 / 1 跳过**（跳过 = 坚果云根目录 403 服务商规则） |
+> | 注册驱动 | **12 个注册项 / 11 个实现**（Quark+UC 共用 quarkuc.zig），12/12 真机覆盖 |
+> | 上游错误透传（`ctx.err_detail`） | **8 个驱动**（quarkuc/quark/itvsh/pan115/cloud189/cloud189pc/aliyundrive/wopan） |
+> | 下载签名密钥 | `zig.token`（对齐 Go 的 `token` 设置；`reset_token` 会作废旧链接） |
+> | CI（GitHub Actions `build_go_minimal.yml`） | 绿（4 构建 + sqfs + Release） |
+> | 已知 P1 缺口 | webdav SharePoint、189pc family_transfer/old 上传/torrent、local 缩略图、aliyun `Other(video_preview)` |
 
 ## 1. 目标与验收
 
 - 用 Zig 重写 OpenList 兼容服务，塞进中兴 F4610U 光猫（aarch64 / musl / squashfs）。
 - **验收标准**：驱动全部写完 + 编译 + 真机验证。
-- **当前状态**：**12 个注册驱动**（含 2026-10-15 补的 `UC`，见 §13.5）；单元/交叉编译全绿
-  （**350 通过 / 0 失败**）；真机 e2e **32 通过 / 0 失败 / 0 跳过**。
+- **当前状态**：**12 个注册驱动 / 11 个实现**，全部真机覆盖；单元测试
+  **411/411**、交叉编译通过；真机 e2e（13 挂载）**464/0/1**。详见顶部基线表。
 
 ## 2. 驱动清单（12 个注册项 / 11 个驱动实现）
 
@@ -35,23 +48,34 @@
 | 联通沃云盘 WoPan | `WoPan`（refresh_token） | `wopan.zig` | ✅ 2026-10-17 真机修通（四连修 + 20MB 分片 md5 全链一致，§36B/§36C.2） |
 | STRM（其他挂载→.strm） | `Strm`（paths 行） | `strm.zig` | ✅ 2026-10-14 真机验证（挂载/列表/详情/内容/OnlyProxy 全链路） |
 
-**铁律**：`factory.key` 必须逐字节等于 Go 的 `driver.Config.Name`（即写进 `Storage.driver` 的字符串）；历史名只能进 `Factory.aliases`。
+**铁律**：`factory.key` 必须逐字节等于 Go 的 `driver.Config.Name`（即写进 `Storage.driver` 的字符串）。**不提供别名、不忽略大小写**（`Factory.aliases` 已于 2026-10-15 删除，见 §13.9）——配置按最新驱动名重新添加即可。
 **故意不实现 copy**：itvsh / 123 / quark 上游 `Copy` 即 `NotSupport`，Zig 故意把 vtable `.copy` 置 `null`，并有显式测试钉住「别顺手补上」。
 
-> ⚠️ 覆盖口径（2026-10-17 补注）：**挂载点 ≠ 驱动数** —— e2e 的 9 个挂载
-> 只覆盖 12 个注册驱动中的 7 个（见 §33 逐驱动测试账；§31 的「全驱动回归」
-> 口径 = 9 挂载点全量，不是 12 驱动同轮全测）。
+> ⚠️ 覆盖口径（2026-10-18 更新）：**挂载点 ≠ 驱动数**。当前 e2e 有 **13 个挂载点**
+> （`/itvsh /koofr /123_2763 /123_5137 /aliyun /quark /ecloud_self /ecloud_family
+> /hikvision /jianguo /uc /wo /115`），**覆盖全部 12 个注册驱动**（12/12，见 §36.4
+> 与 §44）。§31/§33 里「9 挂载 / 7 驱动」是 2026-10-16 的旧口径。
 
-## 3. 验证结果
+## 3. 验证结果（当前 = 2026-10-18；下面带日期的条目是历史基线）
 
-- **打包机 10.0.0.4**（唯一构建路径；本机无 Zig 工具链）：`zig test` **350 passed / 0 failed**（2026-10-15，含本轮新增的 3 个回归测试），无内存泄漏。其中 `every JSON endpoint emits strict, parseable JSON` 把**所有**已注册 JSON 端点跑一遍做严格解析。
-- **交叉编译**（目标 `aarch64-linux-musl`，加 `-lc -fstrip`）通过。
-- **真机 e2e**（光猫，用户真实配置 10 存储）：**32 通过 / 0 失败 / 0 跳过** —— 9 挂载点全部列出、详情/下载/Range/sign 校验、WebDAV 读、Local 全量写操作 13 项全过。
-- **前端页面**：光猫 `15344` 首页由「获取设置失败： Undefined」恢复为正常登录页（`登录到 OpenList (zig)`），logo 正常渲染（`src="https://res.oplist.org/logo/logo.svg"`）。
-- **`/api/public/settings`**：返回 **47** 个字段（对齐 Go `db.GetPublicSettingItems()` 的 `flag IN (PUBLIC, READONLY)`），值**全部是字符串**。
-- **`/api/fs/list`**：顶层 7 字段齐全（`content`/`total`/`readme`/`header`/`write`/`write_content_bypass`/`provider`），`write=true`；`fs/get` 含 `header`/`related`，`provider` 为驱动名。
-- **管理员途径（真机全链路）**：`init_status:false` → `POST /public/init/setup` 建 admin → **前端路径 `/auth/login/hash`（StaticHash）登录成功拿到 token** → `/api/me` 鉴权通过 → `openlist admin set 新密码`（**热重载，服务未重启**）→ 新密码登录成功、旧密码 400。
-- **最终 aarch64 二进制**：`1,183,824 B`（sha256 `b97feba6…`），**350 tests passed**（2026-10-15，见 §13）。
+- **打包机 10.0.0.4**（唯一构建路径；本机无 Zig 工具链）：`zig build test` **411 / 411 通过**
+  （2026-10-18，全量驱动），无内存泄漏。其中 `every JSON endpoint emits strict,
+  parseable JSON` 把**所有**已注册 JSON 端点跑一遍做严格解析。
+- **交叉编译**（目标 `aarch64-linux-musl`，加 `-lc -fstrip`）通过；产物
+  `73027007e1763f51…`，**1,260,816 B**。
+- **真机 e2e**（光猫，13 挂载点 / 12 驱动全覆盖）：**464 通过 / 0 失败 / 1 跳过**
+  （跳过 = 坚果云根目录 403 服务商规则，需 WEB 手动删；日志
+  `docs/regression/2026-10-18-reset-token-e2e.log`）。覆盖列出/详情/下载/Range/
+  sign/条件请求/WebDAV 全协议/写操作/边界与稳定性。
+- **前端页面**：登录页正常（`登录到 OpenList (zig)`）、logo 渲染、管理页 CRUD 全通。
+- **`/api/public/settings`**：返回 **47** 个字段（对齐 Go `db.GetPublicSettingItems()`
+  的 `flag IN (PUBLIC, READONLY)`），值**全部是字符串**。
+- **`/api/fs/list`**：顶层 7 字段齐全（`content`/`total`/`readme`/`header`/`write`/
+  `write_content_bypass`/`provider`），`write=true`；`fs/get` 含 `header`/`related`。
+- **管理员途径（真机全链路）**：`init_status:false` → `POST /public/init/setup` 建
+  admin → 前端 `/auth/login/hash`（StaticHash）登录 → `/api/me` → `openlist admin set`
+  热重载 → 旧密码 400。`reset_token` 轮换后旧 `/d/` 链接 401、新链接 200（§45）。
+- **历史基线（2026-10-15，见 §13）**：350 单测 / 32 e2e / 1,183,824 B。**不要当现状读。**
 
 ## 4. 本轮关键修复（2026-10-13 晚）
 
@@ -124,27 +148,35 @@
 - 单一 `dispatcher` 入口（POST `panservice.mail.wo.cn/{channel}/dispatcher`，channel ∈ api-user / wohome）；header 签名 = `md5(key + resTime毫秒 + reqSeq + channel)` 小写 hex；body 的 `param` = AES-128-CBC + PKCS7（IV = `wNSOYIB1k1DjY5lA`；key：api-user 用 clientSecret `XFmi9GS2hzk98jGX`，wohome 用 accessToken 前 16 字节）后 base64；响应 `RSP.DATA` 若为 `"..."` 包裹的密文则同规则解密。上传走 `{zoneURL}/openapi/client/upload2C` 的 multipart。
 - 注册名 `WoPan` 已进驱动表（共 10 驱动），但当前光猫配置无 wopan 存储实例（无 refresh_token），**未真机**。要验证需往 `/tmp/olz/config.json` 加一个 `WoPan` 存储后重启。
 
-## 9. 未实现 / 功能边界
+## 9. 未实现 / 功能边界（2026-10-18 复核）
 
-- 数据库与多用户体系、搜索、分享链接、后台任务/离线下载、归档解压与文件下载、远程归档浏览、远程 Range 的真正响应流式、完整设置/存储 CRUD、任务中心操作接口。
+> 定案边界见 §22；这里只列「当前确实没有」的项，且每条都给了理由或去向。
+
+- **仍然没有**：数据库与多用户体系、搜索索引、分享链接、SSO/2FA/LDAP/WebAuthn、
+  后台任务队列与离线下载、torrent、归档**解压与下载**（`/ad` `/ae`）、远程归档浏览
+  （本地 ZIP/TAR 的 `archive/list` 已有，远端 501）、S3/FTP/SFTP/MCP 服务端、
+  `fs/form`（multipart 上传）与 `fs/archive/meta`（理由见 §45.3）。
+- **已经有了，别再列进「未实现」**（历史上这里写错过）：存储/设置的**完整 CRUD**
+  （§20/§21）、`/api/me/update`、`/api/auth/logout`、`config/export|import`（§36D）、
+  `reset_token`（§45）、`fs/copy`（驱动不支持时 501）、上传进度**已通过 `fs/put`
+  暴露给前端**（`api.zig` 的 `PutProgress`）。
 - **SFTP SSH 服务端：明确 defer**。单用户虽可缩授权范围（仅开放一个管理员账号、复用现有 `driver.Driver` vtable），但仍需 SSH transport + SFTP 协议，而 Zig 标准库无现成 SSH server，需移植/引依赖；恢复前应先选定可信 SSH 实现并以 OpenSSH/Paramiko 验证互通与 xz 体积，不直接自写密码学传输层。
 - **★ 未来移植 SFTP/FTP 服务端时的安全要点（用户 2026-10-13 提出的上游 bug）**：上游 Go 版的 SFTP/FTP 登录**失败计数 key 用了 `IP:端口`** —— 互联网扫描器每次连接源端口都不同，计数永远到不了阈值，**限速/锁定形同虚设**（已被真实爆破验证）。这条值得反馈上游 OpenList。我们将来实现时：**失败计数的 key 必须用纯 IP**（不带端口），阈值判定、锁定时长（Go `model.DefaultMaxAuthRetries` / `DefaultLockDuration`，见 `server/handles/auth.go` 的 `model.LoginCache` 用法）也要对齐并自查一遍 key 的粒度。同理适用于 HTTP 登录接口现有限流逻辑的复查。
-- 上传进度 callback 全线接通（所有驱动按 Go `model.UpdateProgress` 报 0–100 百分比；itvsh 因并发上传用原子计数 + 独立轮询线程），但**尚无 `/api` 端点把它暴露给前端**。
 
-## 10. 与上游代码对比（项目将作为 `D:\workspace\OpenList` 子目录）
+## 10. 与上游代码对比（当前布局：Go 树 + `zig-src/` 并列）
 
-> 用户计划把 `openlist-zig` 放进 `D:\workspace\OpenList` 作为子目录，紧挨 Go 的 `drivers/` 树，
-> 方便逐文件比对。届时布局：
-> - Zig：`D:\workspace\OpenList\openlist-zig\src\drivers\<name>.zig`
-> - Go ：`D:\workspace\OpenList\drivers\<name>\`
+> **实际布局（2026-10-18）**：仓库根目录就是 Go 上游树（`drivers/`、`server/`、
+> `internal/`、`pkg/`、`main.go`），Zig 移植在 `zig-src/` 子目录。
+> - Zig：`D:\workspace\OpenList-zig\zig-src\src\drivers\<name>.zig`
+> - Go ：`D:\workspace\OpenList-zig\drivers\<name>\`
 >
 > 快速逐驱动 diff（注意 Go 一个驱动是多文件，Zig 合并为单文件）：
 >
 > ```sh
-> diff "D:/workspace/OpenList/openlist-zig/src/drivers/pan123.zig" "D:/workspace/OpenList/drivers/123/driver.go"
+> diff "D:/workspace/OpenList-zig/zig-src/src/drivers/pan123.zig" "D:/workspace/OpenList-zig/drivers/123/driver.go"
 > ```
 >
-> 上游事实来源永远是**本地** OpenList 树，不要去 GitHub 拉；`itvsh` 是 fork 后独立实现的
+> 上游事实来源永远是**本地** Go 树，不要去 GitHub 拉；`itvsh` 是 fork 后独立实现的
 > **私有驱动**，上游 main 本就没有它，比对基准与两个"事实来源视图"的区别见 §12.0。
 
 ## 11. 待处理（用户 2026-10-13 明确要求）
@@ -3385,3 +3417,57 @@ AUDIT §5 的 11 处全部修复，其中两处**顺带改了行为**：
 
 **真机 e2e 结果**：13 挂载 **464 通过 / 0 失败 / 1 跳过**（跳过仍是坚果云根目录
 403 服务商规则；日志 `docs/regression/2026-10-18-reset-token-e2e.log`）。
+
+---
+
+## 46. 文档与注释全量去陈旧（2026-10-18 深夜）
+
+**背景**：多轮快速迭代后，文档里的「当前态」混着历史数字，源码头注释也有几处与
+实现相反。本轮做了一次全量清理，原则：**历史日志不改写，但必须标清楚是历史**；
+**当前态只允许一个事实**。
+
+### 46.1 文档
+
+- **STATUS.md 头部重写**：加「阅读指引」（§4 起是编年日志、数字是当时基线）+
+  **「当前基线」表**（411 单测 / 464 e2e / 1,260,816 B / 12 驱动 / 8 驱动
+  err_detail / 签名密钥 `zig.token` / CI 绿）。§1、§2（删除 `Factory.aliases`
+  的说法、覆盖口径改 13 挂载 12 驱动）、§3（当前数字 + 历史基线标注）、
+  §9（把「存储 CRUD/设置读写/进度端点未实现」这些**已经做了**的项移出）、
+  §10（仓库布局改成实际的 Go 树 + `zig-src/`）全部按现状重写。
+- **README.md**：删掉「可行性验证工程」与「十个驱动」；驱动表补 `UC`/`Strm`；
+  测试/e2e/体积更新；构建章节改成「一律 `build_remote.py`」（原来的本机
+  `zig build-exe` 指南与「本机有工具链」矛盾）；建管理员示例从**已删除的**
+  `/api/auth/register` 改为 `POST /api/public/init/setup`；配置示例里错误的
+  驱动名 `Itvsh` 改为 `上海电信智家硬盘`；「已实现/未实现」按 §9/§45.3 对齐。
+- **旧审计**（2026-10-11 / 10-17 / 10-17-v2 / REVIEW / REVIEW-v1 / DS）：
+  文首统一加「⚠ 历史快照，已被 AUDIT_2026-10-18-drivers.md 与 §37–§45 取代」横幅。
+- **AUDIT_2026-10-18-drivers.md**：头部加「最终验证基线（411/464）」，说明文中
+  408/409/465 是各批次当时的数字。
+- **MODULAR_DRIVERS.md**：补 §5「现状」——调研结论已落地为编译期白名单，
+  体积数字是 2026-10-15 实测、未随代码增长刷新。
+- **TODO.md §5**：`err_detail 逐驱动接入（进行中）` → ✅ 8 驱动完成；
+  `驱动覆盖收官（9/12）` → ✅ 12/12 已真机覆盖。
+
+### 46.2 源码头注释
+
+- `driver.zig`：驱动清单从已下线的 `_open` 变体改为**当前 12 个注册驱动**；
+  「Deliberately absent: copy」纠正为「`copy`/`space` 是可选槽位」。
+- `api.zig`：端点清单补齐 `login/hash`、`logout`、`fs/copy`、`fs/archive/list`、
+  `me/update`、`reset_token`、`config/export|import`、`user/del_cache`；
+  删掉「archives browsing not implemented」的错误结论（本地 ZIP/TAR 已支持），
+  并写明 `fs/form`/`archive/meta` 的取舍。
+- 驱动内的 11 处错误论断已在 §4 第三批修完（Copy/Other/isLog/Version 等）。
+
+### 46.3 tools 清理（64 → 25 个文件）
+
+删掉 39 个一次性探针/临时脚本（TLS 握手探针 `hello_*/https_probe*/tls_probe`、
+115 CDN/Range 探针 `probe_115_*`、tcpdump 分析 `cap_*/parse_*`、向量生成器、
+`run_probe*`、`diag_download`、`test_189web`、`compare_edges` 等）——结论都已
+写进 STATUS §28–§41，脚本本身留在 git 历史里可追溯。
+`_tmp_restore_cfg.py` 改名为 `restore_test_cfg.py`（设备重启后恢复测试配置的
+正式流程，docstring 重写，含「恢复后必须跑 e2e」的告警）；`_tmp_verify_p1.py`
+删除（其检查已被单测/e2e 覆盖）。`driver_matrix.py` 头注释从「没有凭据的驱动」
+改为「无凭据回归」的定位。
+
+**验证**：文档内所有「当前」数字统一为 **411/411 单测、464/0/1 e2e、
+`73027007…`（1,260,816 B）**；改完跑一次全量构建确认注释改动没碰坏编译。
