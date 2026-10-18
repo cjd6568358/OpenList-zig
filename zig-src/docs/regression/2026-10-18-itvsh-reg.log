@@ -1,0 +1,27 @@
+itvsh 真机专项回归（2026-10-18 08:xx，设备 /tmp/olz，二进制 8e521c7b…）
+对照对象：Go drivers/itvsh（driver.go / util.go / upload.go / types.go / crypto.go / meta.go）
+
+[1] 账密登录（cfg.json 清掉残留 access_token 后）
+    POST /nas/session/key  200
+    POST /nas/user/login   200
+    POST /nas/user/info    200
+    [itvsh] ready: mobile=17316345137 forwardUrl=https://n8.pan.itvsh.cn
+    storage #1 上海电信智家硬盘 -> /itvsh        ← 挂载发布
+
+[2] 行为面
+    fs/list  /itvsh            200 code=200 6 条目（家庭共享/Music/智能相册/backup/天翼看家/builds）
+    fs/get   /itvsh/家庭共享    200 name=家庭共享（伪造条目按目录回答，Go injectHomeshare 同语义）
+    fs/put   /itvsh/zig-reg-*.txt  200 success（分块并发上传 + finalize 三步改名）
+    写后可见（轮询 2s×N）        size=40
+    fs/get   单文件             200 size=40
+    fs/put   覆盖同名           200 success（备份→改名→删备份路径）
+    /d/ +sign 下载              200 43 bytes
+    /d/ +sign Range bytes=0-9   206 10 bytes
+    fs/remove                   200 + 生效
+    根目录已恢复原状（探针文件/目录全部清理）
+
+[3] e2e 全量（同二进制）      93/93 通过（13 挂载，itvsh 修复后参与并发 list）
+
+[4] 失败路径
+    上传到不存在目录：上游不校验目录、照收（200）——无法触发 first_err，
+    err_detail 透出路径为编译期验证（直路赋值，无分支）。

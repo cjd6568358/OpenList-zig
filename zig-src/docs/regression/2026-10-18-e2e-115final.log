@@ -1,0 +1,516 @@
+=== 0. 准备：初始化/登录 ===
+  ✅ 登录拿到 token                                     
+
+=== 0.5 等待存储初始化 ===
+  ✅ 挂载点已发布                                         13 个: ecloud_family, ecloud_self, hikvision, 123_2763, 123_5137, jianguo, aliyun, itvsh, koofr, quark, 115, uc, wo
+
+=== 1. 列目录 ===
+  ✅ 虚拟根列出挂载点                                       挂载: ecloud_family, ecloud_self, hikvision, 123_2763, 123_5137, jianguo, aliyun, itvsh, koofr, quark, 115, uc, wo
+  ✅ list /ecloud_family                            5 条
+  ✅ list /ecloud_self                              13 条
+  ✅ list /hikvision                                2 条
+  ✅ list /123_2763                                 2 条
+  ✅ list /123_5137                                 2 条
+  ✅ list /jianguo                                  28 条
+  ✅ list /aliyun                                   1 条
+  ✅ list /itvsh                                    7 条
+  ✅ list /koofr                                    6 条
+  ✅ list /quark                                    16 条
+  ✅ list /115                                      17 条
+  ✅ list /uc                                       2 条
+  ✅ list /wo                                       20 条
+
+=== 2. 详情 / 下载 / Range ===
+  ✅ fs/get /hikvision/probe.txt                    size=14 type=4
+  ✅ fs/get 带 raw_url                               /p/hikvision/probe.txt?sign=gkFLN_I2po4v2mcbY13BiD22nw28_ULO
+  ✅ 下载 /d/hikvision/probe.txt                      HTTP 200, 14 字节 (sign)
+  ✅ Range 206                                      HTTP 206, 4 字节
+  ✅ 篡改的 sign 被拒                                    HTTP 401
+
+=== 3. WebDAV 读 ===
+  ✅ PROPFIND /dav/                                 HTTP 207
+  ✅ PROPFIND /hikvision/probe.txt                  HTTP 207
+  ✅ WebDAV GET                                     HTTP 200, 14 字节
+
+=== 4. 写操作 ===
+  -- 挂载点 /ecloud_family（临时目录 olz-e2e-1792297971）
+  ✅ mkdir                                          success
+  ✅ 上传 a.txt                                       HTTP 200 code=200
+  ✅ 上传后能看到 a.txt                                   1 条
+  ✅ mkdir sub                                      success
+  ⚠️ 跳过 mkdir sub 可见                                   上游同步超时，copy 无从验证
+  ✅ 重命名 a.txt -> b.txt                             success
+  ✅ 重命名生效                                          
+  ✅ 移动到 sub/                                       success
+  ✅ 移动生效                                           
+  ✅ 删除文件                                           success
+  ✅ 删除生效                                           
+  ✅ WebDAV PUT                                     HTTP 201
+  ✅ WebDAV PUT 生效                                  
+  ✅ WebDAV PUT 覆盖 → 201                            HTTP 201
+  ✅ WebDAV PUT 带 Etag                              "6ad44c48-e"
+  ✅ WebDAV PUT 目录 → 405                            HTTP 405
+  ✅ WebDAV OPTIONS 目录                              HTTP 200
+  ✅   DAV: 1, 2                                    1, 2
+  ✅   MS-Author-Via: DAV                           DAV
+  ✅   Allow(目录) 完整                                 OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND
+  ✅   Allow(文件) 完整                                 OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT
+  ✅ WebDAV 未鉴权 → 401                               HTTP 401
+  ✅   WWW-Authenticate realm                       Basic realm="openlist"
+  ✅ WebDAV PROPFIND Depth=2 → 400                  HTTP 400
+  ✅ WebDAV HEAD 目录 → 200                           HTTP 200
+  ✅   Content-Type: httpd/unix-directory           httpd/unix-directory
+  ✅ WebDAV GET 目录 → 405                            HTTP 405
+  ✅ WebDAV Range（远程：第一跳 200/206/302）               HTTP 302
+  ✅   Location 指向上游直链                              https://qd-tjwq-home.tjtele.com/FAMILYCLOUD/1972fabb-d561-45
+  ℹ️ 远程 Range 越界 → 第一跳 302（照抄，不断言）
+  ✅ WebDAV MOVE 自身 → 403                           HTTP 403
+  ✅ WebDAV MKCOL                                   HTTP 405
+  ✅ 清理临时目录 olz-e2e-1792297971                      
+  -- 挂载点 /ecloud_self（临时目录 olz-e2e-1792298064）
+  ✅ mkdir                                          success
+  ✅ 上传 a.txt                                       HTTP 200 code=200
+  ✅ 上传后能看到 a.txt                                   1 条
+  ✅ mkdir sub                                      success
+  ✅ mkdir sub 后等可见（最终一致性）                          
+  ✅ copy a.txt -> sub/                             success
+  ✅ copy 产物出现在 sub/                                
+  ✅ copy 后源文件保留                                    
+  ✅ 重命名 a.txt -> b.txt                             success
+  ✅ 重命名生效                                          
+  ✅ 移动到 sub/                                       success
+  ✅ 移动生效                                           
+  ✅ 删除文件                                           success
+  ✅ 删除生效                                           
+  ✅ WebDAV PUT                                     HTTP 201
+  ✅ WebDAV PUT 生效                                  
+  ✅ WebDAV PUT 覆盖 → 201                            HTTP 201
+  ✅ WebDAV PUT 带 Etag                              "6ad44c5c-e"
+  ✅ WebDAV PUT 目录 → 405                            HTTP 405
+  ✅ WebDAV OPTIONS 目录                              HTTP 200
+  ✅   DAV: 1, 2                                    1, 2
+  ✅   MS-Author-Via: DAV                           DAV
+  ✅   Allow(目录) 完整                                 OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND
+  ✅   Allow(文件) 完整                                 OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT
+  ✅ WebDAV 未鉴权 → 401                               HTTP 401
+  ✅   WWW-Authenticate realm                       Basic realm="openlist"
+  ✅ WebDAV PROPFIND Depth=2 → 400                  HTTP 400
+  ✅ WebDAV HEAD 目录 → 200                           HTTP 200
+  ✅   Content-Type: httpd/unix-directory           httpd/unix-directory
+  ✅ WebDAV GET 目录 → 405                            HTTP 405
+  ✅ WebDAV Range（远程：第一跳 200/206/302）               HTTP 302
+  ✅   Location 指向上游直链                              https://cloudcube.wuxi.cn/cloudcube-jswx-person/PERSONCLOUD/
+  ℹ️ 远程 Range 越界 → 第一跳 302（照抄，不断言）
+  ✅ WebDAV MOVE 自身 → 403                           HTTP 403
+  ✅ WebDAV MKCOL                                   HTTP 405
+  ✅ 清理临时目录 olz-e2e-1792298064                      
+  -- 挂载点 /123_2763（临时目录 olz-e2e-1792298084）
+  ✅ mkdir                                          success
+  ✅ 上传 a.txt                                       HTTP 200 code=200
+  ✅ 上传后能看到 a.txt                                   1 条
+  ✅ mkdir sub                                      success
+  ✅ mkdir sub 后等可见（最终一致性）                          
+  ✅ copy 明确不支持(501)                                code=501 msg=operation not supported by this driver
+  ✅ 重命名 a.txt -> b.txt                             success
+  ✅ 重命名生效                                          
+  ✅ 移动到 sub/                                       success
+  ✅ 移动生效                                           
+  ✅ 删除文件                                           success
+  ✅ 删除生效                                           
+  ✅ WebDAV PUT                                     HTTP 201
+  ✅ WebDAV PUT 生效                                  
+  ✅ WebDAV PUT 覆盖 → 201                            HTTP 201
+  ✅ WebDAV PUT 带 Etag                              "6ad44c7e-e"
+  ✅ WebDAV PUT 目录 → 405                            HTTP 405
+  ✅ WebDAV OPTIONS 目录                              HTTP 200
+  ✅   DAV: 1, 2                                    1, 2
+  ✅   MS-Author-Via: DAV                           DAV
+  ✅   Allow(目录) 完整                                 OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND
+  ✅   Allow(文件) 完整                                 OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT
+  ✅ WebDAV 未鉴权 → 401                               HTTP 401
+  ✅   WWW-Authenticate realm                       Basic realm="openlist"
+  ✅ WebDAV PROPFIND Depth=2 → 400                  HTTP 400
+  ✅ WebDAV HEAD 目录 → 200                           HTTP 200
+  ✅   Content-Type: httpd/unix-directory           httpd/unix-directory
+  ✅ WebDAV GET 目录 → 405                            HTTP 405
+  ✅ WebDAV Range（远程：第一跳 200/206/302）               HTTP 206
+  ℹ️ 远程本端代理 Range → 上游说 206（照抄，不断言）
+  ℹ️ 远程 Range 越界 → 第一跳 416（照抄，不断言）
+  ✅ WebDAV MOVE 自身 → 403                           HTTP 403
+  ✅ WebDAV MKCOL                                   HTTP 405
+  ✅ 清理临时目录 olz-e2e-1792298084                      
+  -- 挂载点 /123_5137（临时目录 olz-e2e-1792298133）
+  ✅ mkdir                                          success
+  ✅ 上传 a.txt                                       HTTP 200 code=200
+  ✅ 上传后能看到 a.txt                                   1 条
+  ✅ mkdir sub                                      success
+  ✅ mkdir sub 后等可见（最终一致性）                          
+  ✅ copy 明确不支持(501)                                code=501 msg=operation not supported by this driver
+  ✅ 重命名 a.txt -> b.txt                             success
+  ✅ 重命名生效                                          
+  ✅ 移动到 sub/                                       success
+  ✅ 移动生效                                           
+  ✅ 删除文件                                           success
+  ✅ 删除生效                                           
+  ✅ WebDAV PUT                                     HTTP 201
+  ✅ WebDAV PUT 生效                                  
+  ✅ WebDAV PUT 覆盖 → 201                            HTTP 201
+  ✅ WebDAV PUT 带 Etag                              "6ad44caf-e"
+  ✅ WebDAV PUT 目录 → 405                            HTTP 405
+  ✅ WebDAV OPTIONS 目录                              HTTP 200
+  ✅   DAV: 1, 2                                    1, 2
+  ✅   MS-Author-Via: DAV                           DAV
+  ✅   Allow(目录) 完整                                 OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND
+  ✅   Allow(文件) 完整                                 OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT
+  ✅ WebDAV 未鉴权 → 401                               HTTP 401
+  ✅   WWW-Authenticate realm                       Basic realm="openlist"
+  ✅ WebDAV PROPFIND Depth=2 → 400                  HTTP 400
+  ✅ WebDAV HEAD 目录 → 200                           HTTP 200
+  ✅   Content-Type: httpd/unix-directory           httpd/unix-directory
+  ✅ WebDAV GET 目录 → 405                            HTTP 405
+  ✅ WebDAV Range（远程：第一跳 200/206/302）               HTTP 206
+  ℹ️ 远程本端代理 Range → 上游说 206（照抄，不断言）
+  ℹ️ 远程 Range 越界 → 第一跳 416（照抄，不断言）
+  ✅ WebDAV MOVE 自身 → 403                           HTTP 403
+  ✅ WebDAV MKCOL                                   HTTP 405
+  ✅ 清理临时目录 olz-e2e-1792298133                      
+  -- 挂载点 /jianguo（临时目录 olz-e2e-1792298182）
+  ✅ mkdir                                          success
+  ✅ 上传 a.txt                                       HTTP 200 code=200
+  ✅ 上传后能看到 a.txt                                   1 条
+  ✅ mkdir sub                                      success
+  ✅ mkdir sub 后等可见（最终一致性）                          
+  ✅ copy a.txt -> sub/                             success
+  ✅ copy 产物出现在 sub/                                
+  ✅ copy 后源文件保留                                    
+  ✅ 重命名 a.txt -> b.txt                             success
+  ✅ 重命名生效                                          
+  ✅ 移动到 sub/                                       success
+  ✅ 移动生效                                           
+  ✅ 删除文件                                           success
+  ✅ 删除生效                                           
+  ✅ WebDAV PUT                                     HTTP 201
+  ✅ WebDAV PUT 生效                                  
+  ✅ WebDAV PUT 覆盖 → 201                            HTTP 201
+  ✅ WebDAV PUT 带 Etag                              "6ad44ccd-e"
+  ✅ WebDAV PUT 目录 → 405                            HTTP 405
+  ✅ WebDAV OPTIONS 目录                              HTTP 200
+  ✅   DAV: 1, 2                                    1, 2
+  ✅   MS-Author-Via: DAV                           DAV
+  ✅   Allow(目录) 完整                                 OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND
+  ✅   Allow(文件) 完整                                 OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT
+  ✅ WebDAV 未鉴权 → 401                               HTTP 401
+  ✅   WWW-Authenticate realm                       Basic realm="openlist"
+  ✅ WebDAV PROPFIND Depth=2 → 400                  HTTP 400
+  ✅ WebDAV HEAD 目录 → 200                           HTTP 200
+  ✅   Content-Type: httpd/unix-directory           httpd/unix-directory
+  ✅ WebDAV GET 目录 → 405                            HTTP 405
+  ✅ WebDAV Range（远程：第一跳 200/206/302）               HTTP 206
+  ℹ️ 远程本端代理 Range → 上游说 206（照抄，不断言）
+  ℹ️ 远程 Range 越界 → 第一跳 416（照抄，不断言）
+  ✅ WebDAV MOVE 自身 → 403                           HTTP 403
+  ✅ WebDAV MKCOL                                   HTTP 405
+  ⚠️ 跳过 清理临时目录 olz-e2e-1792298182                      AuthFailed（坚果云根级目录禁止 API 删除，需 WEB 手动删）
+  -- 挂载点 /aliyun（临时目录 olz-e2e-1792298192）
+  ✅ mkdir                                          success
+  ✅ 上传 a.txt                                       HTTP 200 code=200
+  ✅ 上传后能看到 a.txt                                   1 条
+  ✅ mkdir sub                                      success
+  ✅ mkdir sub 后等可见（最终一致性）                          
+  ✅ copy a.txt -> sub/                             success
+  ✅ copy 产物出现在 sub/                                
+  ✅ copy 后源文件保留                                    
+  ✅ 重命名 a.txt -> b.txt                             success
+  ✅ 重命名生效                                          
+  ✅ 移动到 sub/                                       success
+  ✅ 移动生效                                           
+  ✅ 删除文件                                           success
+  ✅ 删除生效                                           
+  ✅ WebDAV PUT                                     HTTP 201
+  ✅ WebDAV PUT 生效                                  
+  ✅ WebDAV PUT 覆盖 → 201                            HTTP 201
+  ✅ WebDAV PUT 带 Etag                              "CEA3DBCCBCA0DB8F53C0A0879D4654CB109D40FA"
+  ✅ WebDAV PUT 目录 → 405                            HTTP 405
+  ✅ WebDAV OPTIONS 目录                              HTTP 200
+  ✅   DAV: 1, 2                                    1, 2
+  ✅   MS-Author-Via: DAV                           DAV
+  ✅   Allow(目录) 完整                                 OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND
+  ✅   Allow(文件) 完整                                 OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT
+  ✅ WebDAV 未鉴权 → 401                               HTTP 401
+  ✅   WWW-Authenticate realm                       Basic realm="openlist"
+  ✅ WebDAV PROPFIND Depth=2 → 400                  HTTP 400
+  ✅ WebDAV HEAD 目录 → 200                           HTTP 200
+  ✅   Content-Type: httpd/unix-directory           httpd/unix-directory
+  ✅ WebDAV GET 目录 → 405                            HTTP 405
+  ✅ WebDAV Range（远程：第一跳 200/206/302）               HTTP 302
+  ✅   Location 指向上游直链                              https://dl1-v6.aliyundrive.cloud/Pj2iDVRn/832580824/6acc5367
+  ℹ️ 远程 Range 越界 → 第一跳 302（照抄，不断言）
+  ✅ WebDAV MOVE 自身 → 403                           HTTP 403
+  ✅ WebDAV MKCOL                                   HTTP 405
+  ✅ 清理临时目录 olz-e2e-1792298192                      
+  -- 挂载点 /itvsh（临时目录 olz-e2e-1792298218）
+  ✅ mkdir                                          success
+  ✅ 上传 a.txt                                       HTTP 200 code=200
+  ✅ 上传后能看到 a.txt                                   1 条
+  ✅ mkdir sub                                      success
+  ✅ mkdir sub 后等可见（最终一致性）                          
+  ✅ copy 明确不支持(501)                                code=501 msg=operation not supported by this driver
+  ✅ 重命名 a.txt -> b.txt                             success
+  ✅ 重命名生效                                          
+  ✅ 移动到 sub/                                       success
+  ✅ 移动生效                                           
+  ✅ 删除文件                                           success
+  ✅ 删除生效                                           
+  ✅ WebDAV PUT                                     HTTP 201
+  ✅ WebDAV PUT 生效                                  
+  ✅ WebDAV PUT 覆盖 → 201                            HTTP 201
+  ✅ WebDAV PUT 带 Etag                              "6ad44c85-e"
+  ✅ WebDAV PUT 目录 → 405                            HTTP 405
+  ✅ WebDAV OPTIONS 目录                              HTTP 200
+  ✅   DAV: 1, 2                                    1, 2
+  ✅   MS-Author-Via: DAV                           DAV
+  ✅   Allow(目录) 完整                                 OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND
+  ✅   Allow(文件) 完整                                 OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT
+  ✅ WebDAV 未鉴权 → 401                               HTTP 401
+  ✅   WWW-Authenticate realm                       Basic realm="openlist"
+  ✅ WebDAV PROPFIND Depth=2 → 400                  HTTP 400
+  ✅ WebDAV HEAD 目录 → 200                           HTTP 200
+  ✅   Content-Type: httpd/unix-directory           httpd/unix-directory
+  ✅ WebDAV GET 目录 → 405                            HTTP 405
+  ✅ WebDAV Range（远程：第一跳 200/206/302）               HTTP 200
+  ℹ️ 远程本端代理 Range → 上游说 200（照抄，不断言）
+  ℹ️ 远程 Range 越界 → 第一跳 200（照抄，不断言）
+  ✅ WebDAV MOVE 自身 → 403                           HTTP 403
+  ✅ WebDAV MKCOL                                   HTTP 405
+  ✅ 清理临时目录 olz-e2e-1792298218                      
+  -- 挂载点 /koofr（临时目录 olz-e2e-1792298224）
+  ✅ mkdir                                          success
+  ✅ 上传 a.txt                                       HTTP 200 code=200
+  ✅ 上传后能看到 a.txt                                   1 条
+  ✅ mkdir sub                                      success
+  ✅ mkdir sub 后等可见（最终一致性）                          
+  ✅ copy a.txt -> sub/                             success
+  ✅ copy 产物出现在 sub/                                
+  ✅ copy 后源文件保留                                    
+  ✅ 重命名 a.txt -> b.txt                             success
+  ✅ 重命名生效                                          
+  ✅ 移动到 sub/                                       success
+  ✅ 移动生效                                           
+  ✅ 删除文件                                           success
+  ✅ 删除生效                                           
+  ✅ WebDAV PUT                                     HTTP 201
+  ✅ WebDAV PUT 生效                                  
+  ✅ WebDAV PUT 覆盖 → 201                            HTTP 201
+  ✅ WebDAV PUT 带 Etag                              "6ad44d23-e"
+  ✅ WebDAV PUT 目录 → 405                            HTTP 405
+  ✅ WebDAV OPTIONS 目录                              HTTP 200
+  ✅   DAV: 1, 2                                    1, 2
+  ✅   MS-Author-Via: DAV                           DAV
+  ✅   Allow(目录) 完整                                 OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND
+  ✅   Allow(文件) 完整                                 OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT
+  ✅ WebDAV 未鉴权 → 401                               HTTP 401
+  ✅   WWW-Authenticate realm                       Basic realm="openlist"
+  ✅ WebDAV PROPFIND Depth=2 → 400                  HTTP 400
+  ✅ WebDAV HEAD 目录 → 200                           HTTP 200
+  ✅   Content-Type: httpd/unix-directory           httpd/unix-directory
+  ❌ WebDAV GET 目录 → 405                            HTTP 404
+  ✅ WebDAV Range（远程：第一跳 200/206/302）               HTTP 206
+  ℹ️ 远程本端代理 Range → 上游说 206（照抄，不断言）
+  ℹ️ 远程 Range 越界 → 第一跳 416（照抄，不断言）
+  ✅ WebDAV MOVE 自身 → 403                           HTTP 403
+  ✅ WebDAV MKCOL                                   HTTP 405
+  ✅ 清理临时目录 olz-e2e-1792298224                      
+  -- 挂载点 /quark（临时目录 olz-e2e-1792298324）
+  ✅ mkdir                                          success
+  ✅ mkdir 后等可见（最终一致性）                              
+  ✅ 删除目录（容量满：只测删除）                                 success
+  ✅ 删除生效                                           
+  -- 挂载点 /115（临时目录 olz-e2e-1792298327）
+  ✅ mkdir                                          success
+  ✅ 上传 a.txt                                       HTTP 200 code=200
+  ✅ 上传后能看到 a.txt                                   1 条
+  ✅ mkdir sub                                      success
+  ✅ mkdir sub 后等可见（最终一致性）                          
+  ✅ copy a.txt -> sub/                             success
+  ✅ copy 产物出现在 sub/                                
+  ✅ copy 后源文件保留                                    
+  ✅ 重命名 a.txt -> b.txt                             success
+  ✅ 重命名生效                                          
+  ✅ 移动到 sub/                                       success
+  ✅ 移动生效                                           
+  ✅ 删除文件                                           success
+  ✅ 删除生效                                           
+  ✅ WebDAV PUT                                     HTTP 201
+  ✅ WebDAV PUT 生效                                  
+  ✅ WebDAV PUT 覆盖 → 201                            HTTP 201
+  ✅ WebDAV PUT 带 Etag                              "6ad44d64-e"
+  ✅ WebDAV PUT 目录 → 405                            HTTP 405
+  ✅ WebDAV OPTIONS 目录                              HTTP 200
+  ✅   DAV: 1, 2                                    1, 2
+  ✅   MS-Author-Via: DAV                           DAV
+  ✅   Allow(目录) 完整                                 OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND
+  ✅   Allow(文件) 完整                                 OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT
+  ✅ WebDAV 未鉴权 → 401                               HTTP 401
+  ✅   WWW-Authenticate realm                       Basic realm="openlist"
+  ✅ WebDAV PROPFIND Depth=2 → 400                  HTTP 400
+  ✅ WebDAV HEAD 目录 → 200                           HTTP 200
+  ✅   Content-Type: httpd/unix-directory           httpd/unix-directory
+  ✅ WebDAV GET 目录 → 405                            HTTP 405
+  ✅ WebDAV Range（远程：第一跳 200/206/302）               HTTP 403
+  ℹ️ 115 上游 CDN 拒签（invalid signature），403 照抄上游，Go 同形
+  ℹ️ 远程 Range 越界 → 第一跳 403（照抄，不断言）
+  ✅ WebDAV MOVE 自身 → 403                           HTTP 403
+  ✅ WebDAV MKCOL                                   HTTP 405
+  ✅ 清理临时目录 olz-e2e-1792298327                      
+  -- 挂载点 /uc（临时目录 olz-e2e-1792298378）
+  ✅ mkdir                                          success
+  ✅ 上传 a.txt                                       HTTP 200 code=200
+  ✅ 上传后能看到 a.txt                                   1 条
+  ✅ mkdir sub                                      success
+  ✅ mkdir sub 后等可见（最终一致性）                          
+  ✅ copy 明确不支持(501)                                code=501 msg=operation not supported by this driver
+  ✅ 重命名 a.txt -> b.txt                             success
+  ✅ 重命名生效                                          
+  ✅ 移动到 sub/                                       success
+  ✅ 移动生效                                           
+  ✅ 删除文件                                           success
+  ✅ 删除生效                                           
+  ✅ WebDAV PUT                                     HTTP 201
+  ✅ WebDAV PUT 生效                                  
+  ✅ WebDAV PUT 覆盖 → 201                            HTTP 201
+  ✅ WebDAV PUT 带 Etag                              "6ad44d94-e"
+  ✅ WebDAV PUT 目录 → 405                            HTTP 405
+  ✅ WebDAV OPTIONS 目录                              HTTP 200
+  ✅   DAV: 1, 2                                    1, 2
+  ✅   MS-Author-Via: DAV                           DAV
+  ✅   Allow(目录) 完整                                 OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND
+  ✅   Allow(文件) 完整                                 OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT
+  ✅ WebDAV 未鉴权 → 401                               HTTP 401
+  ✅   WWW-Authenticate realm                       Basic realm="openlist"
+  ✅ WebDAV PROPFIND Depth=2 → 400                  HTTP 400
+  ✅ WebDAV HEAD 目录 → 200                           HTTP 200
+  ✅   Content-Type: httpd/unix-directory           httpd/unix-directory
+  ✅ WebDAV GET 目录 → 405                            HTTP 405
+  ✅ WebDAV Range（远程：第一跳 200/206/302）               HTTP 206
+  ℹ️ 远程本端代理 Range → 上游说 206（照抄，不断言）
+  ℹ️ 远程 Range 越界 → 第一跳 200（照抄，不断言）
+  ✅ WebDAV MOVE 自身 → 403                           HTTP 403
+  ✅ WebDAV MKCOL                                   HTTP 405
+  ✅ 清理临时目录 olz-e2e-1792298378                      
+  -- 挂载点 /wo（临时目录 olz-e2e-1792298400）
+  ✅ mkdir                                          success
+  ✅ 上传 a.txt                                       HTTP 200 code=200
+  ✅ 上传后能看到 a.txt                                   1 条
+  ✅ mkdir sub                                      success
+  ✅ mkdir sub 后等可见（最终一致性）                          
+  ✅ copy a.txt -> sub/                             success
+  ✅ copy 产物出现在 sub/                                
+  ✅ copy 后源文件保留                                    
+  ✅ 重命名 a.txt -> b.txt                             success
+  ✅ 重命名生效                                          
+  ✅ 移动到 sub/                                       success
+  ✅ 移动生效                                           
+  ✅ 删除文件                                           success
+  ✅ 删除生效                                           
+  ✅ WebDAV PUT                                     HTTP 201
+  ✅ WebDAV PUT 生效                                  
+  ✅ WebDAV PUT 覆盖 → 201                            HTTP 201
+  ✅ WebDAV PUT 带 Etag                              "6ad44da8-e"
+  ✅ WebDAV PUT 目录 → 405                            HTTP 405
+  ✅ WebDAV OPTIONS 目录                              HTTP 200
+  ✅   DAV: 1, 2                                    1, 2
+  ✅   MS-Author-Via: DAV                           DAV
+  ✅   Allow(目录) 完整                                 OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND
+  ✅   Allow(文件) 完整                                 OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT
+  ✅ WebDAV 未鉴权 → 401                               HTTP 401
+  ✅   WWW-Authenticate realm                       Basic realm="openlist"
+  ✅ WebDAV PROPFIND Depth=2 → 400                  HTTP 400
+  ✅ WebDAV HEAD 目录 → 200                           HTTP 200
+  ✅   Content-Type: httpd/unix-directory           httpd/unix-directory
+  ✅ WebDAV GET 目录 → 405                            HTTP 405
+  ✅ WebDAV Range（远程：第一跳 200/206/302）               HTTP 206
+  ℹ️ 远程本端代理 Range → 上游说 206（照抄，不断言）
+  ℹ️ 远程 Range 越界 → 第一跳 404（照抄，不断言）
+  ✅ WebDAV MOVE 自身 → 403                           HTTP 403
+  ✅ WebDAV MKCOL                                   HTTP 405
+  ✅ 清理临时目录 olz-e2e-1792298400                      
+  -- 挂载点 /hikvision（临时目录 olz-e2e-1792298419）
+  ✅ mkdir                                          success
+  ✅ 上传 a.txt                                       HTTP 200 code=200
+  ✅ 上传后能看到 a.txt                                   1 条
+  ✅ mkdir sub                                      success
+  ✅ mkdir sub 后等可见（最终一致性）                          
+  ✅ copy a.txt -> sub/                             success
+  ✅ copy 产物出现在 sub/                                
+  ✅ copy 后源文件保留                                    
+  ✅ 重命名 a.txt -> b.txt                             success
+  ✅ 重命名生效                                          
+  ✅ 移动到 sub/                                       success
+  ✅ 移动生效                                           
+  ✅ 删除文件                                           success
+  ✅ 删除生效                                           
+  ✅ WebDAV PUT                                     HTTP 201
+  ✅ WebDAV PUT 生效                                  
+  ✅ WebDAV PUT 覆盖 → 201                            HTTP 201
+  ✅ WebDAV PUT 带 Etag                              "6ad44db2-e"
+  ✅ WebDAV PUT 目录 → 405                            HTTP 405
+  ✅ WebDAV OPTIONS 目录                              HTTP 200
+  ✅   DAV: 1, 2                                    1, 2
+  ✅   MS-Author-Via: DAV                           DAV
+  ✅   Allow(目录) 完整                                 OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND
+  ✅   Allow(文件) 完整                                 OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT
+  ✅ WebDAV 未鉴权 → 401                               HTTP 401
+  ✅   WWW-Authenticate realm                       Basic realm="openlist"
+  ✅ WebDAV PROPFIND Depth=2 → 400                  HTTP 400
+  ✅ WebDAV HEAD 目录 → 200                           HTTP 200
+  ✅   Content-Type: httpd/unix-directory           httpd/unix-directory
+  ✅ WebDAV GET 目录 → 405                            HTTP 405
+  ✅ WebDAV Range → 206                             HTTP 206
+  ✅   Content-Range                                bytes 0-4/14
+  ✅   Accept-Ranges: bytes                         bytes
+  ✅   Range 正文 5 字节                                5 字节
+  ✅ WebDAV Range 越界 → 416                          HTTP 416
+  ✅   416 带 Content-Range: bytes */14              bytes */14
+  ✅ WebDAV GET 带 Etag                              "6ad44db2-e"
+  ✅ WebDAV If-None-Match → 304                     HTTP 304
+  ✅ WebDAV MOVE 自身 → 403                           HTTP 403
+  ✅ WebDAV MKCOL                                   HTTP 405
+  ✅ 清理临时目录 olz-e2e-1792298419                      
+
+=== 5. 边界与稳定性 ===
+
+=== 5.0 /p/ 代理端点 + 签名过期 ===
+  ✅ /p/ 本地 txt → 200 + 正文                          HTTP 200, b'proxy probe text\n'
+  ✅   Content-Type 是 text/*                        text/plain; charset=utf-8
+  ✅ /p/ sign 绑定路径（跨文件 → 401）                       HTTP 401
+  ✅ /p/ 本地未知扩展名 → 200（must_proxy）                  HTTP 200, b'BIN\x00\x01'
+  ✅ /p/ 目录（sign 路径不匹配 → 401）                       HTTP 401
+  ✅ /p/ 不存在（sign 路径不匹配 → 401）                      HTTP 401
+  ✅ sign 过期（:1） → 401                              HTTP 401
+  ✅   /p/ 同样拒绝                                     HTTP 401
+  ✅ sign 无冒号 → 401                                 HTTP 401
+  ✅   /p/ 同样拒绝                                     HTTP 401
+  ✅ sign 非法 expire（:abc） → 401                     HTTP 401
+  ✅   /p/ 同样拒绝                                     HTTP 401
+  ✅ 未登录 fs/list 被拒                                 code=401
+  ✅   HTTP 仍为 200（Go 信封）                           HTTP 200
+  ✅ 未登录管理 API 被拒                                   code=401
+  ✅   HTTP 仍为 200（Go 信封）                           HTTP 200
+  ✅ 未注册 /api/* → 200 + SPA shell                   HTTP 200, 4514 字节
+  ✅ 未注册 /api/* 非 GET/POST → 405                    HTTP 405
+  ✅ 空 path 当根（对齐 Go）                               code=200
+  ✅ fs/get 空 path 当根（对齐 Go）                        code=200
+  ✅ 路径穿越 .. → 403                                  code=403
+  ✅   403 也是 HTTP 200（Go 信封）                       HTTP 200
+  ✅ 不存在的路径 → 404                                   code=404
+  ✅ 非法 JSON body → 4xx                             code=400
+  ✅ Range 越界 → 416                                 HTTP 416
+  ✅ Range 非法格式 → 回落 200                            HTTP 200
+  ✅ 下载目录（sign_all 部署 → 401 先于 400）                 HTTP 401
+  ✅ 13 挂载点并发 list                                  全部成功
+
+=== 汇总 ===
+通过 460，失败 1，跳过 2
+  ❌ WebDAV GET 目录 → 405
+  ⚠️ mkdir sub 未同步可见 @ecloud_family（189 上游最终一致性）
+  ⚠️ 清理临时目录 olz-e2e-1792298182（坚果云根级目录 403，需 WEB 手动删）

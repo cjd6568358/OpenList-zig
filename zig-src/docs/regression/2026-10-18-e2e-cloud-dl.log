@@ -1,0 +1,78 @@
+=== 0. 准备：初始化/登录 ===
+  ✅ 登录拿到 token                                     
+
+=== 0.5 等待存储初始化 ===
+  ✅ 挂载点已发布                                         12 个: ecloud_family, ecloud_self, hikvision, 123_2763, 123_5137, jianguo, aliyun, koofr, quark, 115, uc, wo
+
+=== 1. 列目录 ===
+  ✅ 虚拟根列出挂载点                                       挂载: ecloud_family, ecloud_self, hikvision, 123_2763, 123_5137, jianguo, aliyun, koofr, quark, 115, uc, wo
+  ✅ list /quark                                    16 条
+  ✅ list /115                                      0 条
+  ✅ list /uc                                       2 条
+  ✅ list /wo                                       20 条
+
+=== 2. 详情 / 下载 / Range ===
+  ✅ fs/get /hikvision/probe.txt                    size=14 type=4
+  ✅ fs/get 带 raw_url                               /p/hikvision/probe.txt?sign=gkFLN_I2po4v2mcbY13BiD22nw28_ULO
+  ✅ 下载 /d/hikvision/probe.txt                      HTTP 200, 14 字节 (sign)
+  ✅ Range 206                                      HTTP 206, 4 字节
+  ✅ 篡改的 sign 被拒                                    HTTP 401
+
+=== 2b. 定向下载（115,quark,uc,wo）===
+  ⚠️ 跳过 定向下载 /115                                      没有 <2MB 的文件
+  ✅ fs/get /quark/sn.img                           size=5386 type=0
+  ✅ fs/get 带 raw_url                               https://dl-pc-zb.drive.quark.cn/SMLYJDWg/862384553/63a8e29c5
+  ✅ 下载 /d/quark/sn.img                             HTTP 200, 5386 字节 (sign)
+  ✅ Range 206                                      HTTP 206, 4 字节
+  ✅ 篡改的 sign 被拒                                    HTTP 401
+  ⚠️ 跳过 定向下载 /uc                                       没有 <2MB 的文件
+  ✅ fs/get /wo/1000014114.jpg                      size=59131 type=5
+  ✅ fs/get 带 raw_url                               https://du.smartont.net:8445/openapi/download?fid=hPsNb_9vW3
+  ✅ 下载 /d/wo/1000014114.jpg                        HTTP 302 -> 上游直链 https://du.smartont.net:8445/openapi/download?fid=FFQcg_TzDy
+  ✅ 篡改的 sign 被拒                                    HTTP 401
+
+=== 3. WebDAV 读 ===
+  ✅ PROPFIND /dav/                                 HTTP 207
+  ✅ PROPFIND /hikvision/probe.txt                  HTTP 207
+  ✅ WebDAV GET                                     HTTP 200, 14 字节
+
+=== 4. 写操作 ===
+  ❌ 存在可写挂载点                                        没找到 hikvision
+
+=== 5. 边界与稳定性 ===
+
+=== 5.0 /p/ 代理端点 + 签名过期 ===
+  ✅ /p/ 本地 txt → 200 + 正文                          HTTP 200, b'proxy probe text\n'
+  ✅   Content-Type 是 text/*                        text/plain; charset=utf-8
+  ✅ /p/ sign 绑定路径（跨文件 → 401）                       HTTP 401
+  ✅ /p/ 本地未知扩展名 → 200（must_proxy）                  HTTP 200, b'BIN\x00\x01'
+  ✅ /p/ 目录（sign 路径不匹配 → 401）                       HTTP 401
+  ✅ /p/ 不存在（sign 路径不匹配 → 401）                      HTTP 401
+  ✅ sign 过期（:1） → 401                              HTTP 401
+  ✅   /p/ 同样拒绝                                     HTTP 401
+  ✅ sign 无冒号 → 401                                 HTTP 401
+  ✅   /p/ 同样拒绝                                     HTTP 401
+  ✅ sign 非法 expire（:abc） → 401                     HTTP 401
+  ✅   /p/ 同样拒绝                                     HTTP 401
+  ✅ 未登录 fs/list 被拒                                 code=401
+  ✅   HTTP 仍为 200（Go 信封）                           HTTP 200
+  ✅ 未登录管理 API 被拒                                   code=401
+  ✅   HTTP 仍为 200（Go 信封）                           HTTP 200
+  ✅ 未注册 /api/* → 200 + SPA shell                   HTTP 200, 4514 字节
+  ✅ 未注册 /api/* 非 GET/POST → 405                    HTTP 405
+  ✅ 空 path 当根（对齐 Go）                               code=200
+  ✅ fs/get 空 path 当根（对齐 Go）                        code=200
+  ✅ 路径穿越 .. → 403                                  code=403
+  ✅   403 也是 HTTP 200（Go 信封）                       HTTP 200
+  ✅ 不存在的路径 → 404                                   code=404
+  ✅ 非法 JSON body → 4xx                             code=400
+  ✅ Range 越界 → 416                                 HTTP 416
+  ✅ Range 非法格式 → 回落 200                            HTTP 200
+  ✅ 下载目录（sign_all 部署 → 401 先于 400）                 HTTP 401
+  ✅ 12 挂载点并发 list                                  全部成功
+
+=== 汇总 ===
+通过 52，失败 1，跳过 2
+  ❌ 存在可写挂载点
+  ⚠️ 定向下载 /115（无 <2MB 文件，避免拖慢回归）
+  ⚠️ 定向下载 /uc（无 <2MB 文件，避免拖慢回归）
