@@ -447,13 +447,6 @@ on:
         default: "https://cdn.jsdelivr.net/npm/@openlist-frontend/openlist-frontend@latest/dist"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: write
-
-concurrency:
   # 同一分支连推两次会取消上一次运行（cancel-in-progress）。
   # ⚠ 被取消的运行可能已经建好 ci-<sha> Release、传了部分 asset 就停了，
   #   且不会再补齐（summarize 也不会跑）—— 那个 commit 的 Release 是残缺的。
