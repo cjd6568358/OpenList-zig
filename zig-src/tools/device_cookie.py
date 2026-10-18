@@ -9,8 +9,9 @@
 教训：**调试脚本只认设备上的实时配置**，本机临时文件随时可能过期。
 """
 import json
+from creds import root_pwd as _root_pwd
 
-HOST, PORT, USER, PASSWORD = "192.168.1.1", 10022, "root", "REDACTED"
+HOST, PORT, USER, PASSWORD = "192.168.1.1", 10022, "root", _root_pwd()
 
 
 def device_cfg():

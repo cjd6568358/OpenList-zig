@@ -9,12 +9,13 @@ cookie 从 /tmp/olz/cfg.json 提取后只在设备侧 shell 变量里流转，�
 响应体拉回本机后先脱敏再打印。
 """
 import json
+from creds import root_pwd as _root_pwd
 import re
 import sys
 
 import paramiko
 
-HOST, PORT, USER, PWD = "192.168.1.1", 10022, "root", "REDACTED"
+HOST, PORT, USER, PWD = "192.168.1.1", 10022, "root", _root_pwd()
 UA = "Mozilla/5.0 115Browser/35.6.0.3"  # pan115.zig app_ver
 
 

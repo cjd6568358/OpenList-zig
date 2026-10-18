@@ -19,3 +19,6 @@ __pycache__/
 /web_main.js
 /h5_*.js
 /fix_test_block.py
+
+# 仓库内可选的本地凭据（首选 ~/.olz_root_pwd，仓库外）
+tools/.root_pwd

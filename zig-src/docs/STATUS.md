@@ -73,7 +73,7 @@
 
 ## 5. 工程约定（硬规则）
 
-- **⚠️ 本地需要打包 / 编译时，务必一律走打包编译机 `10.0.0.4`（工作目录 `/tmp`，即 `tools/build_remote.py` 用的 `/tmp/olz-build`）—— 这是唯一交付路径。** 原因：本地机器**性能不行、磁盘空间不够**。打包机 Debian 13 x86_64，root/REDACTED；zig 0.17.0 在 `/root/.cache`（只读使用）。**本机产物只能自测，不能当交付。**
+- **⚠️ 本地需要打包 / 编译时，务必一律走打包编译机 `10.0.0.4`（工作目录 `/tmp`，即 `tools/build_remote.py` 用的 `/tmp/olz-build`）—— 这是唯一交付路径。** 原因：本地机器**性能不行、磁盘空间不够**。打包机 Debian 13 x86_64，root/（口令见 ~/.olz_root_pwd）；zig 0.17.0 在 `/root/.cache`（只读使用）。**本机产物只能自测，不能当交付。**
 - **Zig 0.17.0 硬下界**。**本机当前没有 Zig 工具链**（`~/.workbuddy-ai/binaries/` 下只有 git/go/node/python），`zig test` 与交叉编译都只能在打包机跑 —— 一条命令走 `tools/build_remote.py`（打包源码 → 打包机 test → 交叉编译 → 取回，全包）。
 - **本机 D 盘不能 `zig build`**（maker.exe 无法在 D 盘建子进程）→ 一律 `zig build-exe`/`zig test` 直接调用 + 独立 `ZIG_GLOBAL_CACHE_DIR` + 非沙箱执行。
 - **每个驱动必须有单元测试**（`std.testing.allocator` 抓泄漏）。提交前 `zig test` 与交叉编译都要过。

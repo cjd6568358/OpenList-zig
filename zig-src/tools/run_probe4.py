@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """probe4 对照实验：timeout=0 vs timeout=60 各 3 次，抓包 + keys4.log。"""
 import json
+from creds import root_pwd as _root_pwd
 import os
 import sys
 import time
@@ -40,7 +41,7 @@ def main():
 
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect("10.0.0.4", port=22, username="root", password="REDACTED",
+    c.connect("10.0.0.4", port=22, username="root", password=_root_pwd(),
               timeout=20, look_for_keys=False, allow_agent=False)
     sftp = c.open_sftp()
     sftp.get("/tmp/olz-build/https_probe4", "dist/https_probe4")
@@ -52,7 +53,7 @@ def main():
 
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect("192.168.1.1", port=10022, username="root", password="REDACTED",
+    c.connect("192.168.1.1", port=10022, username="root", password=_root_pwd(),
               timeout=20, look_for_keys=False, allow_agent=False)
     sftp = c.open_sftp()
     sftp.put("dist/https_probe4", "/tmp/probe/https_probe4")

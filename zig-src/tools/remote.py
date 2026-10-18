@@ -4,7 +4,7 @@ Usage:
     python tools/remote.py <host> [port] <command...>        # run a command
     python tools/remote.py <host> [port] --put <local> <remote> [mode]
 
-Credentials default to the shared build-host account (root / REDACTED),
+Credentials default to the shared build-host account (root / <见 ~/.olz_root_pwd>),
 which the ONT container also uses.
 
 **Remote paths must be passed WITHOUT a leading slash** ("tmp/olz/x", not
@@ -23,13 +23,14 @@ with a *nonexistent parent directory* kills the whole SSH session
 (EOFError) instead of returning a clean SFTP error, so never probe paths.
 """
 import re
+from creds import root_pwd as _root_pwd
 import socket
 import sys
 
 import paramiko
 
 USER = "root"
-PWD = "REDACTED"
+PWD = _root_pwd()
 DEFAULT_PORT = 22
 
 # Hard bound on every remote command. Previously `sh()` had no timeout at

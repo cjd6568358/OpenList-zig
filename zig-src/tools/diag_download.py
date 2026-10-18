@@ -7,6 +7,7 @@ request sent / receiveHead failed / got head），定位 WriteFailed
 发生在哪一级。
 """
 import json
+from creds import root_pwd as _root_pwd
 import sys
 import urllib.request
 import urllib.error
@@ -78,7 +79,7 @@ def main():
     # 抓设备日志
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect("192.168.1.1", port=10022, username="root", password="REDACTED",
+    c.connect("192.168.1.1", port=10022, username="root", password=_root_pwd(),
               timeout=20, look_for_keys=False, allow_agent=False)
     _, o, e = c.exec_command("cat /tmp/olz/run.log", timeout=30)
     log = o.read().decode(errors="replace")

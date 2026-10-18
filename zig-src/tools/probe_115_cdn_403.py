@@ -9,13 +9,14 @@
 （e2e 的 PUT→GET 序列本身在跟上游赛跑）。
 """
 import base64
+from creds import root_pwd as _root_pwd
 import json
 import sys
 import time
 
 import paramiko
 
-HOST, PORT, USER, PWD = "192.168.1.1", 10022, "root", "REDACTED"
+HOST, PORT, USER, PWD = "192.168.1.1", 10022, "root", _root_pwd()
 BASE = "http://127.0.0.1:15399"
 PW = "e2e-test-123456"
 UA_115 = "Mozilla/5.0 115Browser/35.6.0.3"

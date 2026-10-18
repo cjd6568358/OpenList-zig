@@ -247,7 +247,7 @@ python tools/import_go_config.py <backup.json> <out_config.json> \
 
 ## 6. 环境速查
 
-**测试机（光猫，SSH 192.168.1.1:10022，root / REDACTED）**
+**测试机（光猫，SSH 192.168.1.1:10022，root / （口令见 ~/.olz_root_pwd））**
 - 测试实例：`/tmp/olz`（tmpfs，重启即失），端口 15399
 - **生产 Go 实例**：`/opt/sq/openlist/openlist` + `/opt/armbian/bin/openlist/config.json`
   ⚠ **绝不能碰**（2026-10-15 误杀过一次，见 STATUS.md 事故记录）

@@ -5,13 +5,14 @@
 还是「列表链路坏了」。
 """
 import json
+from creds import root_pwd as _root_pwd
 import re
 import sys
 import time
 
 import paramiko
 
-HOST, PORT, USER, PWD = "192.168.1.1", 10022, "root", "REDACTED"
+HOST, PORT, USER, PWD = "192.168.1.1", 10022, "root", _root_pwd()
 BASE = "http://127.0.0.1:15399"
 UA = "Mozilla/5.0 115Browser/35.6.0.3"
 PW = "e2e-test-123456"

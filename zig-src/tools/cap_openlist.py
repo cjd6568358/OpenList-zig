@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """抓 openlist 实际下载失败的线路包：tcpdump(ppp0,443) + 触发 /d/quark 下载。"""
 import json
+from creds import root_pwd as _root_pwd
 import os
 import sys
 import time
@@ -36,7 +37,7 @@ def main():
 
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect("192.168.1.1", port=10022, username="root", password="REDACTED",
+    c.connect("192.168.1.1", port=10022, username="root", password=_root_pwd(),
               timeout=20, look_for_keys=False, allow_agent=False)
 
     def sh(cmd, timeout=40):

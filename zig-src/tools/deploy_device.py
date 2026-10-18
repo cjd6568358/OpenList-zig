@@ -59,6 +59,7 @@ frontend loads instead and brings its own wizard; you'd then be testing that,
 not this build's shell.)
 """
 import argparse
+from creds import root_pwd as _root_pwd
 import json
 import os
 import sys
@@ -68,7 +69,7 @@ import paramiko
 HOST = "192.168.1.1"
 PORT = 10022
 USER = "root"
-PASSWORD = "REDACTED"
+PASSWORD = _root_pwd()
 ISOLATED = "/tmp/olz"  # tmpfs; the only place this script writes
 DEFAULT_BIN = "dist/openlist-aarch64"
 

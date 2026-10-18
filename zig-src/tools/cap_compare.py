@@ -5,6 +5,7 @@
 拉回本机解析：记录尺寸序列、服务器是否有任何回包（ACK 之外）、时序。
 """
 import json
+from creds import root_pwd as _root_pwd
 import os
 import struct
 import sys
@@ -97,7 +98,7 @@ def main():
 
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect("192.168.1.1", port=10022, username="root", password="REDACTED",
+    c.connect("192.168.1.1", port=10022, username="root", password=_root_pwd(),
               timeout=20, look_for_keys=False, allow_agent=False)
     sftp = c.open_sftp()
     with sftp.open("/tmp/probe/cap_run.sh", "w") as f:

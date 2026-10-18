@@ -6,10 +6,11 @@
 分别用两种 cookie 打同一个 URL，对比响应。
 """
 import sys
+from creds import root_pwd as _root_pwd
 
 import paramiko
 
-HOST, PORT, USER, PWD = "192.168.1.1", 10022, "root", "REDACTED"
+HOST, PORT, USER, PWD = "192.168.1.1", 10022, "root", _root_pwd()
 UA = "Mozilla/5.0 115Browser/35.6.0.3"
 URL = ("https://webapi.115.com/files?aid=1&cid=0&o=user_ptime&asc=1&offset=0"
        "&show_dir=1&limit=1000&snap=0&natsort=0&record_open_time=1&format=json&fc_mix=0")

@@ -9,13 +9,14 @@ GET：curl 默认 / 115Browser（驱动同款）/ Python-urllib（e2e 同款）�
 若只有 115Browser 成功 ⇒ 403 是上游 UA 策略，Go/Zig 行为一致。
 """
 import base64
+from creds import root_pwd as _root_pwd
 import json
 import sys
 import time
 
 import paramiko
 
-HOST, PORT, USER, PWD = "192.168.1.1", 10022, "root", "REDACTED"
+HOST, PORT, USER, PWD = "192.168.1.1", 10022, "root", _root_pwd()
 BASE = "http://127.0.0.1:15399"
 PW = "e2e-test-123456"
 UA_115 = "Mozilla/5.0 115Browser/35.6.0.3"

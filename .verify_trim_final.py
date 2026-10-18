@@ -47,7 +47,7 @@ def probe(path, token=None):
 def main():
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect(HOST, port=PORT, username="root", password="REDACTED", timeout=20,
+    c.connect(HOST, port=PORT, username="root", password=os.environ.get("OLZ_ROOT_PWD", ""), timeout=20,
               look_for_keys=False, allow_agent=False)
     try:
         # 先清掉上一次可能残留的进程/文件：否则 SFTP put 会撞上仍被进程持有的

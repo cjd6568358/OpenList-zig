@@ -10,6 +10,7 @@ A/B 设计：
 只读使用生产二进制；不碰 15244 与 /tmp/olz；凭据不回显。
 """
 import base64
+from creds import root_pwd as _root_pwd
 import json
 import time
 import urllib.error
@@ -17,7 +18,7 @@ import urllib.request
 
 import paramiko
 
-DEV = ("192.168.1.1", 10022, "root", "REDACTED")
+DEV = ("192.168.1.1", 10022, "root", _root_pwd())
 GO_BASE = "http://192.168.1.1:15398"
 ZIG_BASE = "http://192.168.1.1:15399"
 FILE = "olz-goab-ab.txt"

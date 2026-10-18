@@ -7,6 +7,7 @@
 用 curl 配置文件（-K）承载 URL/头，规避 shell 引号与行长限制。
 """
 import json
+from creds import root_pwd as _root_pwd
 import subprocess
 import sys
 import time
@@ -64,7 +65,7 @@ def main():
 
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect("192.168.1.1", port=10022, username="root", password="REDACTED",
+    c.connect("192.168.1.1", port=10022, username="root", password=_root_pwd(),
               timeout=20, look_for_keys=False, allow_agent=False)
     sftp = c.open_sftp()
     with sftp.open("/tmp/olz/curl.cfg", "w") as f:

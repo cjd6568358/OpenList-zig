@@ -1,6 +1,7 @@
 import sys, json, paramiko
+import os
 c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-c.connect("192.168.1.1", port=10022, username="root", password="REDACTED", timeout=20,
+c.connect("192.168.1.1", port=10022, username="root", password=os.environ.get("OLZ_ROOT_PWD", ""), timeout=20,
           look_for_keys=False, allow_agent=False)
 sftp = c.open_sftp()
 sftp.put("zig-src/dist/openlist-aarch64.trimmed", "tmp/olz/openlist.trimmed")

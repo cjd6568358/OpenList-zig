@@ -9,12 +9,13 @@ diag 日志没打出来 ⇒ 失败在 rapidUpload 之前。本脚本把「哪一
 用法： python tools/probe_115_put.py
 """
 import json
+from creds import root_pwd as _root_pwd
 import sys
 import time
 
 import paramiko
 
-HOST, PORT, USER, PWD = "192.168.1.1", 10022, "root", "REDACTED"
+HOST, PORT, USER, PWD = "192.168.1.1", 10022, "root", _root_pwd()
 BASE = "http://127.0.0.1:15399"
 PW = "e2e-test-123456"
 
