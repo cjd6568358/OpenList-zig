@@ -100,6 +100,15 @@ concurrency:
 permissions:
   contents: write
 
+defaults:
+  # ★ 2026-10-18 修复：Zig 工程位于 zig-src/ 子目录，build.zig **不在仓库根**。
+  #   原先所有 `zig build` 都在 $GITHUB_WORKSPACE 根执行，第一个
+  #   "Show build.zig options" 步骤就因找不到 build.zig 而失败 —— 本
+  #   workflow 自创建起从未产出过任何镜像。设了 working-directory 后，
+  #   各 run 步骤里的相对路径（zig-out/、build/）自然落在 zig-src/ 下。
+  run:
+    working-directory: zig-src
+
 jobs:
   build:
     name: zig sqfs ${{ inputs.zig_version }} drivers=${{ inputs.drivers || '(all)' }}

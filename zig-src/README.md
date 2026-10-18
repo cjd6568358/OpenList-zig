@@ -105,10 +105,15 @@ tools/
   ziglib_patch.py       给 std TLS 打 ECDSA 套件补丁（quark 服务器需要）
 docs/
   STATUS.md             当前状态 + 编年日志（先看顶部「当前基线」）
-  AUDIT_2026-10-18-drivers.md  最新驱动维度对账（权威）
-  AUDIT_2026-10-1*.md   更早的审计快照（文首有「历史快照」横幅，已被取代）
+  AUDIT_2026-10-18-drivers.md  驱动维度对账（权威，逐条落地状态）
+  MODULAR_DRIVERS.md    .so 运行时插件可行性调研（结论：用编译期白名单）
+  regression/           真机 e2e 日志存档
 TODO.md                 待办（权威，仓库根目录）
 ```
+
+> 更早的 6 份审计（2026-10-11 台账/摘要、10-17 v1/v2、REVIEW v1/v2、DS 复核）
+> 已于 2026-10-18 清理，结论已并入 STATUS §28–§46；需要原文用
+> `git show 7356589e:<path>` 取回。
 
 ## 构建
 

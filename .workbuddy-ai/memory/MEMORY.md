@@ -121,7 +121,10 @@
 - **权威待办 = `zig-src/TODO.md`**；审计结论 = `zig-src/docs/STATUS.md`（§22/§23 边界与凭据表）。
 - 已知欠项：全驱动真实 API+UI 回归（凭据备份 `zig-src/openlist_backup_2026_10_16 13_53_16.json`）、
   `model.Storage` 无 `modified` 字段、配置项 `delayed_start`/`cors`/`tasks`。
-- **2026-10-17 差异审计 = `zig-src/docs/AUDIT_2026-10-17-v2.md`（v2，权威；v1/DS 报告已标注被取代）**。
+- **驱动维度差异审计 = `zig-src/docs/AUDIT_2026-10-18-drivers.md`（权威）**。
+  更早的 10-11 / 10-17（v1/v2）/ REVIEW / REVIEW-v1 / DS 六份审计已于 2026-10-18
+  清理（结论并入 STATUS §28–§46），需要原文用
+  `git show 7356589e:<path>` 取回。
   **P0 三项已修**（2026-10-17 深夜，均带回归测试，构建结果见 STATUS §37）：
   ① `pan123.zig` refetch 竞态（BatchState.refetch_arena + currentUrls 持 mu）
   ② `cloud189.zig`/`cloud189pc.zig` 所有权 bug（dupeStr/normalizeName 恒 dupe + thumb/hash 深拷）

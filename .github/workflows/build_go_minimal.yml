@@ -374,6 +374,10 @@ on:
   # 推送到 feat/zhijiadisk 分支就自动触发。
   # 想改分支只改这一行；想再支持别的分支就加成列表：
   #   branches: [feat/zhijiadisk, other-branch]
+  # ⚠ push 触发时 GitHub 的 `inputs` 上下文为**空**（dispatch 的 default:
+  #   不生效）—— build_sqfs job 的 "Normalize inputs" 步负责补齐同一套
+  #   默认值并硬校验 arch，删了它就会退回「空 drivers=全量、空 arch=amd64」
+  #   的静默错配置（2026-10-18 事故）。
   push:
     branches: [feat/zhijiadisk]
   # 保留手动触发，方便不改代码就重跑一次。
@@ -757,7 +761,9 @@ jobs:
           echo "::notice::release $tag 已更新：${asset}"
 
   build_sqfs:
-    name: sqfs ${{ inputs.arch }}
+    # arch 加 || 兜底：push 触发时 inputs.arch 为空，job 名会退化成 "sqfs "，
+    # 与实际构建架构脱节（2026-10-18 事故的可见症状之一）。
+    name: sqfs ${{ inputs.arch || 'linux-arm64' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -768,6 +774,71 @@ jobs:
 
       - uses: benjlevesque/short-sha@dbe07338b37c456ce06d23409b35a56a7815eef4 # v4.0
         id: short-sha
+
+      # ---- 输入归一化（本 workflow 同时挂在 push 上，push 时 inputs 全空）----
+      # ⚠ 2026-10-18 事故复盘：GitHub 的 `inputs` 上下文只在
+      #   workflow_dispatch / workflow_call 时填充。本 workflow 由
+      #   `on: push: branches: [feat/zhijiadisk]` 自动触发，此时
+      #   ${{ inputs.* }} 全是空串，上面写气的 default: 一个都不生效：
+      #     drivers 空    → gen_overlay.py 的 parse_list("") 返回 None ≡
+      #                      "keep all" → 87 个驱动全编入
+      #     strip_* 空    → [ "" = "true" ] 为假 → 离线下载 / ffmpeg 都没剥
+      #     db/search 空  → None → mysql / postgres 一个没摘
+      #     arch 空       → case "$TARGET" 四个分支全落空 → GOOS/GOARCH
+      #                      不设 → 在 x86_64 runner 上编出 linux/amd64
+      #   结果：名为「CDN + 裁剪驱动」的镜像实为**全量驱动 + amd64**，
+      #   与设备现役全量 arm64 镜像体积一致（20.3 MB vs 21,155,840 B），
+      #   且根本不能在光猫上运行；CI 还全绿（无任何步骤断言 arch / 裁剪生效）。
+      #   本步骤把默认值补齐并硬校验，把"空输入"从静默错误变成显式可见。
+      - name: Normalize inputs (push runs see empty inputs)
+        env:
+          DRIVERS: ${{ inputs.drivers }}
+          STRIP_OFFLINE: ${{ inputs.strip_offline }}
+          STRIP_FFMPEG: ${{ inputs.strip_ffmpeg }}
+          DB_BACKENDS: ${{ inputs.db_backends }}
+          SEARCH_BACKENDS: ${{ inputs.search_backends }}
+          STRIP_PROTOCOLS: ${{ inputs.strip_protocols }}
+          ARCH: ${{ inputs.arch }}
+          CDN: ${{ inputs.cdn }}
+        run: |
+          set -e
+          # 默认值与 workflow_dispatch 的 default: 逐字一致（改一处要改两处）
+          DRIVERS="${DRIVERS:-local,webdav,itvsh,aliyundrive_open,189,189pc,123,quark_uc,115,wopan,strm}"
+          STRIP_OFFLINE="${STRIP_OFFLINE:-true}"
+          STRIP_FFMPEG="${STRIP_FFMPEG:-true}"
+          DB_BACKENDS="${DB_BACKENDS:-sqlite}"
+          SEARCH_BACKENDS="${SEARCH_BACKENDS:-all}"
+          STRIP_PROTOCOLS="${STRIP_PROTOCOLS:-none}"
+          ARCH="${ARCH:-linux-arm64}"
+          CDN="${CDN:-https://cdn.jsdelivr.net/npm/@openlist-frontend/openlist-frontend@latest/dist}"
+
+          # arch 白名单硬校验：空 arch 曾让 case 静默落空、编出 runner 原生
+          # 架构的二进制。宁可在这里炸，也不要发一个上不了设备的镜像。
+          case "$ARCH" in
+            linux-arm64|linux-armv7|linux-amd64) ;;
+            *) echo "::error::unknown arch '$ARCH' (want linux-arm64|linux-armv7|linux-amd64)"; exit 1 ;;
+          esac
+          # 布尔输入只认 true/false；空串已被上面的 :- 兜底补掉，其余拼写
+          # （Yes/1/TRUE…）一律报错，不静默当 false 放过。
+          for v in "$STRIP_OFFLINE" "$STRIP_FFMPEG"; do
+            case "$v" in
+              true|false) ;;
+              *) echo "::error::strip flags must be true|false, got '$v'"; exit 1 ;;
+            esac
+          done
+
+          {
+            echo "DRIVERS=$DRIVERS"
+            echo "STRIP_OFFLINE=$STRIP_OFFLINE"
+            echo "STRIP_FFMPEG=$STRIP_FFMPEG"
+            echo "DB_BACKENDS=$DB_BACKENDS"
+            echo "SEARCH_BACKENDS=$SEARCH_BACKENDS"
+            echo "STRIP_PROTOCOLS=$STRIP_PROTOCOLS"
+            echo "ARCH=$ARCH"
+            echo "CDN=$CDN"
+            echo "COMPRESS=xz -b 1M -all-root"
+          } >> "$GITHUB_ENV"
+          echo "::notice::resolved: drivers=[$DRIVERS] offline=$STRIP_OFFLINE ffmpeg=$STRIP_FFMPEG db=$DB_BACKENDS search=$SEARCH_BACKENDS protocols=$STRIP_PROTOCOLS arch=$ARCH"
 
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -785,17 +856,10 @@ jobs:
       # 直接 ::error:: 失败，不会静默漏裁。
       - name: Generate build overlay
         id: overlay
-        # 输入一律经 env 传进来，**不要**在 run 里直接写 Actions 插值表达式：
-        # drivers 是自由文本，含引号或反引号时直接插值会破坏脚本（注入）。
-        # （本注释刻意不写那个表达式字面量 —— 即便在 shell 注释里，Actions
-        #   也会先解析一遍，见 build_minimal.yml 里同类提醒。）
-        env:
-          DRIVERS: ${{ inputs.drivers }}
-          STRIP_OFFLINE: ${{ inputs.strip_offline }}
-          STRIP_FFMPEG: ${{ inputs.strip_ffmpeg }}
-          DB_BACKENDS: ${{ inputs.db_backends }}
-          SEARCH_BACKENDS: ${{ inputs.search_backends }}
-          STRIP_PROTOCOLS: ${{ inputs.strip_protocols }}
+        # 输入不直接写 Actions 插值表达式：drivers 是自由文本，含引号或反引号
+        # 时直接插值会破坏脚本（注入）。改由上游 "Normalize inputs" 步归一化后
+        # 经 $GITHUB_ENV 注入 —— push 触发时 inputs.* 为空，直接取会拿到空串
+        # （2026-10-18 事故根因），归一化后此处必为非空合法值。
         run: |
           set -e
           mkdir -p build
@@ -1532,6 +1596,26 @@ jobs:
           cat build/overlay/meta.json
           cat "$OVERLAY"
 
+          # ---- 断言「裁剪真的按要求发生了」----
+          # 2026-10-18 事故里，drivers 输入为空被 parse_list 解释成 "keep
+          # all"，全程无任何步骤发现。这里钉一个不变量：meta.json 的
+          # drivers_full 必须与请求一致 —— 点名了具体名单就不是全量，请求
+          # all 才是全量。不符说明 overlay 生成逻辑漂移，打包前就炸掉，
+          # 而不是发一个「以为裁了其实没裁」的镜像出去。
+          python3 - <<'PY'
+          import json, os, sys
+          meta = json.load(open("build/overlay/meta.json"))
+          want = os.environ.get("DRIVERS", "").strip().lower()
+          want_full = want in ("", "all")
+          got = meta.get("drivers_full")
+          if got != want_full:
+              sys.exit(f"::error::trimming mismatch: DRIVERS={want!r} -> expect "
+                       f"drivers_full={want_full}, overlay meta says {got}")
+          n = len(meta.get("drivers", []))
+          print(f"::notice::trimming verified: {n} driver(s) compiled in, "
+                f"drivers_full={got}, rewrites={len(meta.get('rewrites', []))}")
+          PY
+
       # ---- 注意：这里刻意没有 "Setup web" 步骤 ----
       # build_minimal.yml 那一步会 bash build.sh release web 把前端下载到
       # public/dist，然后被 //go:embed 吸进二进制。本 workflow 要的是 CDN 版，
@@ -1540,18 +1624,21 @@ jobs:
 
       - name: Build (pure Go, CGO_ENABLED=0)
         env:
-          TARGET: ${{ inputs.arch }}
           OVERLAY: ${{ steps.overlay.outputs.overlay }}
           MODFILE: ${{ steps.overlay.outputs.modfile }}
         run: |
           set -e
-          case "$TARGET" in
+          # ARCH 来自 "Normalize inputs" 步（push 时 inputs.arch 为空，直接用
+          # 会让 case 静默落空、编出 runner 原生 amd64 —— 2026-10-18 事故）。
+          # 该步已做白名单硬校验，这里的 case 理论上不会落空。
+          case "$ARCH" in
             linux-arm64) export GOARCH=arm64; unset GOARM ;;
             linux-armv7) export GOARCH=arm;   export GOARM=7 ;;
             linux-amd64) export GOARCH=amd64; unset GOARM ;;
           esac
           export GOOS=linux
           export CGO_ENABLED=0
+          echo "::notice::target=$ARCH -> $GOOS/$GOARCH (drivers=$DRIVERS)"
 
           # ⚠ LDFLAGS 只放**链接器**参数。-trimpath 不是链接器参数（它属于
           #   go build），写进来会让 `go tool link` 报 "flag provided but not
@@ -1576,6 +1663,22 @@ jobs:
           fi
           go build "${args[@]}"
           ls -l build/openlist
+
+          # ---- 断言产物架构与请求一致 ----
+          # 双保险：归一化步校验输入，这里校验输出。空 arch 事故的直接后果
+          # 就是交付了一个 amd64 镜像；Machine 头对不上就在这里炸。
+          want_machine=$(case "$ARCH" in
+            linux-arm64) echo "AArch64" ;;
+            linux-armv7) echo "ARM" ;;
+            linux-amd64) echo "Advanced Micro Devices X86-64" ;;
+          esac)
+          if readelf -h build/openlist | grep -q "Machine:.*$want_machine"; then
+            echo "::notice::arch verified: $(readelf -h build/openlist | grep 'Machine:')"
+          else
+            echo "::error::binary arch mismatch: ARCH=$ARCH wants '$want_machine'"
+            readelf -h build/openlist | grep 'Machine:' || true
+            exit 1
+          fi
 
       # ---- 打包 squashfs ----
       - name: Install squashfs-tools
@@ -1628,22 +1731,16 @@ jobs:
           esac
 
       - name: Publish to GitHub Release
-        # 同样经 env 传输入，避免自由文本（drivers）插值进 shell。
+        # 说明字段用的输入同样取自 "Normalize inputs" 归一化后的环境变量
+        # （push 触发时 inputs.* 为空，直接映射会让 Release 说明全栏空白 ——
+        # 2026-10-18 事故的可见症状；COMPRESS 当时更是从未被赋值）。
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ steps.short-sha.outputs.sha }}
-          TARGET: ${{ inputs.arch }}
-          DRIVERS: ${{ inputs.drivers }}
-          STRIP_OFFLINE: ${{ inputs.strip_offline }}
-          STRIP_FFMPEG: ${{ inputs.strip_ffmpeg }}
-          DB_BACKENDS: ${{ inputs.db_backends }}
-          SEARCH_BACKENDS: ${{ inputs.search_backends }}
-          STRIP_PROTOCOLS: ${{ inputs.strip_protocols }}
-          CDN: ${{ inputs.cdn }}
         run: |
           set -e
           tag="ci-sqfs-${SHA}"
-          name="openlist.sqfs_${TARGET}"
+          name="openlist.sqfs_${ARCH}"
           mv build/openlist.sqfs "build/${name}"
 
           gh release view "$tag" >/dev/null 2>&1 || \
@@ -1652,7 +1749,7 @@ jobs:
               --prerelease \
               --target "${GITHUB_SHA}" \
               --notes "$(printf 'CDN + 裁剪驱动的 squashfs 镜像。\n\n- commit: %s\n- 架构: %s\n- 驱动: %s\n- 离线下载: %s\n- ffmpeg: %s\n- 数据库后端: %s\n- 检索引擎: %s\n- 剥掉的服务端协议: %s\n- 压缩: %s\n- 前端 CDN: %s\n\n镜像内可执行文件名为 openlist，挂载到 /opt/sq/openlist 后直接运行。\n运行时必须配置 cdn（config.json 的 cdn 字段或环境变量 OPENLIST_CDN），否则启动会 Fatal。\n\n注意：\n1. 裁剪掉的驱动若在数据库中已有对应存储，启动时会报 no driver named: xxx，需先删除该存储记录。\n2. 未保留的数据库后端在运行时会被 fatal 拒绝（not supported database type）。\n3. 离线下载为 true 时 /api/fs/add_offline_download 返回业务码 400。\n4. ffmpeg 为 true 时视频缩略图不可用（图片/PDF 缩略图正常）。\n5. 服务端协议栏列出的是被剥掉的协议（none = 全保留）。被剥掉的协议路由仍然注册并返回 403，行为等同于运行时把 enable 设为 false；config.json 里的对应段仍存在但已失效。ftp 不可剥离（SFTP 的适配器建在 ftpserverlib 上），需要关闭请设 "ftp":{"enable":false}。\n\n精简方法论见 .github/workflows/build_sqfs.yml 头部文档。' \
-                "${GITHUB_SHA}" "${TARGET}" "${DRIVERS}" "${STRIP_OFFLINE}" "${STRIP_FFMPEG}" "${DB_BACKENDS}" "${SEARCH_BACKENDS}" "${STRIP_PROTOCOLS}" "${COMPRESS}" "${CDN}")"
+                "${GITHUB_SHA}" "${ARCH}" "${DRIVERS}" "${STRIP_OFFLINE}" "${STRIP_FFMPEG}" "${DB_BACKENDS}" "${SEARCH_BACKENDS}" "${STRIP_PROTOCOLS}" "${COMPRESS}" "${CDN}")"
 
           gh release upload "$tag" "build/${name}" --clobber
           echo "::notice::released ${tag}: ${name} ($(stat -c %s "build/${name}") bytes)"

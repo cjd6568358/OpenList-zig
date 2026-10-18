@@ -246,8 +246,9 @@ python tools/import_go_config.py <backup.json> <out_config.json> \
   数秒~数十秒，**立刻跑 e2e 会空挂载假失败** —— e2e 已加「0.5 等待存储
   初始化」轮询；另两处脚本加固：禁系统代理（跟随 /d/ 302 时会崩）、
   下载断言改第一跳（200 正文 / 302 校验 Location）。
-  审计与复核文档已全部整合进 `zig-src/docs/`（`AUDIT_2026-10-17-REVIEW.md`
-  为最终复核版；outputs/ 原稿仅存档案）。
+  审计与复核文档已收敛到 `zig-src/docs/AUDIT_2026-10-18-drivers.md`（权威）+
+  `docs/STATUS.md`（状态与编年日志）；更早的 6 份审计与 `outputs/` 原稿已于
+  2026-10-18 清理，需要时从 git 历史取回（`git show 7356589e:<path>`）。
 
 ---
 
