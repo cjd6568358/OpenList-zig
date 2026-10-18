@@ -1,286 +1,384 @@
-name: SquashFS Build (CDN + trimmed drivers)
+name: Go Minimal Build
 
-# ============================================================================
-#  OpenList 精简构建 · 方法论文档
-# ============================================================================
-#
-#  自包含：整个精简逻辑（约 470 行 Python）就内联在下面 "Generate build
-#  overlay" 那一步里，没有外部脚本。改驱动时不需要重新分析项目结构。
-#
-#  §0  想改驱动 / 改精简项时只看这一节
-#  ---------------------------------------------------------------------------
-#  改 workflow_dispatch 的输入即可。脚本会自动处理所有**连带关系**：
-#
-#    (a) drivers/all.go 的空导入列表    —— 你勾什么就留什么
-#    (b) core 里为类型断言硬 import 的驱动 —— 见 §4，脚本按勾选自动决定
-#    (c) 只服务于某个驱动的第三方库        —— 见 §5，脚本按勾选自动决定
-#
-#  默认已经打开的四项精简：
-#    drivers       14 个常用驱动（不含 s3 / thunderx 等 AWS 系）
-#    strip_offline true  整个离线下载功能
-#    strip_ffmpeg  true  ffmpeg（视频缩略图）
-#    db_backends   sqlite
-#
-#  另有可选的两项（默认关）：
-#    strip_protocols  none  服务端协议裁剪，可填 s3 / mcp（见 §12）
-#    search_backends  all   检索引擎裁剪，可填 db,db_non_full_text
-#
-#  改完驱动后唯一要自查的：**数据库里已有的存储记录**。被裁掉的驱动若还在
-#  storage 表里，启动会报 `no driver named: xxx`，需先删掉那条存储。
-#
-#  §1  为什么"去掉前端还有 80+ MB"
-#  ---------------------------------------------------------------------------
-#  不是你的代码大。62.81 MiB 的产物里，**Go 运行时元数据占 54.9%**，自研代码
-#  只占 2.3%。其中 `.gopclntab`（栈回溯/行号表）与 `.text` 几乎 1:1 等大，
-#  且 `-w -s` **剥不掉**——GC 扫栈和 panic traceback 都依赖它。
-#  实测基线（hello-world，同 Go 版本）：gopclntab/text = 1.05。这是 Go 1.27
-#  的普遍特性，不是本项目问题。
-#
-#  §2  体积构成（arm64 / 16 驱动 / CDN / 剥离离线下载 / -w -s，实测 62.81 MiB）
-#  ---------------------------------------------------------------------------
-#    .text         26.89 MB  40.8%   机器码，可归因
-#    .gopclntab    25.83 MB  39.2%   栈回溯表，不可剥离
-#    .go.type       5.94 MB   9.0%   类型元数据，不可剥离
-#    .rodata        3.52 MB   5.3%   只读数据 + 字符串池
-#    .noptrdata     2.86 MB   4.3%
-#    .data          0.61 MB   0.9%
-#
-#  按来源拆：Go 元数据 34.51 MiB(54.9%) / 第三方库 24.57 MiB(39.1%) /
-#            标准库 2.13 MiB(3.4%) / 自研 1.44 MiB(2.3%) / 头部对齐 0.16 MiB
-#
-#  复现方法见 §9。
-#
-#  §3  裁剪的放大倍率 —— 方法论核心
-#  ---------------------------------------------------------------------------
-#  **删掉 1 MB 代码，文件大约小 2.41 MB**（text 1.0 + pclntab 0.94 + types 0.39
-#  + 其它 0.08）。这是实测：87 驱动 → 16 驱动，.text −5.61 MB，.gopclntab
-#  −5.26 MB，文件共 −12.91 MiB。
-#
-#  但倍率**不是常数**。删 AWS SDK 时 .text 只降 2.42 MB，.gopclntab 降了
-#  4.21 MB（1.74 倍），整体倍率 3.35 倍。原因是 pclntab 有**每函数固定开销**
-#  （functab 8B + _func ~44B + pcfile/pcln 变长表），所以「大量小函数」的依赖
-#  （生成式 API 那种）代价被显著放大。
-#
-#  ⇒ 判断一个依赖值不值得删，**看它的函数数量，不能只看代码体积**。
-#
-#  §4  core 硬编码耦合清单 —— 改驱动时必看
-#  ---------------------------------------------------------------------------
-#  这些文件为了**类型断言**硬 import 了具体驱动，它们永远在依赖图里。
-#  只改 drivers/all.go 是裁不掉的。
-#
-#    文件                                        硬编码的驱动                        剥离条件
-#    ----------------------------------------    --------------------------------    ------------------
-#    internal/offline_download/tool/add.go       115 115_open 123 123_open          strip_offline=true
-#                                                guangyapan pikpak thunder
-#                                                thunder_browser thunderx
-#    internal/offline_download/tool/transfer.go  189pc (天翼云秒传)                   同上
-#    server/handles/offline_download.go          上述 9 个驱动 (各 Set* handler)      同上
-#    server/handles/torrent.go                   189pc (torrent CAS 秒传)            未勾选 189pc
-#    internal/search/util.go                     openlist (跨实例索引)                未勾选 openlist
-#    drivers/local/util.go                       ffmpeg-go (视频缩略图)              strip_ffmpeg=true
-#    internal/net/request.go                     aws-sdk-go (仅为 awsutil.Copy)      未勾选任何 AWS 系驱动
-#    internal/bootstrap/db.go                    mysql / postgres (gorm 驱动)        db_backends 未包含
-#    internal/search/import.go                   bleve / meilisearch                 search_backends 未包含
-#
-#  **AWS 系驱动**（勾了任意一个，aws-sdk-go 就必然在二进制里）：
-#      123  halalcloud  mediatrack  s3  teambition  thunder  thunder_browser  thunderx
-#
-#  §5  第三方库的连带关系（为什么一个小功能会拖进几 MB）
-#  ---------------------------------------------------------------------------
-#    gin/binding  → github.com/ugorji/go/codec  (2.93 MB，最大的单个第三方包)
-#                   只为 msgpack 绑定。Gin 自带 `//go:build nomsgpack` 开关，
-#                   OpenList 不用 msgpack ⇒ 构建时固定加 `-tags=nomsgpack`。
-#    drivers/local → github.com/u2takey/ffmpeg-go
-#                   ffmpeg-go 无条件 import aws-sdk-go（3 个 import），只为
-#                   `Output("s3://...")`，OpenList 走不到。
-#                   两种处理方式：
-#                     strip_ffmpeg=true  → 直接从 util.go 摘掉 ffmpeg，整个
-#                                          ffmpeg-go 不进二进制。**推荐**。
-#                     strip_ffmpeg=false → 保留视频缩略图，此时脚本会额外把
-#                                          ffmpeg-go 复制出来打补丁、走
-#                                          -modfile + replace（因为 -overlay
-#                                          改不了 GOMODCACHE）。
-#    internal/net/request.go → aws-sdk-go/aws/awsutil
-#                   仅 2 处 awsutil.Copy 深拷贝 HttpRequestParams{URL,Range,
-#                   HeaderRef,Size}；拷贝后只改 Range，浅拷贝语义等价。
-#    gorm 驱动     → sqlite(glebarez 纯 Go) / mysql / postgres(pgx)
-#    gorm 驱动     → mongo / bleve / meilisearch（见 internal/search）
-#
-#  §6  输入速查表
-#  ---------------------------------------------------------------------------
-#    drivers         保留的存储驱动（逗号/空格分隔，或 all = 全量 87 个）
-#                    可用名单：在仓库根跑
-#                      python3 build/gen_overlay.py --list-drivers
-#                    留空 = all
-#    strip_offline   true(默认) 移除整个离线下载功能 / false 保留
-#    strip_ffmpeg    true(默认) 移除 ffmpeg 与视频缩略图 / false 保留
-#    db_backends     保留的数据库后端，默认 sqlite
-#                    （已知：sqlite / mysql / postgres；多个用逗号，all = 全留）
-#    search_backends 保留的检索引擎，默认 all
-#                    （已知：bleve / meilisearch；db、db_non_full_text 恒留）
-#    strip_protocols 要剥掉的服务端协议，默认 none
-#                    （已知：s3 / mcp；ftp 不支持，原因见 §12）
-#    arch            linux-arm64(默认) / linux-armv7 / linux-amd64
-#    compress        none(默认) / upx —— 光猫场景请保持 none，见 §7
-#    cdn             前端 CDN 基址（只写进产物说明，运行时仍需配置）
-#
-#  §7  设备侧约束（中兴 F4610U，选错白跑）
-#  ---------------------------------------------------------------------------
-#    - 挂载点 /opt/sq/openlist，backing file /opt/armbian/bin/openlist/openlist.sqfs
-#      挂载：mount -t squashfs -o loop,ro <img> /opt/sq/openlist
-#    - **镜像内可执行文件必须叫 openlist**（openlist_start.sh 硬编码该路径）
-#      ⇒ mksquashfs 的源目录必须是 stage/openlist 本身，传父目录会让镜像里多
-#        一层 openlist/，挂载后路径变成 .../openlist/openlist。现役镜像
-#        inodes=2 即为此（根目录 + 该文件）。
-#    - **镜像内 openlist 必须可执行且属主 root**：openlist_start.sh 启动前有
-#      `[ ! -x "$APP" ]` 检查，不可执行直接拒绝启动。所以打包时
-#      `chmod 755` 源文件 + `mksquashfs -all-root`，并在打包后断言
-#      `-rwxr-xr-x root/root`，模式不对就让构建失败。
-#      （CI 里 mksquashfs 以 runner/uid 1001 运行，不加 -all-root 镜像里就是
-#        1001:1001，与设备现役镜像不一致。）
-#    - **必须 -b 1M**：128K 块会大 3.4 MiB
-#    - **不要加 -Xbcj arm**：对 AArch64 无效
-#    - 内核 4.1.25 已实测支持 squashfs + xz + 1M 块
-#    - **默认不开 UPX**：光猫上 UPX 的 stub 把整个解压体放进**匿名**内存，
-#      无 swap 不可回收，1:1 扣减可用内存。设备侧 2026-10-09 起已全面停用，
-#      改为 squashfs 挂载 raw 二进制（file-backed，可丢弃）。
-#      详见 server 仓库 0806/BUILD-ENV.md §3.3 / f4610u/F4610U.md §5-19。
-#
-#  §8  已知坑
-#  ---------------------------------------------------------------------------
-#    - **`-tags=jsoniter` 是死开关**：项目里没有任何 `jsoniter` build tag，
-#      带与不带产物**逐字节相同**（实测 65,863,840 == 65,863,840）。本 workflow
-#      不再传它。build.sh 里那行也可以删。
-#    - **`-trimpath` 不能写进 LDFLAGS**。它是 go build 的参数，不是链接器的；
-#      混进去会让 `go tool link` 报 "flag provided but not defined: -trimpath"
-#      并打出 usage。LDFLAGS 里只放 -s -w -X。
-#    - **`go build -overlay` 不能替换 GOMODCACHE 下的文件**，会报
-#      "Files beneath GOMODCACHE must not be replaced"。改第三方模块必须走
-#      -modfile + replace（strip_ffmpeg=false 时脚本会自动处理）。
-#    - **必须先 `go mod download`**：补丁 ffmpeg-go 要靠 `go list -m -f {{.Dir}}`
-#      定位模块源码，模块缓存为空时无法工作。workflow 里有 "Warm module cache"。
-#    - **`-w -s` 剥不掉 .gopclntab**，别指望靠它减体积。
-#    - **strip_ffmpeg 会破坏一个单元测试**：drivers/local/pdf_thumb_test.go 里
-#      `{name: "video", fileName: "movie.mp4", want: true}` 期望视频可缩略图。
-#      `go build` 不受影响（测试文件不参与编译），但本地跑 `go test ./drivers/local`
-#      会失败。那是 overlay 生效的预期结果。
-#    - **运行时必须配 CDN**：Cdn=="" 时会去 fs.Sub(static,"assets") 直接 Fatal。
-#      这个二进制不能当通用版发出去。环境变量是 `OPENLIST_CDN=`（不是裸 CDN=）。
-#    - **不要设 dist_dir**：一旦非空，CDN 分支失效，会回去读内嵌 index.html
-#      然后 Fatal。
-#    - **CDN 里别写 $version**：代码会把 $version 替换成 WebVersion 即 `rolling`，
-#      而 npm 上没有 rolling 这个 dist-tag。用 `@latest` 或写死版本号。
-#    - Go 版本必须 1.27.1：go.mod 要求 go 1.26.0 / toolchain go1.27.1。
-#      设备文档里「锁 go1.22.12 避 32MiB BSS 雷」的前提是 overcommit_memory=0；
-#      2026-10-09 实测已更正为 1，且现役 openlist 就是 go1.27.1 编的并正常运行。
-#      （那个 32 MiB 是 crypto/internal/fips140/drbg 的 ScratchBuffer[1<<25]，
-#        BSS 不占文件但首次用 crypto/rand 会真的提交约 32 MiB 物理内存。）
-#
-#  §9  怎么复现 §2 的体积分析
-#  ---------------------------------------------------------------------------
-#    1. 构建一份**带符号表**的同配置产物（不要加 -w -s）：
-#         go build -tags=nomsgpack -overlay=<overlay.json> -o /tmp/sym .
-#    2. ELF 段级结构：
-#         python3 build/_elfsec.py /tmp/sym
-#    3. 包/模块级归因：
-#         go tool nm -size /tmp/sym > /tmp/nm.txt
-#         go list -deps . > /tmp/deps.txt        # 必须在仓库根目录执行
-#         python3 build/_nmstat.py /tmp/nm.txt /tmp/deps.txt
-#    注意 `go tool nm -size` 的 size 字段是**十进制**，按十六进制解析会把总量
-#    放大 11 倍。这两个脚本在 build/ 下（该目录已被 .gitignore）。
-#    另外：**验证裁剪别用 `go version -m`** —— 它列的是 go.mod 模块图，不是
-#    实际链接的包。用 `go list -deps` 才是权威。
-#
-#  §10  实测瘦身阶梯（arm64 / CDN / -w -s / strip_offline）
-#  ---------------------------------------------------------------------------
-#    配置                                          裸二进制      sqfs[xz,-b 1M]
-#    ------------------------------------------    ----------    --------------
-#    基线（16 驱动 + -tags=jsoniter）               62.81 MiB      15.11 MiB
-#    + -tags=nomsgpack                              57.31 MiB      —
-#    + 去掉 aws-sdk-go（14 驱动，无 s3/thunderx）    49.50 MiB      —
-#    + db_backends=sqlite                           45.81 MiB      12.72 MiB
-#    + strip_ffmpeg=true                            45.56 MiB      —
-#
-#    合计 −17.25 MiB（−27.5%）。sqfs 约为裸二进制的 27.8%。
-#
-#  §11  相对 build_minimal.yml 还能怎么优化体积
-#  ---------------------------------------------------------------------------
-#    build_minimal.yml 是**通用多平台构建**，本 workflow 是**单一设备镜像**，
-#    因此可以放弃通用性换体积。按性价比排序：
-#
-#    1. 前端走 CDN（本 workflow 已做）—— 省最多，前端 dist 原本 ~55 MB 被
-#       //go:embed 吸进二进制。注意 CDN 版**必须**运行时配 cdn，且 WebVersion
-#       必须是 rolling。
-#    2. `-tags=nomsgpack`（已做）—— 省 5.50 MiB，摘掉 gin 的 msgpack 绑定
-#       连带 ugorji/go/codec 2.93 MB。
-#    3. 裁驱动（已做）—— 87→14 省 12.91 MiB。倍率 2.41x，见 §3。
-#    4. 去掉 aws-sdk-go（已做）—— 省 7.69 MiB。倍率 3.35x（函数多）。
-#       需要同时摘掉 request.go 的 awsutil 与 ffmpeg-go 的 3 个 import。
-#    5. db 只留 sqlite（已做）—— 省 3.69 MiB（mysql + pgx）。
-#    6. strip_offline（已做）—— 去掉整个离线下载功能与其 9 个硬编码驱动。
-#    7. strip_ffmpeg（已做）—— 只省 0.13 MiB（因为 aws-sdk-go 已在第 4 步
-#       去掉）。**真正的价值是消掉了 -modfile 模块补丁这一整块复杂度**。
-#    8. search_backends=db,db_non_full_text —— 去掉 bleve（68 个包）与
-#       meilisearch，省约 1.7 MiB。代价是失去全文检索。
-#    9. strip_protocols=s3,mcp —— 剥掉 S3 与 MCP 服务端协议，省 512 KiB
-#       裸二进制 / 约 125 KiB（xz 后）。**性价比最低的一项**（约占镜像 1%），
-#       见 §12；只想要"只保留 sftp"的语义用配置关掉就行，不必重新构建。
-#   10. CGO_ENABLED=0 纯 Go —— 已隐含（sqlite 走 glebarez 纯 Go 驱动），
-#       无 glibc 版本要求，体积通常还比 musl 版小。
-#   11. UPX —— **光猫上不要用**，见 §7。体积收益也要打折，因为前端/数据段
-#       已经压过。
-#
-#    想再往下压，只剩两条路：换更小的 Go 运行时（比如 -gcflags 调优不现实）、
-#    或者把部分驱动改成运行时插件（OpenList 无插件机制，需大改）。
-#
-#  §12  服务端协议裁剪（strip_protocols）
-#  ---------------------------------------------------------------------------
-#    OpenList 的四种服务端协议各有一个顶层文件 + 一个子包：
-#
-#      协议    顶层文件          子包            拉进来的第三方库
-#      S3      server/s3.go     server/s3/      gofakes3、ncw/swift/v2
-#      MCP     server/mcp.go    server/mcp/     （无，只用 gin + internal）
-#      FTP     server/ftp.go    ——              fclairamb/ftpserverlib
-#      SFTP    server/sftp.go   server/sftp/    sftpd-openlist、x/crypto/ssh
-#
-#    ★ 关键约束：**SFTP 摘不掉 ftpserverlib**。
-#      server/sftp.go:28 调 ftp.InitStage()、:75 用 ftp.NewAferoAdapter(ctx)，
-#      而 server/ftp/ 子包（afero.go / fsup.go / site.go）用的是
-#      ftpserver.FileTransfer / AnswerCommand / ClientDriver / StatusOK 这些
-#      **真实类型** —— SFTP 的适配器就建在 FTP 那套 afero 适配器上。
-#      ⇒ 剥掉 FTP 监听器只能省 server/ftp.go 自己（约 20 KB），ftpserverlib
-#        必须留；而且 FTP 服务端用配置 "ftp":{"enable":false} 就能关
-#        （run.go:227 判 conf.Conf.FTP.Enable）。所以本 workflow 不支持剥 ftp，
-#        传了会硬失败并给出原因。
-#
-#    做法：把 server/s3.go、server/mcp.go 换成**保持函数签名的 stub**，
-#    于是 server/s3、server/mcp 两个包整个从依赖图里消失（连带 gofakes3、
-#    ncw/swift/v2）。**router.go / run.go 一行都不用改** —— stub 保留了
-#    S3() / S3Server() / MCP() 三个符号，调用点照样类型检查通过。
-#    stub 里路由仍然注册并返回 403，与 "enable": false 时的行为一致
-#    （客户端拿到干净的错误码，而不是 404）。
-#
-#    实测（arm64 / CGO_ENABLED=0 / -trimpath -tags=nomsgpack / -s -w / 全量驱动）：
-#      baseline                 73,466,016 B
-#      只去 MCP                 73,466,016 B   ← 段内容缩了 60 KB 但被文件对齐吃掉
-#      只去 S3                  73,072,800 B   (−384 KiB)
-#      去 S3 + MCP              72,941,728 B   (−512 KiB)
-#      xz -6 后                 16,947,436 B   (−125.6 KiB)
-#    ⇒ 净收益约 0.12 MiB（压缩后），约占 12.67 MiB 镜像的 1%。**收益很小**：
-#      只想要"只保留 sftp"的语义，用配置关掉三个协议就够了，不必重新构建。
-#
-#    ⚠ 陷阱：**单点改动与体积不成线性**。只去 MCP 时段内容确实缩了约 60 KB，
-#      但文件总长一模一样（Go 链接器文件级对齐/填充吸收）。所以"分别测 A 和 B
-#      再相加"不可靠（−384 + −61 ≠ −512）。要测就测组合。
-#
-#    ⚠ 被剥掉的协议，config.json 里的 "s3" / "mcp" 段仍然存在 —— 它们是
-#      internal/conf/config.go 里的 struct 字段，由 viper 统一解析，本身不占
-#      体积，删掉反而会让 admin API 报错。运行时把 enable 设成 false 即可。
+# 精简版构建：按需选择目标 + 链接方式。
+# 触发：推送到 feat/zhijiadisk 分支，或手动 workflow_dispatch（见 on:）。
 #
 # ============================================================================
+#  本 workflow 相对上游 build.yml 的两处改造（都是为了减体积）
+# ============================================================================
+#
+#  ① 前端走 CDN —— 不再把前端 dist 嵌进二进制
+#     上游做法是 `bash build.sh release web` 把前端下载到 public/dist，
+#     再由 public/public.go 的 `//go:embed all:dist` 吸进二进制（标准版
+#     ~55MB，是二进制的绝对大头）。本 workflow **跳过 Setup web 步骤**，
+#     public/dist 保持仓库里的 README.md 占位，体积立刻掉一大截。
+#
+#     ⚠ 代价（部署时必须知道）：
+#       - 运行时要配 `cdn`（config.json 的 cdn 字段，或环境变量 OPENLIST_CDN），
+#         否则启动直接 Fatal —— 见 server/static/static.go 的 initIndex：
+#         只有 `DistDir == "" && Cdn != "" && WebVersion ∈ {"", beta, dev, rolling}`
+#         才走 CDN 分支，三个条件缺一不可。
+#       - WebVersion 必须是 rolling（或空/beta/dev）。本 workflow 的
+#         LDFLAGS 与 cgo-actions 的 x-flags 都已经写死 `WebVersion=rolling`。
+#       - **不要设 dist_dir**：一旦非空，CDN 分支失效，会回头去读内嵌的
+#         index.html 然后 Fatal。
+#       - CDN 地址里别写 `$version`：代码会把 `$version` 替换成 WebVersion
+#         即 `rolling`，而 npm 上没有 rolling 这个 dist-tag。用 `@latest`
+#         或写死版本号。
+#       环境变量是 `OPENLIST_CDN=`，不是裸 `CDN=`。
+#
+#  ② 数据库只留 SQLite —— 摘掉 mysql / postgres
+#     internal/bootstrap/db.go **无条件** import 了
+#     `gorm.io/driver/mysql` 与 `gorm.io/driver/postgres`（连带 pgx、
+#     go-sql-driver/mysql），没有任何 build tag 可以关掉 —— 注意
+#     `sqlite_cgo_compat` 那个 tag 管的是 **sqlite 用哪个实现**
+#     （glebarez 纯 Go vs mattn cgo），跟 mysql/postgres 无关。
+#     所以本 workflow 在构建前用一段内联 Python **原地改写** db.go，
+#     把这两个 import 与它们的 case 分支删掉，只留 `case "sqlite3"` 和
+#     `default:`（default 会干净地 fatal："not supported database type: x"）。
+#     实测省约 3.69 MiB。
+#
+#     ⚠ 代价：config.json 里若写 `"type": "mysql"` 或 `"postgres"`，
+#       启动会立刻 fatal 退出。这两个后端的用户请用 build.yml / 上游发行版。
+#
+#     为什么是「原地改写」而不是 build_sqfs.yml 那种 `-overlay`：
+#     本 workflow 的 cgo 变体走 OpenListTeam/cgo-actions（Docker 里跑 xgo），
+#     把 `-overlay=<绝对路径>` 穿过 action 的 flags 有不确定性；而 CI 的
+#     工作区本来就是一次性的，原地改最稳、对 cgo 与纯 Go 两条路径一视同仁。
+#     （build_sqfs.yml 是单一设备镜像、只走纯 Go，所以那边用 overlay 更干净。）
+#
+# ============================================================================
+#  以下为上游原有说明（链接方式 / 产物分发）
+# ============================================================================
+#
+# 链接方式说明（务必看，选错会白跑）：
+#   linux-*-musl     musl 工具链 + CGO，-static 全静态。体积最大，兼容性最好。
+#   linux-*          xgo（docker glibc）+ CGO，动态链接。需目标机 glibc >= 构建镜像。
+#   linux-*-nocgo    CGO_ENABLED=0 纯 Go，不含任何 libc。通常比 musl 版还小，
+#                    且无 glibc 版本要求；amd64/arm64 上 sqlite 走 glebarez 纯 Go 驱动。
+#                    ⚠ 此变体无法走 cgo-actions（它会强制 CGO_ENABLED=1），
+#                      由下面的 "Build (pure Go)" 步骤直接用 go build 完成
+#
+# 产物分发渠道（两条，互不影响）：
+#   GitHub Release  可执行文件本体，见 build job 的 "Publish to GitHub Release"。
+#                   proxy_<sha>.txt 里的加速地址指向这里，所以它是下载链路的
+#                   最终来源，WebDAV 只是清单托管处。
+#   WebDAV          只传一份 proxy_<sha>.txt（下载地址清单）。
+#                   产物本体不传 —— 几十 MB × 十几个变体是重复占用，而 txt
+#                   里的加速地址指向 Release、不经过 WebDAV，代理下载已够用。
+#
+# 邮件配置（仓库 Settings → Secrets and variables → Actions 里加）：
+#   vars.SMTP_HOST          SMTP 服务器，如 smtp.qq.com
+#   vars.SMTP_PORT          可选，默认 465（隐式 SSL）；其它值走 STARTTLS
+#   vars.MAIL_FROM          可选，默认取 SMTP_USERNAME
+#   secrets.MAIL_TO         收件人，多个用逗号分隔
+#   secrets.SMTP_USERNAME   登录用户（通常就是发件邮箱）
+#   secrets.SMTP_PASSWORD   密码 / 授权码 —— 多数邮箱要用「SMTP 授权码」，
+#                           不是网页登录密码，用错会得到 535 认证失败。
+#   任一项缺失时脚本打 notice 后正常返回，不视为构建失败。
+#
+# 不需要的目标/变体，直接把 include 里对应那两行注释掉即可。
+
+# ==========================================================================
+#  squashfs 镜像（build_sqfs job）—— 原 .github/workflows/build_sqfs.yml
+#  已于并入本 workflow 时删除，其方法论文档随之搬到这里。
+# ==========================================================================
+#
+#  本 workflow 因此产出两类东西：
+#    * `build` job      —— 各目标平台的普通二进制（原 Minimal Build）
+#    * `build_sqfs` job —— 额外一个 aarch64 的 squashfs 镜像
+# 两个 job 产物互不影响，各自发到自己的 Release（ci-<sha> / ci-sqfs-<sha>）。
+#
+#  以下为 build_sqfs.yml 原文的方法论文档（§1–§12 编号保持原样）。
+# ==========================================================================
+#
+# ----------------------------------------------------------------------
+# name: SquashFS Build (CDN + trimmed drivers)     <- 原文的 name，已被上面的
+#                                                    Go Minimal Build 取代
+# ============================================================================
+# #  OpenList 精简构建 · 方法论文档
+# # ============================================================================
+# #
+# #  自包含：整个精简逻辑（约 470 行 Python）就内联在下面 "Generate build
+# #  overlay" 那一步里，没有外部脚本。改驱动时不需要重新分析项目结构。
+# #
+# #  §0  想改驱动 / 改精简项时只看这一节
+# #  ---------------------------------------------------------------------------
+# #  改 workflow_dispatch 的输入即可。脚本会自动处理所有**连带关系**：
+# #
+# #    (a) drivers/all.go 的空导入列表    —— 你勾什么就留什么
+# #    (b) core 里为类型断言硬 import 的驱动 —— 见 §4，脚本按勾选自动决定
+# #    (c) 只服务于某个驱动的第三方库        —— 见 §5，脚本按勾选自动决定
+# #
+# #  默认已经打开的四项精简：
+# #    drivers       14 个常用驱动（不含 s3 / thunderx 等 AWS 系）
+# #    strip_offline true  整个离线下载功能
+# #    strip_ffmpeg  true  ffmpeg（视频缩略图）
+# #    db_backends   sqlite
+# #
+# #  另有可选的两项（默认关）：
+# #    strip_protocols  none  服务端协议裁剪，可填 s3 / mcp（见 §12）
+# #    search_backends  all   检索引擎裁剪，可填 db,db_non_full_text
+# #
+# #  改完驱动后唯一要自查的：**数据库里已有的存储记录**。被裁掉的驱动若还在
+# #  storage 表里，启动会报 `no driver named: xxx`，需先删掉那条存储。
+# #
+# #  §1  为什么"去掉前端还有 80+ MB"
+# #  ---------------------------------------------------------------------------
+# #  不是你的代码大。62.81 MiB 的产物里，**Go 运行时元数据占 54.9%**，自研代码
+# #  只占 2.3%。其中 `.gopclntab`（栈回溯/行号表）与 `.text` 几乎 1:1 等大，
+# #  且 `-w -s` **剥不掉**——GC 扫栈和 panic traceback 都依赖它。
+# #  实测基线（hello-world，同 Go 版本）：gopclntab/text = 1.05。这是 Go 1.27
+# #  的普遍特性，不是本项目问题。
+# #
+# #  §2  体积构成（arm64 / 16 驱动 / CDN / 剥离离线下载 / -w -s，实测 62.81 MiB）
+# #  ---------------------------------------------------------------------------
+# #    .text         26.89 MB  40.8%   机器码，可归因
+# #    .gopclntab    25.83 MB  39.2%   栈回溯表，不可剥离
+# #    .go.type       5.94 MB   9.0%   类型元数据，不可剥离
+# #    .rodata        3.52 MB   5.3%   只读数据 + 字符串池
+# #    .noptrdata     2.86 MB   4.3%
+# #    .data          0.61 MB   0.9%
+# #
+# #  按来源拆：Go 元数据 34.51 MiB(54.9%) / 第三方库 24.57 MiB(39.1%) /
+# #            标准库 2.13 MiB(3.4%) / 自研 1.44 MiB(2.3%) / 头部对齐 0.16 MiB
+# #
+# #  复现方法见 §9。
+# #
+# #  §3  裁剪的放大倍率 —— 方法论核心
+# #  ---------------------------------------------------------------------------
+# #  **删掉 1 MB 代码，文件大约小 2.41 MB**（text 1.0 + pclntab 0.94 + types 0.39
+# #  + 其它 0.08）。这是实测：87 驱动 → 16 驱动，.text −5.61 MB，.gopclntab
+# #  −5.26 MB，文件共 −12.91 MiB。
+# #
+# #  但倍率**不是常数**。删 AWS SDK 时 .text 只降 2.42 MB，.gopclntab 降了
+# #  4.21 MB（1.74 倍），整体倍率 3.35 倍。原因是 pclntab 有**每函数固定开销**
+# #  （functab 8B + _func ~44B + pcfile/pcln 变长表），所以「大量小函数」的依赖
+# #  （生成式 API 那种）代价被显著放大。
+# #
+# #  ⇒ 判断一个依赖值不值得删，**看它的函数数量，不能只看代码体积**。
+# #
+# #  §4  core 硬编码耦合清单 —— 改驱动时必看
+# #  ---------------------------------------------------------------------------
+# #  这些文件为了**类型断言**硬 import 了具体驱动，它们永远在依赖图里。
+# #  只改 drivers/all.go 是裁不掉的。
+# #
+# #    文件                                        硬编码的驱动                        剥离条件
+# #    ----------------------------------------    --------------------------------    ------------------
+# #    internal/offline_download/tool/add.go       115 115_open 123 123_open          strip_offline=true
+# #                                                guangyapan pikpak thunder
+# #                                                thunder_browser thunderx
+# #    internal/offline_download/tool/transfer.go  189pc (天翼云秒传)                   同上
+# #    server/handles/offline_download.go          上述 9 个驱动 (各 Set* handler)      同上
+# #    server/handles/torrent.go                   189pc (torrent CAS 秒传)            未勾选 189pc
+# #    internal/search/util.go                     openlist (跨实例索引)                未勾选 openlist
+# #    drivers/local/util.go                       ffmpeg-go (视频缩略图)              strip_ffmpeg=true
+# #    internal/net/request.go                     aws-sdk-go (仅为 awsutil.Copy)      未勾选任何 AWS 系驱动
+# #    internal/bootstrap/db.go                    mysql / postgres (gorm 驱动)        db_backends 未包含
+# #    internal/search/import.go                   bleve / meilisearch                 search_backends 未包含
+# #
+# #  **AWS 系驱动**（勾了任意一个，aws-sdk-go 就必然在二进制里）：
+# #      123  halalcloud  mediatrack  s3  teambition  thunder  thunder_browser  thunderx
+# #
+# #  §5  第三方库的连带关系（为什么一个小功能会拖进几 MB）
+# #  ---------------------------------------------------------------------------
+# #    gin/binding  → github.com/ugorji/go/codec  (2.93 MB，最大的单个第三方包)
+# #                   只为 msgpack 绑定。Gin 自带 `//go:build nomsgpack` 开关，
+# #                   OpenList 不用 msgpack ⇒ 构建时固定加 `-tags=nomsgpack`。
+# #    drivers/local → github.com/u2takey/ffmpeg-go
+# #                   ffmpeg-go 无条件 import aws-sdk-go（3 个 import），只为
+# #                   `Output("s3://...")`，OpenList 走不到。
+# #                   两种处理方式：
+# #                     strip_ffmpeg=true  → 直接从 util.go 摘掉 ffmpeg，整个
+# #                                          ffmpeg-go 不进二进制。**推荐**。
+# #                     strip_ffmpeg=false → 保留视频缩略图，此时脚本会额外把
+# #                                          ffmpeg-go 复制出来打补丁、走
+# #                                          -modfile + replace（因为 -overlay
+# #                                          改不了 GOMODCACHE）。
+# #    internal/net/request.go → aws-sdk-go/aws/awsutil
+# #                   仅 2 处 awsutil.Copy 深拷贝 HttpRequestParams{URL,Range,
+# #                   HeaderRef,Size}；拷贝后只改 Range，浅拷贝语义等价。
+# #    gorm 驱动     → sqlite(glebarez 纯 Go) / mysql / postgres(pgx)
+# #    gorm 驱动     → mongo / bleve / meilisearch（见 internal/search）
+# #
+# #  §6  输入速查表
+# #  ---------------------------------------------------------------------------
+# #    drivers         保留的存储驱动（逗号/空格分隔，或 all = 全量 87 个）
+# #                    可用名单：在仓库根跑
+# #                      python3 build/gen_overlay.py --list-drivers
+# #                    留空 = all
+# #    strip_offline   true(默认) 移除整个离线下载功能 / false 保留
+# #    strip_ffmpeg    true(默认) 移除 ffmpeg 与视频缩略图 / false 保留
+# #    db_backends     保留的数据库后端，默认 sqlite
+# #                    （已知：sqlite / mysql / postgres；多个用逗号，all = 全留）
+# #    search_backends 保留的检索引擎，默认 all
+# #                    （已知：bleve / meilisearch；db、db_non_full_text 恒留）
+# #    strip_protocols 要剥掉的服务端协议，默认 none
+# #                    （已知：s3 / mcp；ftp 不支持，原因见 §12）
+# #    arch            linux-arm64(默认) / linux-armv7 / linux-amd64
+# #    cdn             前端 CDN 基址（只写进产物说明，运行时仍需配置）
+# #
+# #  §7  设备侧约束（中兴 F4610U，选错白跑）
+# #  ---------------------------------------------------------------------------
+# #    - 挂载点 /opt/sq/openlist，backing file /opt/armbian/bin/openlist/openlist.sqfs
+# #      挂载：mount -t squashfs -o loop,ro <img> /opt/sq/openlist
+# #    - **镜像内可执行文件必须叫 openlist**（openlist_start.sh 硬编码该路径）
+# #      ⇒ mksquashfs 的源目录必须是 stage/openlist 本身，传父目录会让镜像里多
+# #        一层 openlist/，挂载后路径变成 .../openlist/openlist。现役镜像
+# #        inodes=2 即为此（根目录 + 该文件）。
+# #    - **镜像内 openlist 必须可执行且属主 root**：openlist_start.sh 启动前有
+# #      `[ ! -x "$APP" ]` 检查，不可执行直接拒绝启动。所以打包时
+# #      `chmod 755` 源文件 + `mksquashfs -all-root`，并在打包后断言
+# #      `-rwxr-xr-x root/root`，模式不对就让构建失败。
+# #      （CI 里 mksquashfs 以 runner/uid 1001 运行，不加 -all-root 镜像里就是
+# #        1001:1001，与设备现役镜像不一致。）
+# #    - **必须 -b 1M**：128K 块会大 3.4 MiB
+# #    - **不要加 -Xbcj arm**：对 AArch64 无效
+# #    - 内核 4.1.25 已实测支持 squashfs + xz + 1M 块
+# #      改为 squashfs 挂载 raw 二进制（file-backed，可丢弃）。
+# #      详见 server 仓库 0806/BUILD-ENV.md §3.3 / f4610u/F4610U.md §5-19。
+# #
+# #  §8  已知坑
+# #  ---------------------------------------------------------------------------
+# #    - **`-tags=jsoniter` 是死开关**：项目里没有任何 `jsoniter` build tag，
+# #      带与不带产物**逐字节相同**（实测 65,863,840 == 65,863,840）。本 workflow
+# #      不再传它。build.sh 里那行也可以删。
+# #    - **`-trimpath` 不能写进 LDFLAGS**。它是 go build 的参数，不是链接器的；
+# #      混进去会让 `go tool link` 报 "flag provided but not defined: -trimpath"
+# #      并打出 usage。LDFLAGS 里只放 -s -w -X。
+# #    - **`go build -overlay` 不能替换 GOMODCACHE 下的文件**，会报
+# #      "Files beneath GOMODCACHE must not be replaced"。改第三方模块必须走
+# #      -modfile + replace（strip_ffmpeg=false 时脚本会自动处理）。
+# #    - **必须先 `go mod download`**：补丁 ffmpeg-go 要靠 `go list -m -f {{.Dir}}`
+# #      定位模块源码，模块缓存为空时无法工作。workflow 里有 "Warm module cache"。
+# #    - **`-w -s` 剥不掉 .gopclntab**，别指望靠它减体积。
+# #    - **strip_ffmpeg 会破坏一个单元测试**：drivers/local/pdf_thumb_test.go 里
+# #      `{name: "video", fileName: "movie.mp4", want: true}` 期望视频可缩略图。
+# #      `go build` 不受影响（测试文件不参与编译），但本地跑 `go test ./drivers/local`
+# #      会失败。那是 overlay 生效的预期结果。
+# #    - **运行时必须配 CDN**：Cdn=="" 时会去 fs.Sub(static,"assets") 直接 Fatal。
+# #      这个二进制不能当通用版发出去。环境变量是 `OPENLIST_CDN=`（不是裸 CDN=）。
+# #    - **不要设 dist_dir**：一旦非空，CDN 分支失效，会回去读内嵌 index.html
+# #      然后 Fatal。
+# #    - **CDN 里别写 $version**：代码会把 $version 替换成 WebVersion 即 `rolling`，
+# #      而 npm 上没有 rolling 这个 dist-tag。用 `@latest` 或写死版本号。
+# #    - Go 版本必须 1.27.1：go.mod 要求 go 1.26.0 / toolchain go1.27.1。
+# #      设备文档里「锁 go1.22.12 避 32MiB BSS 雷」的前提是 overcommit_memory=0；
+# #      2026-10-09 实测已更正为 1，且现役 openlist 就是 go1.27.1 编的并正常运行。
+# #      （那个 32 MiB 是 crypto/internal/fips140/drbg 的 ScratchBuffer[1<<25]，
+# #        BSS 不占文件但首次用 crypto/rand 会真的提交约 32 MiB 物理内存。）
+# #
+# #  §9  怎么复现 §2 的体积分析
+# #  ---------------------------------------------------------------------------
+# #    1. 构建一份**带符号表**的同配置产物（不要加 -w -s）：
+# #         go build -tags=nomsgpack -overlay=<overlay.json> -o /tmp/sym .
+# #    2. ELF 段级结构：
+# #         python3 build/_elfsec.py /tmp/sym
+# #    3. 包/模块级归因：
+# #         go tool nm -size /tmp/sym > /tmp/nm.txt
+# #         go list -deps . > /tmp/deps.txt        # 必须在仓库根目录执行
+# #         python3 build/_nmstat.py /tmp/nm.txt /tmp/deps.txt
+# #    注意 `go tool nm -size` 的 size 字段是**十进制**，按十六进制解析会把总量
+# #    放大 11 倍。这两个脚本在 build/ 下（该目录已被 .gitignore）。
+# #    另外：**验证裁剪别用 `go version -m`** —— 它列的是 go.mod 模块图，不是
+# #    实际链接的包。用 `go list -deps` 才是权威。
+# #
+# #  §10  实测瘦身阶梯（arm64 / CDN / -w -s / strip_offline）
+# #  ---------------------------------------------------------------------------
+# #    配置                                          裸二进制      sqfs[xz,-b 1M]
+# #    ------------------------------------------    ----------    --------------
+# #    基线（16 驱动 + -tags=jsoniter）               62.81 MiB      15.11 MiB
+# #    + -tags=nomsgpack                              57.31 MiB      —
+# #    + 去掉 aws-sdk-go（14 驱动，无 s3/thunderx）    49.50 MiB      —
+# #    + db_backends=sqlite                           45.81 MiB      12.72 MiB
+# #    + strip_ffmpeg=true                            45.56 MiB      —
+# #
+# #    合计 −17.25 MiB（−27.5%）。sqfs 约为裸二进制的 27.8%。
+# #
+# #  §11  相对 build_minimal.yml 还能怎么优化体积
+# #  ---------------------------------------------------------------------------
+# #    build_minimal.yml 是**通用多平台构建**，本 workflow 是**单一设备镜像**，
+# #    因此可以放弃通用性换体积。按性价比排序：
+# #
+# #    1. 前端走 CDN（本 workflow 已做）—— 省最多，前端 dist 原本 ~55 MB 被
+# #       //go:embed 吸进二进制。注意 CDN 版**必须**运行时配 cdn，且 WebVersion
+# #       必须是 rolling。
+# #    2. `-tags=nomsgpack`（已做）—— 省 5.50 MiB，摘掉 gin 的 msgpack 绑定
+# #       连带 ugorji/go/codec 2.93 MB。
+# #    3. 裁驱动（已做）—— 87→14 省 12.91 MiB。倍率 2.41x，见 §3。
+# #    4. 去掉 aws-sdk-go（已做）—— 省 7.69 MiB。倍率 3.35x（函数多）。
+# #       需要同时摘掉 request.go 的 awsutil 与 ffmpeg-go 的 3 个 import。
+# #    5. db 只留 sqlite（已做）—— 省 3.69 MiB（mysql + pgx）。
+# #    6. strip_offline（已做）—— 去掉整个离线下载功能与其 9 个硬编码驱动。
+# #    7. strip_ffmpeg（已做）—— 只省 0.13 MiB（因为 aws-sdk-go 已在第 4 步
+# #       去掉）。**真正的价值是消掉了 -modfile 模块补丁这一整块复杂度**。
+# #    8. search_backends=db,db_non_full_text —— 去掉 bleve（68 个包）与
+# #       meilisearch，省约 1.7 MiB。代价是失去全文检索。
+# #    9. strip_protocols=s3,mcp —— 剥掉 S3 与 MCP 服务端协议，省 512 KiB
+# #       裸二进制 / 约 125 KiB（xz 后）。**性价比最低的一项**（约占镜像 1%），
+# #       见 §12；只想要"只保留 sftp"的语义用配置关掉就行，不必重新构建。
+# #   10. CGO_ENABLED=0 纯 Go —— 已隐含（sqlite 走 glebarez 纯 Go 驱动），
+# #       无 glibc 版本要求，体积通常还比 musl 版小。
+# #
+# #    想再往下压，只剩两条路：换更小的 Go 运行时（比如 -gcflags 调优不现实）、
+# #    或者把部分驱动改成运行时插件（OpenList 无插件机制，需大改）。
+# #
+# #  §12  服务端协议裁剪（strip_protocols）
+# #  ---------------------------------------------------------------------------
+# #    OpenList 的四种服务端协议各有一个顶层文件 + 一个子包：
+# #
+# #      协议    顶层文件          子包            拉进来的第三方库
+# #      S3      server/s3.go     server/s3/      gofakes3、ncw/swift/v2
+# #      MCP     server/mcp.go    server/mcp/     （无，只用 gin + internal）
+# #      FTP     server/ftp.go    ——              fclairamb/ftpserverlib
+# #      SFTP    server/sftp.go   server/sftp/    sftpd-openlist、x/crypto/ssh
+# #
+# #    ★ 关键约束：**SFTP 摘不掉 ftpserverlib**。
+# #      server/sftp.go:28 调 ftp.InitStage()、:75 用 ftp.NewAferoAdapter(ctx)，
+# #      而 server/ftp/ 子包（afero.go / fsup.go / site.go）用的是
+# #      ftpserver.FileTransfer / AnswerCommand / ClientDriver / StatusOK 这些
+# #      **真实类型** —— SFTP 的适配器就建在 FTP 那套 afero 适配器上。
+# #      ⇒ 剥掉 FTP 监听器只能省 server/ftp.go 自己（约 20 KB），ftpserverlib
+# #        必须留；而且 FTP 服务端用配置 "ftp":{"enable":false} 就能关
+# #        （run.go:227 判 conf.Conf.FTP.Enable）。所以本 workflow 不支持剥 ftp，
+# #        传了会硬失败并给出原因。
+# #
+# #    做法：把 server/s3.go、server/mcp.go 换成**保持函数签名的 stub**，
+# #    于是 server/s3、server/mcp 两个包整个从依赖图里消失（连带 gofakes3、
+# #    ncw/swift/v2）。**router.go / run.go 一行都不用改** —— stub 保留了
+# #    S3() / S3Server() / MCP() 三个符号，调用点照样类型检查通过。
+# #    stub 里路由仍然注册并返回 403，与 "enable": false 时的行为一致
+# #    （客户端拿到干净的错误码，而不是 404）。
+# #
+# #    实测（arm64 / CGO_ENABLED=0 / -trimpath -tags=nomsgpack / -s -w / 全量驱动）：
+# #      baseline                 73,466,016 B
+# #      只去 MCP                 73,466,016 B   ← 段内容缩了 60 KB 但被文件对齐吃掉
+# #      只去 S3                  73,072,800 B   (−384 KiB)
+# #      去 S3 + MCP              72,941,728 B   (−512 KiB)
+# #      xz -6 后                 16,947,436 B   (−125.6 KiB)
+# #    ⇒ 净收益约 0.12 MiB（压缩后），约占 12.67 MiB 镜像的 1%。**收益很小**：
+# #      只想要"只保留 sftp"的语义，用配置关掉三个协议就够了，不必重新构建。
+# #
+# #    ⚠ 陷阱：**单点改动与体积不成线性**。只去 MCP 时段内容确实缩了约 60 KB，
+# #      但文件总长一模一样（Go 链接器文件级对齐/填充吸收）。所以"分别测 A 和 B
+# #      再相加"不可靠（−384 + −61 ≠ −512）。要测就测组合。
+# #
+# #    ⚠ 被剥掉的协议，config.json 里的 "s3" / "mcp" 段仍然存在 —— 它们是
+# #      internal/conf/config.go 里的 struct 字段，由 viper 统一解析，本身不占
+# #      体积，删掉反而会让 admin API 报错。运行时把 enable 设成 false 即可。
+# #
+# # ============================================================================
+# ----------------------------------------------------------------------
 
 on:
+  # 推送到 feat/zhijiadisk 分支就自动触发。
+  # 想改分支只改这一行；想再支持别的分支就加成列表：
+  #   branches: [feat/zhijiadisk, other-branch]
+  push:
+    branches: [feat/zhijiadisk]
+  # 保留手动触发，方便不改代码就重跑一次。
   workflow_dispatch:
+    # ---- 以下输入供 build_sqfs job 使用（build job 忽略它们）----
     inputs:
       drivers:
         description: >-
@@ -290,7 +388,15 @@ on:
             thunder_browser thunderx —— 勾了任意一个，aws-sdk-go 就会留在
             二进制里，多约 7.7 MiB）
         required: false
-        default: "local,alias,crypt,virtual,strm,url_tree,itvsh,115,139,quark_uc,webdav,ftp,smb,sftp"
+        # 与 Zig 版（build_zig_minimal.yml `-Ddrivers=`）的 12 个注册项一一对应。
+        # 两边用同一份名单，镜像才能直接互换、不挑构建方式。
+        #   local | webdav | itvsh | aliyundrive_open | 189 | 189pc
+        #   | 123 | quark_uc | 115 | wopan | strm
+        # 注意 quark_uc 一个目录出两个驱动（Quark 与 UC），所以 Go 侧 11 个
+        # 目录 = Zig 侧 12 个注册项。
+        # ⚠ 代价：`123` 是 AWS 系，勾选会把 aws-sdk-go 拖回来，按本文件 §3/§11
+        #   的实测约 +7.7 MiB 裸二进制。若设备不用 123Pan，把它从名单里去掉。
+        default: "local,webdav,itvsh,aliyundrive_open,189,189pc,123,quark_uc,115,wopan,strm"
       strip_offline:
         description: >-
           true = 移除整个离线下载功能（连带 9 个硬编码驱动导入与所有下载工具）
@@ -339,14 +445,6 @@ on:
         description: 前端 CDN 基址（写进产物说明，运行时仍需配置 cdn 字段或 OPENLIST_CDN）
         required: false
         default: "https://cdn.jsdelivr.net/npm/@openlist-frontend/openlist-frontend@latest/dist"
-      compress:
-        description: 额外压缩。光猫场景请保持 none（见文档 §7）
-        required: false
-        default: none
-        type: choice
-        options:
-          - none
-          - upx
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -355,8 +453,317 @@ concurrency:
 permissions:
   contents: write
 
+concurrency:
+  # 同一分支连推两次会取消上一次运行（cancel-in-progress）。
+  # ⚠ 被取消的运行可能已经建好 ci-<sha> Release、传了部分 asset 就停了，
+  #   且不会再补齐（summarize 也不会跑）—— 那个 commit 的 Release 是残缺的。
+  #   要完整产物，等上一次跑完再推，或对残缺的 commit 手动重跑一次。
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 创建 Release 需要写权限。GITHUB_TOKEN 默认是只读的，
+# 不显式声明会在 gh release create / release upload 时得到 403。
+permissions:
+  contents: write
+
 jobs:
   build:
+    strategy:
+      # 某个变体失败时不要连坐取消其它变体，便于一次跑完看对比。
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Windows 10+ x86-64（产物 openlist.exe）----
+          - target: windows-amd64
+
+          # ---- Linux，musl 全静态 ----
+          # - target: linux-amd64-musl
+          # - target: linux-arm64-musl
+
+          # ---- Linux，glibc 动态链接 ----
+          # - target: linux-amd64
+          # - target: linux-arm64
+
+          # ---- Linux，纯 Go 零依赖 CGO_ENABLED=0 ----
+          - target: linux-amd64-nocgo
+          - target: linux-arm64-nocgo
+
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # 与 release.yml 一致：浅克隆但要取 tag，
+          # 否则 git describe 拿不到版本号。
+          fetch-depth: 1
+          fetch-tags: true
+
+      - uses: benjlevesque/short-sha@dbe07338b37c456ce06d23409b35a56a7815eef4 # v4.0
+        id: short-sha
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.27.1"
+
+      - name: Strip MySQL/PostgreSQL (SQLite only)
+        # 原地改写 internal/bootstrap/db.go：摘掉 mysql / postgres 两个
+        # gorm 驱动（连带 pgx、go-sql-driver/mysql），只留 sqlite3。
+        # 见文件头 ② 的说明。每处改写都锚定精确源码模式，锚点失配直接
+        # ::error:: 失败，不会静默留下一个「以为裁了其实没裁」的产物。
+        run: |
+          set -e
+          python3 - <<'PYEOF'
+          import re
+          import sys
+
+          PATH = "internal/bootstrap/db.go"
+          IMPORTS = {"mysql": '\t"gorm.io/driver/mysql"\n',
+                     "postgres": '\t"gorm.io/driver/postgres"\n'}
+
+          src = open(PATH, encoding="utf-8").read()
+
+          for name, imp in IMPORTS.items():
+              if src.count(imp) != 1:
+                  sys.exit(f"::error::expected exactly one {imp.strip()!r} "
+                           f"in {PATH}; upstream changed")
+              src = src.replace(imp, "", 1)
+              pat = r'\n\t\tcase "' + name + r'":\n\t\t\t\{\n[\s\S]*?\n\t\t\t\}\n'
+              src, n = re.subn(pat, "\n", src, count=1, flags=re.M)
+              if n != 1:
+                  sys.exit(f'::error::case "{name}" not found in {PATH}; '
+                           f"upstream changed")
+
+          # 顺手摘掉因上面改动而变得没人用的 import（当前应无，防御性）
+          m = re.search(r'\nimport \(\n(.*?)\n\)\n', src, re.S)
+          if not m:
+              sys.exit(f"::error::no import block in {PATH}")
+          block = m.group(1)
+          body = src[:m.start()] + src[m.end():]
+          kept, dropped = [], []
+          for line in block.split("\n"):
+              s = line.strip()
+              mm = re.match(r'^(?:([A-Za-z_][A-Za-z0-9_]*)\s+)?"([^"]+)"$', s)
+              if not mm:
+                  kept.append(line)
+                  continue
+              alias, path = mm.group(1), mm.group(2)
+              if alias in ("_", "."):
+                  kept.append(line)
+                  continue
+              nm = alias or path.rsplit("/", 1)[-1]
+              if re.search(r'\b' + re.escape(nm) + r'\b', body):
+                  kept.append(line)
+              else:
+                  dropped.append(nm)
+          if dropped:
+              print("::notice::dropped unused imports:", ", ".join(dropped))
+          while kept and not kept[0].strip():
+              kept.pop(0)
+          while kept and not kept[-1].strip():
+              kept.pop()
+          src = src[:m.start()] + "\nimport (\n" + "\n".join(kept) + "\n)\n" + src[m.end():]
+
+          open(PATH, "w", encoding="utf-8", newline="\n").write(src)
+          print(f"::notice::stripped mysql/postgres from {PATH}")
+          PYEOF
+          echo "--- 改写后的 import 块 ---"
+          sed -n '1,20p' internal/bootstrap/db.go
+          echo "--- 剩余的后端分支 ---"
+          grep -n 'case "\|default:' internal/bootstrap/db.go
+
+      # ---- 注意：这里刻意没有 "Setup web" 步骤 ----
+      # 上游 build_minimal.yml 会 `bash build.sh release web` 把前端下载到
+      # public/dist 再被 //go:embed 吸进二进制。本 workflow 走 CDN，所以跳过；
+      # public/dist 保持仓库里的 README.md 占位（全空目录会让
+      # //go:embed all:dist 报 "contains no embeddable files"）。
+      # 见文件头 ① 的运行时要求。
+
+      - name: Build (cgo)
+        # nocgo 变体走下面独立的 go build 步骤，这里跳过。
+        if: ${{ !contains(matrix.target, '-nocgo') }}
+        uses: OpenListTeam/cgo-actions@6fcace5934c36d70503dba06e2396bb58b766130 # v1.2.5
+        with:
+          targets: ${{ matrix.target }}
+          # 仍按原名分流：只有 -musl 才加静态链接 flag。
+          # 不带 -musl 的 linux-amd64 / linux-arm64 会命中 '-ldflags=' 分支，
+          # 交给 xgo 按 glibc 动态链接处理。
+          flags: ${{ contains(matrix.target, '-musl') && '-ldflags=-linkmode external -extldflags ''-static -fpic''' || '-ldflags=' }}
+          static-link-for-musl: true
+          musl-target-format: $os-$musl-$arch
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          out-dir: build
+          x-flags: |
+            github.com/OpenListTeam/OpenList/v4/internal/conf.BuiltAt=$built_at
+            github.com/OpenListTeam/OpenList/v4/internal/conf.GitAuthor=The OpenList Projects Contributors <noreply@openlist.team>
+            github.com/OpenListTeam/OpenList/v4/internal/conf.GitCommit=$git_commit
+            github.com/OpenListTeam/OpenList/v4/internal/conf.Version=$tag
+            github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=rolling
+          output: openlist$ext
+
+      - name: Build (pure Go, CGO_ENABLED=0)
+        # 纯 Go 静态二进制：不经任何 C 工具链，因此不需要交叉编译器，
+        # 也不受目标机 glibc 版本限制。
+        if: ${{ contains(matrix.target, '-nocgo') }}
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -e
+          arch="${TARGET#linux-}"; arch="${arch%%-*}"
+          export GOARCH="$arch"
+
+          # 与 cgo-actions 的 x-flags 保持一致，只是这里要自己拼。
+          # Version 取 GITHUB_REF_NAME（runner 自带的环境变量，本 workflow
+          # 由分支触发，即分支名），不走 Actions 表达式展开：脚本内容固定，
+          # 不受 ref 名里可能出现的 shell 元字符影响。
+          # （注意：本注释里不能写那种表达式字面量 —— 哪怕在 shell 注释里，
+          #   Actions 也会先解析，空表达式会让整个 workflow 校验失败。）
+          # ⚠ cgo 那侧走的是 cgo-actions 的 $tag，两者不一定相等 ——
+          #   想让同名变体自报一致，需要核对 cgo-actions 里 $tag 的实际取值。
+          # WebVersion=rolling 是 CDN 分支的硬要求，见文件头 ①。
+          LDFLAGS="-w -s \
+            -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.BuiltAt=$(date +'%F %T %z')' \
+            -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.GitAuthor=The OpenList Projects Contributors <noreply@openlist.team>' \
+            -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.GitCommit=$(git rev-parse HEAD)' \
+            -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.Version=${GITHUB_REF_NAME}' \
+            -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=rolling'"
+
+          # 纯 Go 产物统一命中 glebarez 纯 Go sqlite 驱动
+          # （见 internal/bootstrap/sqlite_driver_*.go 的 build tag 约束），
+          # 所以这里只要 jsoniter，不能带 sqlite_cgo_compat。
+          go build -tags=jsoniter -ldflags="$LDFLAGS" -o build/openlist .
+
+      - name: Verify musl binary is static
+        if: contains(matrix.target, '-musl')
+        run: |
+          set -e
+          if readelf -l build/openlist | grep -q "Requesting program interpreter"; then
+            echo "Dynamic binary detected: build/openlist"
+            readelf -l build/openlist | grep "Requesting program interpreter" || true
+            exit 1
+          fi
+
+      - name: Report linkage and size
+        # 链接方式靠推断，不能靠假设 —— 每次把实际结果打出来，
+        # 顺便给出体积，便于各变体横向对比。
+        env:
+          BIN: build/openlist${{ contains(matrix.target, 'windows') && '.exe' || '' }}
+        run: |
+          set -e
+          if [ ! -e "$BIN" ]; then
+            echo "::error::expected artifact missing: $BIN"
+            ls -la build/ || true
+            exit 1
+          fi
+          echo "--- size ---"
+          du -h "$BIN"
+          case "$BIN" in
+            *.exe)
+              echo "::notice::linkage = (windows, skipped)"
+              ;;
+            *)
+              if readelf -l "$BIN" | grep -q "Requesting program interpreter"; then
+                echo "::notice::linkage = DYNAMIC"
+                readelf -l "$BIN" | grep "Requesting program interpreter" || true
+              else
+                echo "::notice::linkage = STATIC"
+              fi
+              ;;
+          esac
+          ls -la build/
+
+      # 产物不走 artifact 上传：走 GitHub Release 本体，
+      # 外加 WebDAV 一条清单渠道（不传产物本体），
+      # 顺带省下每次 run 约 0.9~1.3GB 的 artifact 占用。
+      # 下方保留原步骤备查，需要临时走 artifact 调试时取消注释即可。
+      #
+      # - name: Upload artifact
+      #   uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      #   with:
+      #     name: openlist_${{ matrix.target }}
+      #     overwrite: true
+      #     path: build/*
+
+      - name: Stage artifact with descriptive name
+        # 产物编译出来统一叫 openlist[.exe]，变体信息只存在于目录/文件名里。
+        # 后续 Release asset 的命名都从这里来，
+        # 不带变体信息的话多个变体会同名互相覆盖。
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -e
+          name="openlist_${TARGET}"
+          case "$TARGET" in
+            *windows*) mv build/openlist.exe "build/${name}.exe"; echo "::notice::staged build/${name}.exe" ;;
+            *)         mv build/openlist     "build/${name}";     echo "::notice::staged build/${name}" ;;
+          esac
+
+      - name: Publish to GitHub Release
+        # 产出永久公开直链，形如：
+        #   https://github.com/cjd6568358/OpenList/releases/download/ci-<sha>/<asset>
+        # 与 WebDAV 那步完全独立：这边只负责上传产物本体，WebDAV 只放清单文本。
+        # 与代理清单的先后关系：txt 里拼的就是这里的 asset URL，但生成 txt 在
+        # summarize job 里，靠 needs: build 保证本 job 全跑完才开始。
+        #
+        # tag 用 ci-<commit>：每个 commit 一个 Release，永久归档、互不覆盖。
+        # 因为 tag 里已含 commit，asset 名就不再重复带 commit。
+        #
+        # ⚠ 多个 matrix job 并发跑这一段，必然有多个 job 同时想创建同一个
+        #   Release。谁先谁赢，其余拿到 422 —— 那不是错误，故显式容忍。
+        #
+        # GITHUB_SHA / GITHUB_REF_NAME / GITHUB_EVENT_NAME 由 runner 提供。
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ steps.short-sha.outputs.sha }}
+          TARGET: ${{ matrix.target }}
+          MATRIX_DESC: ${{ matrix.target }}
+        run: |
+          set -e
+          tag="ci-${SHA}"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag 已存在，直接补传 asset"
+          else
+            # --target 必须显式指定：不指定的话 gh 会把 tag 打在默认分支的
+            #   最新提交上，而不是本次构建的 commit。
+            # --prerelease：CI 产物不该被标成 "Latest release"。
+            if ! gh release create "$tag" \
+                 --title "CI build ${SHA}" \
+                 --prerelease \
+                 --target "${GITHUB_SHA}" \
+                 --notes "$(printf '由 build_minimal.yml 自动构建（CDN 前端 + 仅 SQLite 数据库）。\n\n- commit: %s\n- 分支: %s\n- 变体: %s\n- 触发: %s\n\n⚠ 部署须知：\n1. 本产物不含内嵌前端，运行时必须配置 cdn（config.json 的 cdn 字段或环境变量 OPENLIST_CDN），否则启动 Fatal。\n2. 本产物只支持 SQLite；config.json 里若把 type 写成 mysql 或 postgres，启动会立刻 fatal。\n\nCI 产物未经发布流程验证，请自行核对。' \
+                   "${GITHUB_SHA}" "${GITHUB_REF_NAME}" "${MATRIX_DESC}" "${GITHUB_EVENT_NAME}")"; then
+              # 竞态：别的 job 抢先创建了。确认它确实存在即可继续。
+              if gh release view "$tag" >/dev/null 2>&1; then
+                echo "release 已由其它 job 创建，继续"
+              else
+                echo "::error::既无法创建也找不到 release $tag"
+                exit 1
+              fi
+            fi
+          fi
+
+          # 上传上一步暂存的裸二进制。名字由 matrix.target 唯一确定，
+          # 不用通配符：build/ 里可能有别的东西，通配会静默挑错文件。
+          name="openlist_${TARGET}"
+          case "$TARGET" in
+            *windows*) asset="build/${name}.exe" ;;
+            *)         asset="build/${name}" ;;
+          esac
+          [ -f "$asset" ] || {
+            echo "::error::找不到待上传产物 ${asset}"
+            ls -la build/ || true
+            exit 1
+          }
+
+          # --clobber：同 commit 重跑时覆盖同名 asset，保证幂等。
+          gh release upload "$tag" "$asset" --clobber
+          echo "::notice::release $tag 已更新：${asset}"
+
+  build_sqfs:
     name: sqfs ${{ inputs.arch }}
     runs-on: ubuntu-latest
     steps:
@@ -1177,17 +1584,6 @@ jobs:
           go build "${args[@]}"
           ls -l build/openlist
 
-      - name: Optional UPX (default off)
-        if: ${{ inputs.compress == 'upx' }}
-        run: |
-          set -e
-          sudo apt-get update -qq && sudo apt-get install -y -qq upx-ucl
-          before=$(stat -c %s build/openlist)
-          upx -9 build/openlist
-          upx -t build/openlist
-          echo "::warning::UPX 版在光猫上会把解压体驻留匿名内存，不要用于 F4610U"
-          echo "::notice::upx: $before -> $(stat -c %s build/openlist)"
-
       # ---- 打包 squashfs ----
       - name: Install squashfs-tools
         run: |
@@ -1244,7 +1640,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ steps.short-sha.outputs.sha }}
           TARGET: ${{ inputs.arch }}
-          COMPRESS: ${{ inputs.compress }}
           DRIVERS: ${{ inputs.drivers }}
           STRIP_OFFLINE: ${{ inputs.strip_offline }}
           STRIP_FFMPEG: ${{ inputs.strip_ffmpeg }}
@@ -1255,7 +1650,7 @@ jobs:
         run: |
           set -e
           tag="ci-sqfs-${SHA}"
-          name="openlist.sqfs_${TARGET}_${COMPRESS}"
+          name="openlist.sqfs_${TARGET}"
           mv build/openlist.sqfs "build/${name}"
 
           gh release view "$tag" >/dev/null 2>&1 || \
@@ -1268,3 +1663,92 @@ jobs:
 
           gh release upload "$tag" "build/${name}" --clobber
           echo "::notice::released ${tag}: ${name} ($(stat -c %s "build/${name}") bytes)"
+
+  summarize:
+    # 等 build 全部跑完（无论成败）再执行。
+    # always() 是必须的：不加的话任一变体失败就整片跳过，
+    # 而「部分变体失败 + 其余成功的产物」正是最需要清单的时候。
+    # 失败变体不会出现在 Release 里，所以清单自动只含成功产物。
+    #
+    # 职责：(1) 生成汇总版 proxy_<sha>.txt（列出该 Release 里成功的全部产物）
+    #       (2) 上传到 WebDAV
+    #       (3) 把它作为正文发一封邮件
+    # 顺序是「先上传、再发信」：邮件说出「已经在 WebDAV 上」时，它确实在。
+    # 只等 build：build_sqfs 发的是另一个 Release（ci-sqfs-<sha>），
+    # 与这里生成的 proxy_<sha>.txt 无关，不需要等它。
+    needs: build
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+
+      - uses: benjlevesque/short-sha@dbe07338b37c456ce06d23409b35a56a7815eef4 # v4.0
+        id: short-sha
+
+      - name: Generate proxy download links
+        # 为该 Release 里的**全部**产物生成一份 txt，按代理域名分组。
+        # 产物清单由脚本问 GitHub 要（gh release view），不写死 ——
+        # matrix 增删变体后无需改这里，失败的变体没进 Release 也就不在其中。
+        #
+        # 输出文件名带 commit：proxy_<sha>.txt。
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.short-sha.outputs.sha }}
+        run: |
+          set -e
+          bash .github/scripts/gen-proxy-txt.sh "ci-${SHA}" "${REPO}" "proxy_${SHA}.txt"
+
+      - name: Upload to WebDAV
+        # 全局唯一一处 WebDAV 上传，只传一份 proxy_<sha>.txt。目录层级、建目录
+        # 方式和 WEBDAV_DIR 的约束详见文件头「下载地址清单」一段。
+        #
+        # WEBDAV_DIR 必须配：留空等于把文件倒进 WebDAV 根目录（脚本对空
+        #   remote_dir 的行为正是「传到根目录」），所以在这里挡住。
+        env:
+          WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+          WEBDAV_USERNAME: ${{ secrets.WEBDAV_USERNAME }}
+          WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
+          WEBDAV_REMOTE_DIR: ${{ vars.WEBDAV_DIR }}
+        run: |
+          set -e
+          if [ -z "${WEBDAV_REMOTE_DIR// }" ]; then
+            # 未配 WebDAV_URL 时本步本就不做事，那种情况不拦。
+            if [ -n "${WEBDAV_URL:-}" ]; then
+              echo "::error::vars.WEBDAV_DIR 未配置，拒绝上传到 WebDAV 根目录"
+              exit 1
+            fi
+          fi
+          if [ ! -f "proxy_${SHA}.txt" ]; then
+            echo "::notice::未生成 proxy_${SHA}.txt（release 无产物），跳过上传"
+            exit 0
+          fi
+          bash .github/scripts/upload-webdav.sh "proxy_${SHA}.txt"
+
+      - name: Send proxy list by mail
+        # 正文就是 proxy_<sha>.txt 原文，方便不翻 WebDAV 也能拿到加速地址。
+        # 排在 WebDAV 上传之后 —— 邮件里说的内容此时确实已经在 WebDAV 上。
+        # MAIL_BODY_FILE 指到带 commit 的文件名上（脚本默认值仍是 proxy.txt）。
+        #
+        # 文件不存在时脚本自己打 notice 后返回 0，不发空邮件。
+        #
+        # continue-on-error：邮件只是通知，不该拖累构建结果。
+        # 配置不全时脚本自己打 notice 后返回 0，不影响任何人。
+        #
+        # 配置来源：服务器/端口/发件地址放 vars（非敏感，且写错了能在
+        # Settings 里直接读回来排查）；账号密码放 secrets。
+        # SMTP_PORT 可留空，脚本默认 465（隐式 SSL）；其它端口走 STARTTLS。
+        continue-on-error: true
+        env:
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          SMTP_HOST: ${{ vars.SMTP_HOST }}
+          SMTP_PORT: ${{ vars.SMTP_PORT }}
+          MAIL_FROM: ${{ vars.MAIL_FROM }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          MAIL_BODY_FILE: proxy_${{ steps.short-sha.outputs.sha }}.txt
+          MAIL_SUBJECT: OpenList CI 构建产物 ${{ steps.short-sha.outputs.sha }}
+        run: python3 .github/scripts/send-mail.py

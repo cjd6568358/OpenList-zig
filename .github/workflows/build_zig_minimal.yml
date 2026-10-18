@@ -1,0 +1,267 @@
+name: Zig Minimal Build (SquashFS)
+
+# ============================================================================
+#  只产 Zig 版 aarch64 squashfs 镜像 —— 从 build_sqfs.yml 改造而来
+# ============================================================================
+#
+#  与 Go 版（.github/workflows/build_go_minimal.yml 的 build_sqfs job）的关系：
+#
+#    同：都走「编译期白名单 + mksquashfs」得到 /opt/sq/openlist 的镜像，
+#        参数（驱动清单、CDN）与打包参数（-comp xz -b 1M -all-root、
+#        镜像内文件名 openlist、0755）完全一致 —— 直接互换、不挑构建方式。
+#    异：裁剪手段不同。Go 版在构建**前**用 `go build -overlay` 改写
+#        `drivers/all.go` 等源码；Zig 版不需要，因为 Zig 的注册表本身就是
+#        编译期常量，`-Ddrivers=` 就直接决定谁被编译进去。
+#
+#  §0  改驱动只看这一节
+#  ---------------------------------------------------------------------------
+#  改 `drivers` 输入即可。名字可以是 Go 驱动名（写进 config.json 的
+#  `Storage.driver`），也可以是 Zig 源文件名（src/drivers/<name>.zig）：
+#
+#    Local | local                    上海电信智家硬盘 | itvsh
+#    WebDav | webdav                  AliyundriveOpen | aliyundrive
+#    189Cloud | cloud189              189CloudPC | cloud189pc
+#    123Pan | pan123                  Quark / UC | quarkuc（一个文件出两个驱动）
+#    115 Cloud | pan115               WoPan | wopan
+#    Strm | strm
+#
+#  留空或填 all = 全量。未知名字会在配置阶段直接失败并列全部合法值，
+#  不会静默产出缺驱动的二进制。
+#
+#  ⚠ 与 Go 版的一个重要差别：Zig 版**没有** MySQL/PostgreSQL 裁剪、没有
+#    离线下载/ffmpeg/服务端协议裁剪 —— 这个实现里根本没有这些功能点
+#    （见 zig-src/docs/STATUS.md §11）。所以那几个输入不存在。
+#
+#  §1  体积（打包机实测，aarch64-linux-musl，-O small -fstrip）
+#  ---------------------------------------------------------------------------
+#    drivers=all                 1,183,352 B
+#    local,webdav,Quark,strm       893,352 B   （省 24.5%）
+#  驱动在静态单体里的 xz 边际见 zig-src/dist/driver_size.log，按需估算。
+#
+#  §2  运行时前提（与 Go 版相同）
+#  ---------------------------------------------------------------------------
+#    * 必须配 cdn：config.json 的 cdn 字段或环境变量 OPENLIST_CDN，
+#      且 WebVersion ∈ {"", beta, dev, rolling}。用官方 CDN 地址
+#      https://cdn.jsdelivr.net/npm/@openlist-frontend/openlist-frontend@latest/dist
+#      （别写 $version —— 它会被替换成 rolling，而 npm 上没有这个 dist-tag）。
+#    * 不要设 dist_dir：设了会去读镜像里不存在的前端文件然后 Fatal。
+#    * 被裁掉的驱动若 config.json 里还有对应存储，该存储会 init 失败并记
+#      error_msg，其余存储照常服务。
+#
+#  §3  设备侧挂载注意（与 Go 版一致，都是实测结论）
+#  ---------------------------------------------------------------------------
+#    * mksquashfs 的源目录必须是 stage/openlist 本身，传父目录会让镜像里多一层。
+#    * 必须 -b 1M：128K 块会大 3.4 MiB。-Xbcj arm 对 AArch64 无效，不加。
+#    * 必须 -all-root：否则镜像内文件归 runner 的 uid 1001，与设备现役镜像不一致。
+#    * 可执行位必须显式 chmod 755：设备侧启动脚本会先做 [ ! -x ] 检查。
+
+on:
+  # 只保留手动触发：这个镜像只服务一台特定设备，没有"每次推送都出"的需要。
+  # 想改成跟随推送就照 build_go_minimal.yml 加 branches 列表。
+  workflow_dispatch:
+    inputs:
+      drivers:
+        description: >-
+          要编译进去的存储驱动，逗号或空格分隔。留空或 all = 全量（12 项）。
+          名字可用 Go 驱动名或 Zig 源文件名，可用名单见文件头 §0。
+        required: false
+        default: ""
+      zig_version:
+        description: >-
+          Zig 版本号。留空取文件里写死的默认值。项目对 0.17.0 是硬下界
+          （build.zig.zon 的 minimum_zig_version），不要往低填。
+        required: false
+        default: "0.17.0"
+      cdn:
+        description: 前端 CDN 地址（必须配，否则启动 Fatal）
+        required: false
+        default: "https://cdn.jsdelivr.net/npm/@openlist-frontend/openlist-frontend@latest/dist"
+
+concurrency:
+  # 同分支连推两次取消上一次。被取消的运行可能已有残缺 Release，需手动重跑。
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: zig sqfs ${{ inputs.zig_version }} drivers=${{ inputs.drivers || '(all)' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+          fetch-tags: true
+
+      - uses: benjlevesque/short-sha@dbe07338b37c456ce06d23409b35a56a7815eef4 # v4.0
+        id: short-sha
+
+      # ---- 安装 Zig ----
+      # 不用 snap：那拿到的是最新 beta，而 build.zig.zon 对 0.17.0 是硬下界。
+      # 直接拉官方 tarball，版本显式可控且无需 root。
+      - name: Install Zig
+        env:
+          ZIG_VERSION: ${{ inputs.zig_version }}
+        run: |
+          set -e
+          case "$(uname -m)" in
+            x86_64)  ZIG_ARCH=x86_64 ;;
+            aarch64) ZIG_ARCH=aarch64 ;;
+            *) echo "::error::unsupported runner arch $(uname -m)"; exit 1 ;;
+          esac
+          TARBALL="zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
+          URL="https://ziglang.org/download/${ZIG_VERSION}/${TARBALL}"
+          echo "::notice::installing ${URL}"
+          mkdir -p "$HOME/.local"
+          curl -fsSL "$URL" -o "$TARBALL"
+          tar -C "$HOME/.local" -xf "$TARBALL"
+          echo "$HOME/.local/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          zig version
+
+      - name: Show build.zig options
+        run: zig build --help | sed -n '1,40p'
+
+      # ---- 驱动白名单校验 ----
+      # 输入是自由文本，先确认它合法，别等编译到一半才炸。
+      # build.zig 的 resolveDrivers 对未知名字会打印全部合法值并以 1 退出，
+      # 所以这里只需跑一次 `zig build --help`（只做 configure、不编译）。
+      # 注意不能加 `-Dhelp`：那不是合法选项，会自己触发一次失败。
+      - name: Validate driver whitelist
+        env:
+          DRIVERS: ${{ inputs.drivers }}
+        run: |
+          set -e
+          if [ -z "${DRIVERS// }" ]; then
+            echo "::notice::empty whitelist -> building every driver"
+            exit 0
+          fi
+          if zig build --help -Ddrivers="$DRIVERS" >/tmp/whitelist.log 2>&1; then
+            echo "::notice::whitelist accepted: $DRIVERS"
+          else
+            echo "::error::unknown driver name(s) in: $DRIVERS"
+            grep -E 'unknown driver|known drivers' /tmp/whitelist.log || tail -3 /tmp/whitelist.log
+            exit 1
+          fi
+
+      # ---- 交叉编译 ----
+      # aarch64 + musl、全静态、-O small、strip。Zig 自带 musl 静态 libc，
+      # 不需要额外工具链 —— 这正是 Zig 做 C 交叉编译的优势所在。
+      # 产物落在 zig-out/bin/openlist。
+      - name: Build (aarch64-linux-musl, static)
+        env:
+          DRIVERS: ${{ inputs.drivers }}
+          ZIG_VERSION: ${{ inputs.zig_version }}
+        run: |
+          set -e
+          DRV_ARGS=""
+          if [ -n "${DRIVERS// }" ]; then DRV_ARGS="-Ddrivers=$DRIVERS"; fi
+
+          # 先把 version 写进产物名，便于从 Release 名看出用了什么配置。
+          zig build -Dtarget=aarch64-linux-musl -Doptimize=small $DRV_ARGS
+          echo "--- drivers in this build ---"
+          zig build size -Dtarget=aarch64-linux-musl -Doptimize=small $DRV_ARGS || true
+          echo "--- artifact ---"
+          ls -l zig-out/bin/openlist
+          file zig-out/bin/openlist 2>/dev/null || true
+          readelf -h zig-out/bin/openlist | grep -E 'Machine|Type'
+
+      # ---- 静态链接断言 ----
+      # 与 build_go_minimal.yml 的断言语义一致：真的静态才能塞进光猫单机跑。
+      - name: Verify musl binary is static
+        run: |
+          set -e
+          if readelf -l zig-out/bin/openlist | grep -q "Requesting program interpreter"; then
+            echo "Dynamic binary detected:"
+            readelf -l zig-out/bin/openlist | grep "Requesting program interpreter" || true
+            exit 1
+          fi
+          echo "::notice::static confirmed (no INTERP, no dynamic section)"
+
+      # ---- 单元测试 ----
+      # 与构建**同一份白名单**下跑：测过的驱动集必须是编进二进制的那个。
+      # 失败不影响最终打包（那已经是编译成功的产物），但会让 job 变黄并留痕。
+      - name: Unit tests (same whitelist)
+        continue-on-error: true
+        env:
+          DRIVERS: ${{ inputs.drivers }}
+        run: |
+          set -e
+          DRV_ARGS=""
+          if [ -n "${DRIVERS// }" ]; then DRV_ARGS="-Ddrivers=$DRIVERS"; fi
+          zig build test $DRV_ARGS --summary all 2>&1 | tail -30
+
+      - name: Install squashfs-tools
+        run: |
+          set -e
+          if ! command -v mksquashfs >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq squashfs-tools
+          fi
+          mksquashfs -version
+
+      # ---- 打包 squashfs ----
+      # stage/openlist 的内容即镜像根，与 Go 版逐参数一致。
+      - name: Pack openlist.sqfs
+        run: |
+          set -e
+          stage=build/sqfs-stage/openlist
+          mkdir -p "$stage"
+          cp zig-out/bin/openlist "$stage/openlist"
+          # ★ 可执行位必须显式设：设备侧启动脚本会先做 [ ! -x ] 检查。
+          #   zig build 的产物本来就是 0755，钉一次是不依赖上游行为/runner umask。
+          chmod 755 "$stage/openlist"
+          rm -f build/openlist.sqfs
+          # ★ 源目录必须是 stage/openlist 本身。传父目录会让镜像里多一层
+          #   openlist/，挂载后变成 /opt/sq/openlist/openlist/openlist。
+          # -comp xz -b 1M 是设备侧实测结论（128K 块大 3.4 MiB）。
+          # -all-root 让镜像内文件归 root:root，否则是 runner 的 uid 1001。
+          # -noappend 保证重跑幂等。
+          mksquashfs "$stage" build/openlist.sqfs -comp xz -b 1M -noappend -all-root
+          echo "--- raw vs sqfs ---"
+          du -h "$stage/openlist" build/openlist.sqfs
+          echo "--- image header ---"
+          unsquashfs -s build/openlist.sqfs
+
+          # ---- 断言：镜像内 openlist 必须可执行且属主为 root ----
+          # 打包完立刻验，别把一个设备侧起不来的镜像发出去。
+          line=$(unsquashfs -ll build/openlist.sqfs | grep 'squashfs-root/openlist$' || true)
+          case "$line" in
+            -rwxr-xr-x\ root/root*)
+              echo "::notice::image perms OK: $line" ;;
+            *)
+              echo "::error::image perms wrong (want -rwxr-xr-x root/root): $line"
+              exit 1 ;;
+          esac
+
+      - name: Publish to GitHub Release
+        # 输入一律经 env 传进来：自由文本直接插值进 shell 有注入风险。
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ steps.short-sha.outputs.sha }}
+          DRIVERS: ${{ inputs.drivers }}
+          ZIG_VERSION: ${{ inputs.zig_version }}
+          CDN: ${{ inputs.cdn }}
+        run: |
+          set -e
+          tag="ci-zig-sqfs-${SHA}"
+          drv="${DRIVERS:-all}"
+          name="openlist-zig.sqfs_${ZIG_VERSION}_${drv//[^a-zA-Z0-9._-]/_}"
+          mv build/openlist.sqfs "build/${name}"
+          ls -l "build/${name}"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag exists, adding asset"
+          else
+            gh release create "$tag" \
+              --title "Zig SquashFS build ${SHA}" \
+              --prerelease \
+              --target "${GITHUB_SHA}" \
+              --notes "$(printf 'Zig 版 squashfs 镜像（白名单驱动 + CDN 前端）。\n\n- commit: %s\n- Zig: %s\n- 驱动: %s\n- 前端 CDN: %s\n\n镜像内可执行文件名为 openlist，挂载到 /opt/sq/openlist 后直接运行。\n运行时必须配置 cdn（config.json 的 cdn 字段或环境变量 OPENLIST_CDN），否则启动 Fatal。\n\n注意：\n1. 被裁掉的驱动若 config.json 里还有对应存储，该存储 init 失败，其余照常服务。\n2. 驱动名可用 Go 驱动名（如 189Cloud）或 Zig 源文件名（如 cloud189），见本 workflow 头部 §0。\n\n构建与裁剪方法论见 .github/workflows/build_zig_minimal.yml 头部，Zig 侧结论见 zig-src/docs/STATUS.md。' \
+                "${GITHUB_SHA}" "${ZIG_VERSION}" "${drv}" "${CDN}")"
+          fi
+
+          gh release upload "$tag" "build/${name}" --clobber
+          echo "::notice::released ${tag}: ${name} ($(stat -c %s "build/${name}") bytes)"

@@ -497,6 +497,13 @@ const public_setting_defaults = [_]PublicSetting{
     // ---- SITE ----
     .{ .key = "version", .value = "" }, // 由 publicSettingValue 填
     .{ .key = "site_title", .value = "OpenList" },
+    // ⚠️ 与 Go 的**有意差异**：上游默认值是一段欢迎语（TypeText，Flag 缺省即
+    // PUBLIC），Zig 这里是空串。原因见 `docs/STATUS.md` §13.2：加了欢迎语却没有
+    // 前台入口去改它，用户就会看到一段永远删不掉的文案。
+    //
+    // 要补平成 Go 需要一起做：`/api/admin/setting` 支持 announcement 读写 +
+    // `publicSettingValue` 把它接进实时 settings。`check_public_settings.py`
+    // 把这一项列在 DELIBERATE 里，别当成漂移。
     .{ .key = "announcement", .value = "" },
     .{ .key = "pagination_type", .value = "all" },
     .{ .key = "default_page_size", .value = "30" },
@@ -547,6 +554,10 @@ const public_setting_defaults = [_]PublicSetting{
     .{ .key = "sso_login_enabled", .value = "false" },
     .{ .key = "sso_login_platform", .value = "" },
     .{ .key = "sso_compatibility_mode", .value = "false" },
+    // 上游 ea10624f 新增（`internal/conf/const.go:120` → setting.go:214，
+    // TypeString + Flag PUBLIC），Go 的 public settings 因此是 **48** 项。
+    // 前端 SSO 的 postMessage origin 校验读它；Zig 无 SSO，恒空串即可。
+    .{ .key = "sso_postmessage_origin", .value = "" },
     // ---- LDAP ----
     .{ .key = "ldap_login_enabled", .value = "false" },
     .{ .key = "ldap_login_tips", .value = "login with ldap" },
@@ -973,8 +984,66 @@ fn handleFsGet(app: *App, req: *http.Request, res: *http.Response) !void {
     // header/related 前端当前不读，一并补齐，免得再漏。
     try b.append(",\"readme\":\"\",\"header\":\"\",\"provider\":");
     try json.writeString(&b, r.mount.storage.driver);
-    try b.append(",\"related\":[]}}");
+    try b.append(",\"related\":[");
+    // 对齐 Go `FsGet`（fsread.go:350-357 + filterRelated:383）：**仅视频文件**
+    // 才列一次父目录、挑出"同名前缀"的兄弟文件作为 related（上游 9de3f69b 才把
+    // 条件从"所有文件"收窄到"视频"）。前端播放器拿它做同目录剧集/字幕/外挂
+    // 音轨 —— 此前这里恒发空数组，等于这个功能从来没生效过。
+    //
+    // 列目录失败不能让 fs/get 整体 500：Go 的写法是 `if err == nil` 才填，
+    // 出错就留空。
+    if (!f.is_dir and model.objTypeFor(f.name, false) == .video) {
+        appendRelated(app, &b, a, path, f.name) catch {};
+    }
+    try b.append("]}}");
     try res.jsonOkRaw(b.slice());
+}
+
+/// Go `filterRelated` 的 `strings.TrimSuffix(name, stdpath.Ext(name))`：
+/// `movie.mp4` → `movie`，用来前缀匹配 `movie.srt` 这类外挂文件。
+fn stemOf(name: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return name;
+    return name[0..dot];
+}
+
+/// 把 `related` 数组写进 `b`（不含外层方括号）。`path` 是被请求视频的完整路径。
+fn appendRelated(app: *App, b: *Buf, a: std.mem.Allocator, path: []const u8, name: []const u8) !void {
+    const parent = dirnameRel(path);
+    const pr = app.resolve(parent) orelse return;
+    var pctx = driver.Ctx{ .alloc = a, .tag = pr.mount.mount_path };
+    const objs = try pr.mount.driver.list(&pctx, pr.rel);
+    // `resolve` 保证父目录与被请求文件落在**同一个挂载**内，所以这里不需要
+    // 再做跨挂载判断（Go 的 `fs.List(parentPath)` 同样只解析到一个挂载）。
+    const stem = stemOf(name);
+    var n: usize = 0;
+    for (objs) |o| {
+        if (std.mem.eql(u8, o.name, name)) continue;
+        if (!std.mem.startsWith(u8, o.name, stem)) continue;
+        if (n != 0) try b.appendByte(',');
+        const child = try urlmod.joinPath(a, if (parent.len == 1) "" else parent, o.name);
+        try writeObj(app, b, o, child);
+        n += 1;
+    }
+}
+
+/// Go `errs.RelativePath` 的文案（`internal/errs/errors.go:13`）。
+const err_relative_path = "using relative path is not allowed";
+
+/// 对齐 Go `server/handles/fsmanage.go:338` 的 `checkRelativePath`（上游
+/// ea10624f 安全加固）：`names[]` 的元素与 rename 的 `name` 必须是**纯文件名**
+/// —— 含 `/` 或 `\`、空串、`.`、`..` 一律 403 `errs.RelativePath`。
+/// 上游在四处调用：`FsMove(:116)` / `FsCopy(:223)` / `FsRename(:306)` /
+/// `FsRemove(:384)`。
+///
+/// 为什么必须查：`urlmod.joinPath` 是纯字符串拼接、**不归一化 `..`**。没有这层
+/// 校验时 `names:["../x"]` 会拼出 `src_dir/../x` 直接交给驱动（local 有
+/// `cleanPath` 兜底，云盘驱动多半 404，但都与上游不一致），`names:["a/b"]`
+/// 更是直接操作子路径 —— 两者上游都是 403。
+fn isPlainFileName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
+    return std.mem.indexOfScalar(u8, name, '/') == null and
+        std.mem.indexOfScalar(u8, name, '\\') == null;
 }
 
 fn handleFsMkdir(app: *App, req: *http.Request, res: *http.Response) !void {
@@ -996,9 +1065,13 @@ fn handleFsCopy(app: *App, req: *http.Request, res: *http.Response) !void {
     const dst_dir = v.strAt("dst_dir") orelse return res.jsonError(400, "dst_dir is required");
     const names = v.getPath("names") orelse return res.jsonError(400, "names is required");
     const arr = names.asArray() orelse return res.jsonError(400, "names must be an array");
+    // 对齐 Go `FsCopy`（fsmanage.go:182）：空数组是显式 400，不是"什么都不做然后 200"。
+    if (arr.len == 0) return res.jsonError(400, "Empty file names");
 
     for (arr) |*n| {
         const name = n.asStr() orelse continue;
+        // 对齐 Go `checkRelativePath`（fsmanage.go:223）。
+        if (!isPlainFileName(name)) return res.jsonError(403, err_relative_path);
         const src = try urlmod.joinPath(a, src_dir, name);
         const sr = app.resolve(src) orelse return res.jsonError(404, "storage not found");
         const dr = app.resolve(dst_dir) orelse return res.jsonError(404, "storage not found");
@@ -1016,6 +1089,8 @@ fn handleFsRename(app: *App, req: *http.Request, res: *http.Response) !void {
     const v = try parseBodyJson(a, req, res) orelse return;
     const path = v.strAt("path") orelse return res.jsonError(400, "path is required");
     const name = v.strAt("name") orelse return res.jsonError(400, "name is required");
+    // 对齐 Go `FsRename`（fsmanage.go:306）—— 五个端点里唯一原本就有此校验的。
+    if (!isPlainFileName(name)) return res.jsonError(403, err_relative_path);
     const r = app.resolve(path) orelse return res.jsonError(404, "storage not found");
     var ctx = driver.Ctx{ .alloc = a, .tag = r.mount.mount_path };
     r.mount.driver.rename(&ctx, r.rel, name) catch |e| return mapDriverError(res, e);
@@ -1030,9 +1105,13 @@ fn handleFsMove(app: *App, req: *http.Request, res: *http.Response) !void {
     const dst_dir = v.strAt("dst_dir") orelse return res.jsonError(400, "dst_dir is required");
     const names = v.getPath("names") orelse return res.jsonError(400, "names is required");
     const arr = names.asArray() orelse return res.jsonError(400, "names must be an array");
+    // 对齐 Go `FsMove`（fsmanage.go:76）。
+    if (arr.len == 0) return res.jsonError(400, "Empty file names");
 
     for (arr) |*n| {
         const name = n.asStr() orelse continue;
+        // 对齐 Go `checkRelativePath`（fsmanage.go:116）。
+        if (!isPlainFileName(name)) return res.jsonError(403, err_relative_path);
         const src = try urlmod.joinPath(a, src_dir, name);
         const sr = app.resolve(src) orelse return res.jsonError(404, "storage not found");
         const dr = app.resolve(dst_dir) orelse return res.jsonError(404, "storage not found");
@@ -1052,9 +1131,13 @@ fn handleFsRemove(app: *App, req: *http.Request, res: *http.Response) !void {
     const dir = v.strAt("dir") orelse return res.jsonError(400, "dir is required");
     const names = v.getPath("names") orelse return res.jsonError(400, "names is required");
     const arr = names.asArray() orelse return res.jsonError(400, "names must be an array");
+    // 对齐 Go `FsRemove`（fsmanage.go:358）。
+    if (arr.len == 0) return res.jsonError(400, "Empty file names");
 
     for (arr) |*n| {
         const name = n.asStr() orelse continue;
+        // 对齐 Go `checkRelativePath`（fsmanage.go:384）。
+        if (!isPlainFileName(name)) return res.jsonError(403, err_relative_path);
         const full = try urlmod.joinPath(a, dir, name);
         const r = app.resolve(full) orelse return res.jsonError(404, "storage not found");
         var ctx = driver.Ctx{ .alloc = a, .tag = r.mount.mount_path };
@@ -2440,6 +2523,16 @@ fn doRequestWith(app: *App, a: std.mem.Allocator, method: []const u8, path: []co
     return res;
 }
 
+/// Like `doRequestWith`, but with a JSON body. `parseBodyJson` treats a missing
+/// body as `{}`, so every endpoint that reads fields needs this to be exercised.
+fn doRequestJson(app: *App, a: std.mem.Allocator, method: []const u8, path: []const u8, body: []const u8, headers: []Header) !*http.Response {
+    var req = http.Request{ .arena = a, .method = method, .path = path, .target = path, .headers = headers, .body = .{ .memory = body } };
+    const res = try a.create(http.Response);
+    res.* = http.Response.init(a);
+    try handle(app, &req, res);
+    return res;
+}
+
 test "routing: the shell and the manifest need no token" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2692,7 +2785,10 @@ test "routing: authed admin endpoints return data, unauthed is 401" {
         try testing.expect(std.mem.indexOf(u8, body, "Local") != null);
         // 驱动名必须与 Go `driver.Config.Name` 一致 —— itvsh 的 Go 名是
         // 「上海电信智家硬盘」（drivers/itvsh/meta.go:34），配置里存的就是它。
-        try testing.expect(std.mem.indexOf(u8, body, "上海电信智家硬盘") != null);
+        // 仅在 itvsh 被 `-Ddrivers=` 选入时才要求出现（裁剪构建本来就不含它）。
+        if (driver.find("上海电信智家硬盘") != null) {
+            try testing.expect(std.mem.indexOf(u8, body, "上海电信智家硬盘") != null);
+        }
     }
 
     // Task centre knows these categories but accurately reports no active or
@@ -2889,7 +2985,8 @@ test "public settings carries the keys the frontend actually reads" {
         "readme_autorender",    "filter_readme_scripts",  "hide_files",
         "package_download",     "share_preview",          "share_archive_preview",
         "share_summary_content", "search_index",          "sso_login_enabled",
-        "sso_login_platform",   "sso_compatibility_mode", "ldap_login_enabled",
+        "sso_login_platform",   "sso_compatibility_mode", "sso_postmessage_origin",
+        "ldap_login_enabled",
         "ldap_login_tips",      "multipart_enabled",
     };
     for (required) |k| {
@@ -2936,6 +3033,71 @@ test "fs list carries the envelope fields the frontend reads" {
     }
     // 单管理员构建 ⇒ 目录可写，前端据此显示上传/新建。
     try testing.expect(data.get("write").?.asBool() != null and data.get("write").?.asBool().?);
+}
+
+test "fs move/copy/remove/rename reject relative names like Go checkRelativePath" {
+    // 回归：上游 ea10624f 给 `FsMove`/`FsCopy`/`FsRemove` 补了 `checkRelativePath`
+    // （`fsmanage.go:116/223/384`），`FsRename`(:306) 原本就有。Zig 四个端点
+    // 一个都没有，而 `urlmod.joinPath` 是纯字符串拼接、**不归一化 `..`** ⇒
+    // `names:["../x"]` 会拼出 `src_dir/../x` 交给驱动，`["a/b"]` 直接操作子
+    // 路径 —— 上游两者都是 403。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fe = try frontend_mod.initFromHtml(a, .{}, ROUTING_SHELL);
+    defer fe.deinit();
+    var app = routingApp(a, fe);
+
+    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    const hdrs = try a.alloc(Header, 1);
+    hdrs[0] = .{ .name = "Authorization", .value = auth };
+
+    // 纯逻辑：等价于 Go 的 `strings.ContainsAny(path, "/\\") || path == "" ||
+    // path == "." || path == ".."`。
+    for ([_][]const u8{ "", ".", "..", "a/b", "a\\b" }) |n| {
+        try testing.expect(!isPlainFileName(n));
+    }
+    for ([_][]const u8{ "a.b", "..hidden", "normal name.txt", "电影.mp4" }) |n| {
+        try testing.expect(isPlainFileName(n));
+    }
+
+    // 端点层：必须在**碰到驱动之前**就 403（测试环境没有挂载，没有这层校验时
+    // 这些请求会一路走到 `app.resolve` 返回 404 —— 语义完全不同）。
+    for ([_][]const u8{ "../x", "a/b", "..", ".", "" }) |n| {
+        const mv = try std.fmt.allocPrint(a, "{{\"src_dir\":\"/\",\"dst_dir\":\"/d\",\"names\":[\"{s}\"]}}", .{n});
+        const r1 = try doRequestJson(&app, a, "POST", "/api/fs/move", mv, hdrs);
+        try testing.expectEqual(@as(u16, 403), r1.status);
+
+        const cp = try std.fmt.allocPrint(a, "{{\"src_dir\":\"/\",\"dst_dir\":\"/d\",\"names\":[\"{s}\"]}}", .{n});
+        const r2 = try doRequestJson(&app, a, "POST", "/api/fs/copy", cp, hdrs);
+        try testing.expectEqual(@as(u16, 403), r2.status);
+
+        const rm = try std.fmt.allocPrint(a, "{{\"dir\":\"/\",\"names\":[\"{s}\"]}}", .{n});
+        const r3 = try doRequestJson(&app, a, "POST", "/api/fs/remove", rm, hdrs);
+        try testing.expectEqual(@as(u16, 403), r3.status);
+
+        const rn = try std.fmt.allocPrint(a, "{{\"path\":\"/x\",\"name\":\"{s}\"}}", .{n});
+        const r4 = try doRequestJson(&app, a, "POST", "/api/fs/rename", rn, hdrs);
+        try testing.expectEqual(@as(u16, 403), r4.status);
+    }
+
+    // 空数组是显式 400（Go 的 "Empty file names"），不是"什么都不做然后 200"。
+    for ([_][]const u8{ "/api/fs/move", "/api/fs/copy" }) |ep| {
+        const r = try doRequestJson(&app, a, "POST", ep, "{\"src_dir\":\"/\",\"dst_dir\":\"/d\",\"names\":[]}", hdrs);
+        try testing.expectEqual(@as(u16, 400), r.status);
+    }
+    const rr = try doRequestJson(&app, a, "POST", "/api/fs/remove", "{\"dir\":\"/\",\"names\":[]}", hdrs);
+    try testing.expectEqual(@as(u16, 400), rr.status);
+}
+
+test "stemOf mirrors Go filterRelated's TrimSuffix(name, Ext(name))" {
+    // `movie.mp4` → `movie`，用来前缀匹配 `movie.srt`（同目录字幕/外挂音轨）。
+    try testing.expectEqualStrings("movie", stemOf("movie.mp4"));
+    try testing.expectEqualStrings("movie", stemOf("movie"));
+    // 有多个点时取最后一个（Go `path.Ext` 语义）
+    try testing.expectEqualStrings("ep.01", stemOf("ep.01.mkv"));
 }
 
 test "init_status drives the first-run wizard and init/setup creates the admin" {

@@ -1257,8 +1257,6 @@ pub const factory = driver.Factory{
     // 逐字等于 Go 的 `driver.Config.Name`（drivers/123/meta.go:18）。用户
     // 备份里 id=3/4 两个存储的 `driver` 字段就是 "123Pan"。
     .key = "123Pan",
-    // 历史名/大小写变体只用于查找（`driver.find` 允许忽略大小写已覆盖大部）。
-    .aliases = &.{"123"},
     .label = "123 云盘",
     .secrets = &.{ "password", "AccessToken" },
     // 字段名与 Go `Addition` 的 json tag 逐字一致（无 tag 字段用字段名）。

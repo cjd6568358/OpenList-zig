@@ -668,9 +668,18 @@ const BUILTIN_INDEX =
     \\    <p class="sub">接口是 OpenList 的子集，完整前端只会有部分功能可用，
     \\    详见 <code>docs/STATUS.md</code>。</p>
     \\
+    \\    <h2>首次安装</h2>
+    \\    <p>这个实例还没有管理员。直接在下面填写并提交即可完成初始化 —— 它发的就是
+    \\    <code>POST /api/public/init/setup</code>，和原版前端的安装向导是同一个接口。</p>
+    \\    <form id="setup" hidden>
+    \\      <p><label>用户名 <input name="username" value="admin" required /></label></p>
+    \\      <p><label>密码 <input name="password" type="password" minlength="4" required /></label>
+    \\         <span class="sub">至少 4 位</span></p>
+    \\      <p><button type="submit">创建管理员</button></p>
+    \\      <p id="setup-msg" class="sub"></p>
+    \\    </form>
+    \\
     \\    <script>
-    \\      // The tokens above are substituted at startup; reflect the two that
-    \\      // are visible so a misconfiguration is obvious from the page itself.
     \\      var c = window.OPENLIST_CONFIG;
     \\      if (c.main_color) {
     \\        document.documentElement.style.setProperty("--accent", c.main_color);
@@ -679,6 +688,33 @@ const BUILTIN_INDEX =
     \\      if (c.base_path &amp;&amp; c.base_path !== "/") parts.push("base_path " + c.base_path);
     \\      parts.push(c.cdn ? "assets → CDN" : "assets → 本地");
     \\      document.getElementById("mode").textContent = parts.join(" · ");
+    \\
+    \\      // 未初始化时亮出安装面板。init_status 是 public 路由，不需要令牌。
+    \\      // 为什么需要这个：内置占位页原本连 POST 的入口都没有，用户只能上服务器
+    \\      // 敲 curl —— 那对一台只连着光猫的机器来说太远了。
+    \\      fetch("api/public/init_status").then(function (r) { return r.json(); })
+    \\        .then(function (j) {
+    \\          if (!j || !j.data || j.data.initialized) return;
+    \\          var f = document.getElementById("setup");
+    \\          f.hidden = false;
+    \\          f.onsubmit = function (ev) {
+    \\            ev.preventDefault();
+    \\            var d = new FormData(f);
+    \\            fetch("api/public/init/setup", {
+    \\              method: "POST",
+    \\              headers: { "Content-Type": "application/json" },
+    \\              body: JSON.stringify({ username: d.get("username"), password: d.get("password") }),
+    \\            }).then(function (r) { return r.json(); })
+    \\              .then(function (j) {
+    \\                if (j &amp;&amp; j.code === 200) { location.reload(); return; }
+    \\                document.getElementById("setup-msg").textContent =
+    \\                  "失败：" + ((j &amp;&amp; j.message) || "未知错误");
+    \\              }).catch(function (e) {
+    \\                document.getElementById("setup-msg").textContent = "失败：" + e;
+    \\              });
+    \\            return false;
+    \\          };
+    \\        }).catch(function () {});
     \\    </script>
     \\    <!-- customize body -->
     \\  </body>
@@ -998,4 +1034,22 @@ test "the builtin shell carries every token the pipeline looks for" {
     try testing.expect(std.mem.indexOf(u8, fe.index_html, "href=\"https://x/l.png\"") != null);
     try testing.expect(std.mem.indexOf(u8, fe.index_html, "<!--h-->") != null);
     try testing.expect(std.mem.indexOf(u8, fe.index_html, "<!--b-->") != null);
+}
+
+test "the built-in shell carries a first-run setup panel" {
+    // 回归（用户 2026-10-15 指出）：内置占位页原先连入口都没有，普通用户无法在
+    // 浏览器里初始化 —— 只能上服务器敲 curl。这个面板把它补上，发的是
+    // `POST /api/public/init/setup`（和原版前端安装向导同一个接口）。
+    // 于是这几样东西必须在页面里齐备，缺一个表单就跑不通。
+    try testing.expect(std.mem.indexOf(u8, BUILTIN_INDEX, "首次安装") != null);
+    try testing.expect(std.mem.indexOf(u8, BUILTIN_INDEX, "id=\"setup\"") != null);
+    // init_status 是 public 路由，页面据此决定显不显面板
+    try testing.expect(std.mem.indexOf(u8, BUILTIN_INDEX, "api/public/init_status") != null);
+    try testing.expect(std.mem.indexOf(u8, BUILTIN_INDEX, "api/public/init/setup") != null);
+    // 面板默认隐藏，只有 init_status 说未初始化才亮出来
+    try testing.expect(std.mem.indexOf(u8, BUILTIN_INDEX, "id=\"setup\" hidden") != null);
+    // 密码下限与后端一致（后端是 <4 拒绝）
+    try testing.expect(std.mem.indexOf(u8, BUILTIN_INDEX, "minlength=\"4\"") != null);
+    // 成功后 reload，让页面进入已初始化状态
+    try testing.expect(std.mem.indexOf(u8, BUILTIN_INDEX, "location.reload()") != null);
 }

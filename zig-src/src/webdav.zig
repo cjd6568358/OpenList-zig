@@ -27,6 +27,7 @@ const model = @import("model.zig");
 const driver = @import("driver.zig");
 const http = @import("http.zig");
 const urlmod = @import("util/url.zig");
+const time = @import("util/time.zig");
 const cookiejar = @import("cookiejar.zig");
 const client_mod = @import("client.zig");
 const log = @import("log.zig");
@@ -294,6 +295,234 @@ fn getOrHead(app: *App, req: *http.Request, res: *http.Response, is_head: bool) 
 // PUT / MKCOL / DELETE
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// ETag 与条件请求 —— 对齐 Go `internal/net/preconditions.go`（上游 8cfe906e
+// 把它接到 WebDAV 的 PUT 上）与 `server/common/proxy.go:90` 的 `GetEtag`。
+//
+// 为什么值得做：标准 WebDAV 客户端（挂载盘、rsync 类同步工具）靠
+// `If-None-Match: *` 表达"不存在才写入"。此前这里恒返回 201 且完全不看条件头，
+// 于是"只写新文件"的客户端每次都整份重传，冲突覆盖也无从谈起。
+// ---------------------------------------------------------------------------
+
+const Cond = enum { none, yes, no };
+
+/// Go `common.GetEtag(file, size)`：有 hash 用 hash，否则退化成
+/// `"<hex(mtime 秒)>-<hex(size)>"`。
+///
+/// ⚠️ 用**秒**不是纳秒：上游注释写明存储后端不保证亚秒精度能跨缓存刷新复现，
+/// 用纳秒会让同一文件每次 stat 拿到不同 ETag，条件请求永远不成立。
+fn etagFor(a: std.mem.Allocator, f: driver.File) ![]const u8 {
+    if (f.hash_info) |hi| {
+        if (hi.hash_value.len > 0) return std.fmt.allocPrint(a, "\"{s}\"", .{hi.hash_value});
+    }
+    return std.fmt.allocPrint(a, "\"{x}-{x}\"", .{ f.modified, f.size });
+}
+
+fn trimWs(s: []const u8) []const u8 {
+    var i: usize = 0;
+    var j: usize = s.len;
+    while (i < j and (s[i] == ' ' or s[i] == '\t')) i += 1;
+    while (j > i and (s[j - 1] == ' ' or s[j - 1] == '\t')) j -= 1;
+    return s[i..j];
+}
+
+/// Go `internal/net/preconditions.go:11` 的 `scanETag`：识别 `W/"x"` 或 `"x"`，
+/// 返回 ETag 本身与剩余文本。
+fn scanETag(s: []const u8) ?struct { etag: []const u8, remain: []const u8 } {
+    const t = trimWs(s);
+    var start: usize = 0;
+    if (std.mem.startsWith(u8, t, "W/")) start = 2;
+    if (t.len < start + 2 or t[start] != '"') return null;
+    var i: usize = start + 1;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (c == '"') return .{ .etag = t[0 .. i + 1], .remain = t[i + 1 ..] };
+        // RFC 7232 §2.3 允许的 ETag 字符
+        const ok = c == 0x21 or (c >= 0x23 and c <= 0x7e) or c >= 0x80;
+        if (!ok) return null;
+    }
+    return null;
+}
+
+fn etagStrongMatch(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b) and a.len > 0 and a[0] == '"';
+}
+
+/// Go `etagWeakMatch`：`strings.TrimPrefix(a, "W/") == strings.TrimPrefix(b, "W/")`。
+/// 必须是**整串前缀**，不能写成按字符集合 trim（那会把 `"W"` 开头的强 ETag 也剥掉）。
+fn stripWeakPrefix(s: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, s, "W/")) s[2..] else s;
+}
+
+fn etagWeakMatch(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, stripWeakPrefix(a), stripWeakPrefix(b));
+}
+
+/// HTTP 日期解析（Go `http.ParseTime`）。这里支持 RFC 7231 要求发送方必须
+/// 产生的 IMF-fixdate（"Mon, 02 Jan 2006 15:04:05 GMT"）以及常见的
+/// RFC 850 / asctime 两种老格式；解析不出来时**返回 null**，调用方按 Go 的
+/// 语义把它当 `condNone`（忽略该条件头），不会误判成 412。
+fn parseHttpTime(s: []const u8) ?i64 {
+    var it = std.mem.tokenizeAny(u8, s, " \t");
+    const tok = [4][]const u8{ it.next() orelse return null, it.next() orelse return null,
+        it.next() orelse return null, it.next() orelse return null };
+    var day_s: []const u8 = undefined;
+    var mon_s: []const u8 = undefined;
+    var year_s: []const u8 = undefined;
+    var time_s: []const u8 = undefined;
+    var zone_s: []const u8 = undefined;
+
+    // IMF-fixdate:  Mon,  02  Jan  2006  15:04:05  GMT
+    if (tok[1].len == 2 and std.ascii.isDigit(tok[1][0]) and std.ascii.isDigit(tok[1][1]) and
+        (tok[2].len == 3 or tok[2].len == 4 and tok[2][3] == ','))
+    {
+        day_s = tok[1];
+        mon_s = tok[2][0..3];
+        year_s = tok[3];
+        time_s = it.next() orelse return null;
+        zone_s = it.next() orelse return null;
+    } else if (std.mem.indexOfScalar(u8, tok[1], '-') != null) {
+        // RFC 850:  Monday, 02-Jan-06 15:04:05 MST   （逗号已在 tokenize 里按空白切，
+        // 但这一种的首段常带逗号，故按 '-' 分段）
+        var p = std.mem.splitScalar(u8, tok[1], '-');
+        day_s = p.next() orelse return null;
+        mon_s = p.next() orelse return null;
+        year_s = p.next() orelse return null;
+        time_s = tok[2];
+        zone_s = tok[3];
+    } else {
+        // asctime:  Mon Jan  2 15:04:05 2006  （注意年是最后一个 token）
+        mon_s = tok[1];
+        day_s = tok[2];
+        time_s = tok[3];
+        year_s = it.next() orelse return null;
+        zone_s = "GMT";
+    }
+
+    if (!std.ascii.eqlIgnoreCase(zone_s, "GMT") and !std.ascii.eqlIgnoreCase(zone_s, "UTC")) return null;
+
+    const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    var month: i64 = -1;
+    for (month_names, 0..) |m, i| {
+        if (std.ascii.eqlIgnoreCase(m, mon_s)) month = @intCast(i + 1);
+    }
+    if (month < 0) return null;
+
+    const day = std.fmt.parseInt(i64, day_s, 10) catch return null;
+    var year = std.fmt.parseInt(i64, year_s, 10) catch return null;
+    if (year < 100) year += if (year < 70) 2000 else 1900; // RFC 850 的两位年
+
+    var tp = std.mem.splitScalar(u8, time_s, ':');
+    const hh = std.fmt.parseInt(i64, tp.next() orelse return null, 10) catch return null;
+    const mm = std.fmt.parseInt(i64, tp.next() orelse return null, 10) catch return null;
+    const ss = std.fmt.parseInt(i64, tp.next() orelse return null, 10) catch return null;
+
+    return time.daysFromCivil(year, month, day) * 86400 + hh * 3600 + mm * 60 + ss;
+}
+
+fn checkIfMatch(a: std.mem.Allocator, req: *const http.Request, etag: []const u8, exists: bool) !Cond {
+    const vals = try req.headersAll(a, "If-Match");
+    if (vals.len == 0) return .none;
+    var joined = Buf.init(a);
+    for (vals, 0..) |v, i| {
+        if (i != 0) try joined.appendByte(',');
+        try joined.append(v);
+    }
+    if (!exists) return .no;
+    var im = joined.slice();
+    while (true) {
+        im = trimWs(im);
+        if (im.len == 0) break;
+        if (im[0] == ',') {
+            im = im[1..];
+            continue;
+        }
+        if (im[0] == '*') return .yes;
+        const r = scanETag(im) orelse break;
+        if (etagStrongMatch(r.etag, etag)) return .yes;
+        im = r.remain;
+    }
+    return .no;
+}
+
+fn checkIfNoneMatch(a: std.mem.Allocator, req: *const http.Request, etag: []const u8, exists: bool) !Cond {
+    const vals = try req.headersAll(a, "If-None-Match");
+    if (vals.len == 0) return .none;
+    var joined = Buf.init(a);
+    for (vals, 0..) |v, i| {
+        if (i != 0) try joined.appendByte(',');
+        try joined.append(v);
+    }
+    if (!exists) return .yes;
+    var buf = joined.slice();
+    while (true) {
+        buf = trimWs(buf);
+        if (buf.len == 0) break;
+        if (buf[0] == ',') {
+            buf = buf[1..];
+            continue;
+        }
+        if (buf[0] == '*') return .no;
+        const r = scanETag(buf) orelse break;
+        if (etagWeakMatch(r.etag, etag)) return .no;
+        buf = r.remain;
+    }
+    return .yes;
+}
+
+fn checkIfUnmodifiedSince(req: *const http.Request, modtime: i64) Cond {
+    const v = req.header("If-Unmodified-Since") orelse return .none;
+    if (modtime == 0) return .none; // Go `isZeroTime`
+    const t = parseHttpTime(v) orelse return .none;
+    return if (modtime <= t) .yes else .no;
+}
+
+fn checkIfModifiedSince(req: *const http.Request, modtime: i64) Cond {
+    // Go：只对 GET / HEAD 生效
+    if (!eql(u8, req.method, "GET") and !eql(u8, req.method, "HEAD")) return .none;
+    const v = req.header("If-Modified-Since") orelse return .none;
+    if (modtime == 0) return .none;
+    const t = parseHttpTime(v) orelse return .none;
+    return if (modtime <= t) .no else .yes;
+}
+
+/// 对齐 Go `internal/net/preconditions.go` 末尾的 `writeNotModified`（RFC 7232 §4.1）。
+fn writeNotModified(res: *http.Response) !void {
+    res.setStatus(304);
+    try res.set("Content-Length", "0");
+}
+
+/// 对齐 Go `net.CheckPreconditions`：返回 true 表示条件头已经决定了响应
+/// （304 / 412），调用方必须就此返回、不再执行实际操作。
+fn checkPreconditions(a: std.mem.Allocator, req: *const http.Request, res: *http.Response, etag: []const u8, modtime: i64, exists: bool) !bool {
+    var ch = try checkIfMatch(a, req, etag, exists);
+    if (ch == .none) ch = checkIfUnmodifiedSince(req, modtime);
+    if (ch == .no) {
+        res.setStatus(412);
+        try res.set("Content-Length", "0");
+        return true;
+    }
+    switch (try checkIfNoneMatch(a, req, etag, exists)) {
+        .no => {
+            if (eql(u8, req.method, "GET") or eql(u8, req.method, "HEAD")) {
+                try writeNotModified(res);
+            } else {
+                res.setStatus(412);
+                try res.set("Content-Length", "0");
+            }
+            return true;
+        },
+        .none => {
+            if (checkIfModifiedSince(req, modtime) == .no) {
+                try writeNotModified(res);
+                return true;
+            }
+        },
+        .yes => {},
+    }
+    return false;
+}
+
 fn put(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const vpath = vpathOf(req.path);
@@ -304,8 +533,35 @@ fn put(app: *App, req: *http.Request, res: *http.Response) !void {
         return;
     };
     var ctx = driver.Ctx{ .alloc = a, .tag = r.mount.mount_path };
+
+    // 对齐上游 `handlePut`（webdav.go:398-415）：PUT **之前**先 stat ——
+    // 目标已存在且是目录 ⇒ 405 Method Not Allowed（覆盖目录没有意义）。
+    var exists = false;
+    var modtime: i64 = 0;
+    var etag: []const u8 = "";
+    if (r.mount.driver.details(&ctx, r.rel)) |f| {
+        if (f.is_dir) {
+            res.setStatus(405);
+            try res.set("Content-Length", "0");
+            return;
+        }
+        exists = true;
+        modtime = f.modified;
+        etag = try etagFor(a, f);
+    } else |_| {}
+
+    // 条件请求：If-Match / If-Unmodified-Since / If-None-Match 不满足 ⇒ 412，
+    // 且**不执行**上传。
+    if (try checkPreconditions(a, req, res, etag, modtime, exists)) return;
+
     r.mount.driver.put(&ctx, r.rel, req.body.source()) catch |e| return webdavErr(res, e);
-    res.setStatus(201);
+    // 上游：已存在 ⇒ 204，新建 ⇒ 201（此前这里恒 201，客户端无法区分覆盖与新建）。
+    res.setStatus(if (exists) 204 else 201);
+    // 上游写完会再 stat 一次拿新 ETag；拿不到就干脆不发这个头，
+    // 也好过发一个已经过期的旧值。
+    if (r.mount.driver.details(&ctx, r.rel)) |f| {
+        try res.set("ETag", try etagFor(a, f));
+    } else |_| {}
     try res.set("Content-Length", "0");
 }
 

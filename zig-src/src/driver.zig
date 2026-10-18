@@ -15,8 +15,14 @@
 //! blank check.
 
 const std = @import("std");
+const testing = std.testing;
 const model = @import("model.zig");
 const json = @import("util/json.zig");
+/// 编译期驱动白名单，由 `build.zig` 的 `-Ddrivers=` 注入。
+/// 字段：`drivers`（basename 逗号分隔串）+ `drivers_all`（true = 全量）。
+/// 只有走 `zig build` / `zig build test` 才有这个模块 —— 这也正是
+/// `tools/build_remote.py` 必须走 `zig build test` 而不是裸 `zig test` 的原因。
+const build_options = @import("build_options");
 
 pub const Obj = model.Obj;
 pub const File = model.File;
@@ -244,9 +250,12 @@ pub const Factory = struct {
     /// 必须与 Go `driver.Config.Name` **逐字节相同** —— Go 把驱动名直接写进
     /// 配置的 `Storage.driver`，改名就等于读不懂已有配置。例如 itvsh 的 Go 名
     /// 是「上海电信智家硬盘」（drivers/itvsh/meta.go:34），不是 "Itvsh"。
+    ///
+    /// **不提供别名 / 不忽略大小写**（用户 2026-10-15 明确要求）：本工程不背
+    /// 兼容性包袱。历史名一律删除，配置按最新驱动名重新添加即可。
+    /// Go 侧就是 `map[string]DriverConstructor` 的精确查找
+    /// （`internal/op/driver.go:26`），这里与之对齐。
     key: []const u8,
-    /// 额外可接受的写法（本工程历史名等）。只用于查找，不用于写出。
-    aliases: []const []const u8 = &.{},
     /// One-line description shown in the admin UI.
     label: []const u8,
     /// JSON text of the `addition` schema (field name -> default/type), served
@@ -269,20 +278,38 @@ pub const Factory = struct {
 /// Built-in driver table. Explicit rather than self-registering: Zig has no
 /// static initialisers, and an explicit list makes the size cost of each
 /// driver visible in one place — which is the whole point of this exercise.
-pub const builtin = [_]Factory{
-    @import("drivers/local.zig").factory,
-    @import("drivers/webdav.zig").factory,
-    @import("drivers/itvsh.zig").factory,
-    @import("drivers/aliyundrive.zig").factory,
-    @import("drivers/cloud189.zig").factory,
-    @import("drivers/cloud189pc.zig").factory,
+///
+/// **按编译期白名单生成**（用户 2026-10-15 要求，即 `-Ddrivers=`，见
+/// `docs/MODULAR_DRIVERS.md` §4 方案 A）。不勾选的驱动连编译都不进二进制，
+/// 体积按 xz 边际全额省下，`/api/admin/driver/names` 与前端下拉框自然只列
+/// 编译进去的那些。
+///
+/// ⚠️ 为什么这里必须是**一串 `if (comptime ...)`**，而不能把 factory 收集进
+/// 一个数组再过滤：`registry` 一旦持有 `Factory` 值，就等于持有了里面每个
+/// fn 指针，**所有驱动的代码都会被强制生成**（Zig 惰性分析只认"被引用"）。
+/// 用 comptime 分支时，未选中的 `@import(...).factory` 连同整个分支一起被
+/// 消掉，一行代码都不生成 —— 这是整个白名单能省体积的关键。
+pub const builtin = blk: {
+    // 12 个注册项；每个 if 对应一项，与 build.zig 的 DRIVERS 表一一对应
+    // （build.zig 负责把用户传的名字翻译成这里的 basename 并校验）。
+    @setEvalBranchQuota(200000);
+    var list: []const Factory = &.{};
+    if (has("local")) list = list ++ [_]Factory{@import("drivers/local.zig").factory};
+    if (has("webdav")) list = list ++ [_]Factory{@import("drivers/webdav.zig").factory};
+    if (has("itvsh")) list = list ++ [_]Factory{@import("drivers/itvsh.zig").factory};
+    if (has("aliyundrive")) list = list ++ [_]Factory{@import("drivers/aliyundrive.zig").factory};
+    if (has("cloud189")) list = list ++ [_]Factory{@import("drivers/cloud189.zig").factory};
+    if (has("cloud189pc")) list = list ++ [_]Factory{@import("drivers/cloud189pc.zig").factory};
+    if (has("pan123")) list = list ++ [_]Factory{@import("drivers/pan123.zig").factory};
     // T2（2026-10-12）：补上的三个正确变体（用户配置 + build_sqfs.yml
     // 默认清单用的是这些，不是 `_open` 系列）。
-    @import("drivers/pan123.zig").factory, // 123Pan（用户名+密码）
-    @import("drivers/quarkuc.zig").factory, // Quark（Cookie）
-    @import("drivers/pan115.zig").factory, // 115 Cloud（Cookie）
-    @import("drivers/wopan.zig").factory, // WoPan（联通沃云盘，refresh_token）
-    @import("drivers/strm.zig").factory, // Strm（把其他挂载映射成 .strm，2026-10-14）
+    if (has("quarkuc")) list = list ++ [_]Factory{
+        @import("drivers/quarkuc.zig").factory, // Quark（Cookie）
+        @import("drivers/quarkuc.zig").uc_factory, // UC（Cookie，OnlyProxy 变体）
+    };
+    if (has("pan115")) list = list ++ [_]Factory{@import("drivers/pan115.zig").factory};
+    if (has("wopan")) list = list ++ [_]Factory{@import("drivers/wopan.zig").factory};
+    if (has("strm")) list = list ++ [_]Factory{@import("drivers/strm.zig").factory};
 
     // ---------------------------------------------------------------------
     // 暂时下线的入口 —— 这几个是**做错了变体**的驱动，代码保留、不删，
@@ -295,20 +322,40 @@ pub const builtin = [_]Factory{
     //
     // T2 已补齐前者，后者按用户 2026-10-12 的指示保留代码但不注册。
     // ---------------------------------------------------------------------
-    // @import("drivers/123open.zig").factory,   // 123 Open
-    // @import("drivers/quark.zig").factory,     // QuarkOpen
-    // @import("drivers/115open.zig").factory,   // 115 Open
+    // if (has("123open"))  ... // 123 Open
+    // if (has("quark"))    ... // QuarkOpen
+    // if (has("115open"))  ... // 115 Open
+
+    break :blk list;
 };
 
-pub fn find(key: []const u8) ?*const Factory {
-    for (&builtin) |*f| {
-        if (std.ascii.eqlIgnoreCase(f.key, key)) return f;
+/// 编译期驱动白名单查询。`build_options.drivers` 是 build.zig 传进来的
+/// **basename**（= `src/drivers/<name>.zig` 去掉扩展名）逗号分隔串，
+/// `drivers_all` 为 true 时全量。
+///
+/// 用**字符串**而不是 `[]const []const u8` 选项：生成模块里的字面量是
+/// comptime 已知的，`splitScalar` 才能在 comptime 下跑；万一哪天它不是，
+/// 这里会直接编译失败而不是静默跑出个空注册表。
+fn has(comptime name: []const u8) bool {
+    if (build_options.drivers_all) return true;
+    var it = std.mem.splitScalar(u8, build_options.drivers, ',');
+    while (it.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " ");
+        if (t.len != 0 and std.mem.eql(u8, t, name)) return true;
     }
-    // 第二遍才查别名：正式名永远优先，避免别名遮蔽同名的其它驱动。
-    for (&builtin) |*f| {
-        for (f.aliases) |alias| {
-            if (std.ascii.eqlIgnoreCase(alias, key)) return f;
-        }
+    return false;
+}
+
+
+/// 精确匹配，与 Go `op.GetDriver`（`internal/op/driver.go:26` 的 map 查找）
+/// 一致：没有别名、不忽略大小写。用户 2026-10-15 定的规矩——不背兼容性
+/// 包袱，历史名直接删，配置按最新驱动名重新加。
+///
+/// 返回**指向 `builtin` 元素的指针**而不是拷贝：`builtin` 现在是 slice
+/// （编译期白名单 re方向生成，长度不定），for 出来的是值，取不到地址。
+pub fn find(key: []const u8) ?*const Factory {
+    for (builtin, 0..) |f, i| {
+        if (std.mem.eql(u8, f.key, key)) return &builtin[i];
     }
     return null;
 }
@@ -316,7 +363,7 @@ pub fn find(key: []const u8) ?*const Factory {
 /// Keys of all compiled-in drivers, for `/api/admin/driver/list`.
 pub fn keys(alloc: std.mem.Allocator) ![][]const u8 {
     var out = try alloc.alloc([]const u8, builtin.len);
-    for (&builtin, 0..) |*f, i| out[i] = f.key;
+    for (builtin, 0..) |f, i| out[i] = f.key;
     return out;
 }
 
@@ -336,3 +383,50 @@ pub const Error = error{
     /// Upstream returned a well-formed response we could not interpret.
     UnexpectedResponse,
 };
+
+test "find matches the Go Config.Name byte for byte — no aliases, no case folding" {
+    // 回归（用户 2026-10-15）：不许再有兼容性包袱。Go 侧是
+    // `internal/op/driver.go:26` 的 map 精确查找，Zig 必须一致。
+    //
+    // 白名单感知：本测试跑在 `-Ddrivers=` 选中的子集上，所以"能找到"只能断言
+    // **编译进来了的**驱动；"找不到"的断言与白名单无关，必须无条件的。
+    // 全量构建下 4 条"能找到"覆盖 Quark / UC / 123Pan / itvsh 四类易错项。
+    try testing.expectEqualStrings("Local", find("Local").?.key); // 任何构建都该有
+
+    if (find("UC") != null) {
+        try testing.expectEqualStrings("UC", find("UC").?.key);
+        try testing.expect(find("Quark") != null); // 同实现，必然同时入选
+    }
+    if (find("123Pan") != null) try testing.expectEqualStrings("123Pan", find("123Pan").?.key);
+    if (find("上海电信智家硬盘") != null) {
+        try testing.expectEqualStrings("上海电信智家硬盘", find("上海电信智家硬盘").?.key);
+    }
+
+    for ([_][]const u8{
+        "Itvsh",  // itvsh 的历史名
+        "123",    // 123Pan 的历史名
+        "quark",  // 大小写变体
+        "local",
+        "LOCAL",
+        "123pan",
+        "",       // 空串
+        "QuarkOpen",
+    }) |bad| {
+        try testing.expect(find(bad) == null);
+    }
+}
+
+test "keys() reports exactly the registered driver names, no duplicates" {
+    const ks = try keys(testing.allocator);
+    defer testing.allocator.free(ks);
+    // 条数随白名单变化（全量 = 12 注册项，11 个实现，quarkuc 出 Quark + UC
+    // 两个），所以不断言固定值，只断言"自洽 + 无重复 + 非空"这些不变量。
+    try testing.expect(ks.len > 0);
+    for (ks, 0..) |k, i| {
+        for (ks[i + 1 ..]) |other| {
+            try testing.expect(!std.mem.eql(u8, k, other));
+        }
+        // find 必须能按这个 key 找到自己
+        try testing.expectEqualStrings(k, find(k).?.key);
+    }
+}

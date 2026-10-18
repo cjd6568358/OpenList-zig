@@ -36,11 +36,41 @@ const rt = @import("../rt.zig");
 // 协议常量（drivers/quark_uc/meta.go 的 Conf 与 util.go 的端点）
 // ---------------------------------------------------------------------------
 
-const api = "https://drive.quark.cn/1/clouddrive";
-const referer = "https://pan.quark.cn";
-/// `pr` / `fr` 固定 query 参数（util.go:35-36）。
-const pr = "ucpro";
-const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch";
+/// Go `drivers/quark_uc/meta.go` 的 `Conf` + 两个 `op.RegisterDriver`：夸克
+/// (`Quark`) 与 UC (`UC`) **共用同一套协议**，只有 ua / referer / api / pr 四个
+/// 常量不同，`UC` 另外带 `OnlyProxy`。所以这里把它们参数化，而不是复制一份
+/// 42 KB 的驱动 —— 复制一份就多一份协议漂移的机会。
+pub const Conf = struct {
+    /// Go `driver.Config.Name`，即写进 `Storage.driver` 的字符串。
+    name: []const u8,
+    ua: []const u8,
+    referer: []const u8,
+    api: []const u8,
+    /// `pr` / `fr` 固定 query 参数（util.go:35-36）。
+    pr: []const u8,
+    /// Go `driver.Config.OnlyProxy`。UC 的直链靠 Cookie 认身份，302 出去就失效
+    /// ⇒ 必须走服务端代理（`model.Link.proxy = true`）。夸克不需要。
+    only_proxy: bool,
+};
+
+pub const quark_conf = Conf{
+    .name = "Quark",
+    .ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch",
+    .referer = "https://pan.quark.cn",
+    .api = "https://drive.quark.cn/1/clouddrive",
+    .pr = "ucpro",
+    .only_proxy = false,
+};
+
+pub const uc_conf = Conf{
+    .name = "UC",
+    .ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) uc-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch",
+    .referer = "https://drive.uc.cn",
+    .api = "https://pc-api.uc.cn/1/clouddrive",
+    .pr = "UCBrowser",
+    .only_proxy = true,
+};
+
 const oss_ua = "aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit";
 
 const page_size: i64 = 100;
@@ -161,6 +191,9 @@ pub const Quark = struct {
     storage_id: i64,
     cfg: Addition,
     client: httpclient.Client,
+    /// 站点参数（`quark_conf` / `uc_conf`）。`Addition` 是**用户配置**，
+    /// 这个是**驱动变体**，两者不能混。
+    conf: Conf,
     /// T6：init 跑在后台线程，请求线程随时可能进来 —— 串行化同一驱动的请求，
     /// 顺带保护 `cfg.cookie` 的并发写（Go 那边是单协程模型下直接改字段）。
     req_mu: std.Io.Mutex = .init,
@@ -180,8 +213,10 @@ pub const Quark = struct {
         .space = space,
     };
 
-    fn drvName(_: *anyopaque) []const u8 {
-        return "Quark";
+    /// 返回**变体**自己的名字（`Quark` / `UC`），与 `factory.key` 一致 ——
+    /// fs/get 的 `provider` 直接透传它，写死 "Quark" 会让 UC 存储显示成夸克。
+    fn drvName(ptr: *anyopaque) []const u8 {
+        return as(ptr).conf.name;
     }
 
     /// 通用请求（util.go:27-67）。`pathname` 以 `/` 开头。
@@ -191,12 +226,12 @@ pub const Quark = struct {
         defer self.req_mu.unlock(io);
 
         const url = try std.fmt.allocPrint(arena, "{s}{s}?pr={s}&fr=pc{s}", .{
-            api, pathname, pr, if (query) |q| (if (q.len > 0) q else "") else "",
+            self.conf.api, pathname, self.conf.pr, if (query) |q| (if (q.len > 0) q else "") else "",
         });
         var hdrs = List(model.Header).init(arena);
         try hdrs.append(.{ .name = "Cookie", .value = self.cfg.cookie });
         try hdrs.append(.{ .name = "Accept", .value = "application/json, text/plain, */*" });
-        try hdrs.append(.{ .name = "Referer", .value = referer });
+        try hdrs.append(.{ .name = "Referer", .value = self.conf.referer });
         if (ua_override) |u| try hdrs.append(.{ .name = "User-Agent", .value = u });
 
         const res = try self.client.send(arena, .{
@@ -267,14 +302,14 @@ fn requestUnchecked(self: *Quark, arena: std.mem.Allocator, pathname: []const u8
     const io = rt.io();
     self.req_mu.lockUncancelable(io);
     defer self.req_mu.unlock(io);
-    const url = try std.fmt.allocPrint(arena, "{s}{s}?pr={s}&fr=pc", .{ api, pathname, pr });
+    const url = try std.fmt.allocPrint(arena, "{s}{s}?pr={s}&fr=pc", .{ self.conf.api, pathname, self.conf.pr });
     const res = try self.client.send(arena, .{
         .method = method,
         .url = url,
         .headers = &[_]model.Header{
             .{ .name = "Cookie", .value = self.cfg.cookie },
             .{ .name = "Accept", .value = "application/json, text/plain, */*" },
-            .{ .name = "Referer", .value = referer },
+            .{ .name = "Referer", .value = self.conf.referer },
         },
         .body = body,
         .use_cookies = true,
@@ -424,25 +459,29 @@ fn link(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, args: driver.LinkAr
     // 转码地址：仅 Quark、视频分类、且有大小（driver.go:66-71）
     if (self.cfg.use_transcoding_address and (raw != null and (raw.?.intAt("category") orelse 0) == 1) and (raw != null and (raw.?.intAt("size") orelse 0) > 0)) {
         const body = try std.fmt.allocPrint(a, "{{\"fid\":{s},\"resolutions\":\"low,normal,high,super,2k,4k\",\"supports\":\"fmp4_av,m3u8,dolby_vision\"}}", .{try jsonQuote(a, entry.id)});
-        const res = try self.request(a, "/file/v2/play/project", "POST", null, body, ua);
+        const res = try self.request(a, "/file/v2/play/project", "POST", null, body, self.conf.ua);
         const v = json.parse(a, res) catch return Error.UpstreamNotJson;
         for (arrAt(&v, "data.video_list")) |item| {
-            if (item.strAt("video_info.url")) |u| return .{ .url = try a.dupe(u8, u) };
+            // `UC` 变体 `OnlyProxy`：转码地址同样靠 Cookie 认身份。
+            if (item.strAt("video_info.url")) |u| return .{ .url = try a.dupe(u8, u), .proxy = self.conf.only_proxy };
         }
         return Error.InvalidResponse;
     }
 
     const body = try std.fmt.allocPrint(a, "{{\"fids\":[{s}]}}", .{try jsonQuote(a, entry.id)});
-    const res = try self.request(a, "/file/download", "POST", null, body, ua);
+    const res = try self.request(a, "/file/download", "POST", null, body, self.conf.ua);
     const v = json.parse(a, res) catch return Error.UpstreamNotJson;
     const url = v.strAt("data.0.download_url") orelse return Error.InvalidResponse;
     return .{
         .url = url,
         .header = &[_]model.Header{
             .{ .name = "Cookie", .value = self.cfg.cookie },
-            .{ .name = "Referer", .value = referer },
-            .{ .name = "User-Agent", .value = ua },
+            .{ .name = "Referer", .value = self.conf.referer },
+            .{ .name = "User-Agent", .value = self.conf.ua },
         },
+        // 对齐 Go `driver.Config.OnlyProxy`（UC 变体为 true）：直链必须经服务端
+        // 代理，否则 api.zig 会 302 出去、Cookie 丢了链接就失效。
+        .proxy = self.conf.only_proxy,
     };
 }
 
@@ -697,7 +736,7 @@ fn upPart(self: *Quark, a: std.mem.Allocator, pre: UpPre, part_no: i64, chunk: [
         .headers = &[_]model.Header{
             .{ .name = "Authorization", .value = auth_key },
             .{ .name = "Content-Type", .value = content_type },
-            .{ .name = "Referer", .value = referer ++ "/" },
+            .{ .name = "Referer", .value = try std.fmt.allocPrint(a, "{s}/", .{self.conf.referer}) },
             .{ .name = "x-oss-date", .value = date },
             .{ .name = "x-oss-user-agent", .value = oss_ua },
         },
@@ -745,7 +784,7 @@ fn upCommit(self: *Quark, a: std.mem.Allocator, pre: UpPre, etags: [][]const u8)
             .{ .name = "Authorization", .value = auth_key },
             .{ .name = "Content-MD5", .value = content_md5 },
             .{ .name = "Content-Type", .value = "application/xml" },
-            .{ .name = "Referer", .value = referer ++ "/" },
+            .{ .name = "Referer", .value = try std.fmt.allocPrint(a, "{s}/", .{self.conf.referer}) },
             .{ .name = "x-oss-callback", .value = callback_b64 },
             .{ .name = "x-oss-date", .value = date },
             .{ .name = "x-oss-user-agent", .value = oss_ua },
@@ -763,12 +802,9 @@ fn upCommit(self: *Quark, a: std.mem.Allocator, pre: UpPre, etags: [][]const u8)
 // 注册
 // ---------------------------------------------------------------------------
 
-pub const factory = driver.Factory{
-    // 逐字等于 Go 的 `driver.Config.Name`（drivers/quark_uc/meta.go:30）。
-    .key = "Quark",
-    .label = "夸克网盘",
-    .secrets = &.{"cookie"},
-    .addition_schema =
+/// 两个变体的 `Addition` 字段集完全相同（Go 里是同一个 `Addition` 类型），
+/// 所以 schema 只写一份 —— 抄两份迟早会不一致。
+const addition_schema =
     \\{
     \\  "cookie":                   {"type":"string","required":true,"secret":true,"help":"浏览器里抓的 Cookie（含 __pus/__puus 等）"},
     \\  "root_folder_id":           {"type":"string","default":"0","help":"根目录 fid，夸克的根是 0"},
@@ -777,15 +813,39 @@ pub const factory = driver.Factory{
     \\  "use_transcoding_address":  {"type":"bool","default":false,"help":"视频走转码地址（可 302）"},
     \\  "only_list_video_file":     {"type":"bool","default":false,"help":"只列出视频与目录"}
     \\}
-    ,
+;
+
+pub const factory = driver.Factory{
+    // 逐字等于 Go 的 `driver.Config.Name`（drivers/quark_uc/meta.go:30）。
+    .key = "Quark",
+    .label = "夸克网盘",
+    .secrets = &.{"cookie"},
+    .addition_schema = addition_schema,
     .create = create,
 };
 
+/// `UC` 变体（`drivers/quark_uc/meta.go:53` 的第二个 `op.RegisterDriver`）：
+/// 与 `Quark` 同协议同一份 `Addition`，但站点参数不同且 `OnlyProxy`。
+/// 只注册 `Quark` 时，用户配置里 `driver:"UC"` 的存储会报"驱动不存在"。
+pub const uc_factory = driver.Factory{
+    .key = "UC",
+    .label = "UC网盘",
+    .secrets = &.{"cookie"},
+    .addition_schema = addition_schema,
+    .create = createUc,
+};
+
 fn create(alloc: std.mem.Allocator, storage_id: i64, cfg: ?*const json.Value) !driver.Driver {
-    return driver.asDriver(Quark, try createWithId(alloc, storage_id, cfg));
+    return driver.asDriver(Quark, try createWithId(alloc, storage_id, cfg, quark_conf));
 }
 
-pub fn createWithId(alloc: std.mem.Allocator, storage_id: i64, cfg: ?*const json.Value) !*Quark {
+/// `UC` 变体（`drivers/quark_uc/meta.go:53` 的第二个 `op.RegisterDriver`）。
+/// 与 `Quark` 同协议、不同站点参数，且 `OnlyProxy`。
+fn createUc(alloc: std.mem.Allocator, storage_id: i64, cfg: ?*const json.Value) !driver.Driver {
+    return driver.asDriver(Quark, try createWithId(alloc, storage_id, cfg, uc_conf));
+}
+
+pub fn createWithId(alloc: std.mem.Allocator, storage_id: i64, cfg: ?*const json.Value, conf: Conf) !*Quark {
     const self = try alloc.create(Quark);
     const jar = try alloc.create(cookiejar.Jar);
     jar.* = cookiejar.Jar.init(alloc);
@@ -794,6 +854,7 @@ pub fn createWithId(alloc: std.mem.Allocator, storage_id: i64, cfg: ?*const json
         .storage_id = storage_id,
         .cfg = try Addition.parse(alloc, cfg),
         .client = httpclient.Client.init(alloc, .{}, jar),
+        .conf = conf,
     };
     return self;
 }
@@ -903,11 +964,39 @@ test "T2: createWithId builds a driver with the expected name" {
     var arena = testArena();
     defer arena.deinit();
     const a = arena.allocator();
-    const self = try createWithId(a, 8, null);
+    const self = try createWithId(a, 8, null, quark_conf);
     defer self.client.deinit();
     try testing.expectEqual(@as(i64, 8), self.storage_id);
     try testing.expectEqualStrings("Quark", Quark.drvName(@ptrCast(self)));
     try testing.expectEqualStrings("Quark", factory.key);
+}
+
+test "T3: the UC variant is its own registered driver, not an alias" {
+    // 回归：Go `drivers/quark_uc/meta.go` 注册了**两个** Config（`Quark` 与
+    // `UC`）。只注册 `Quark` 时，用户备份里 `driver:"UC"` 的存储会直接报
+    // "驱动不存在"。两者同协议、不同站点参数，且 UC 带 OnlyProxy。
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings("UC", uc_factory.key);
+    try testing.expectEqualStrings("Quark", factory.key);
+    try testing.expect(uc_conf.only_proxy);
+    try testing.expect(!quark_conf.only_proxy);
+    try testing.expectEqualStrings("https://pc-api.uc.cn/1/clouddrive", uc_conf.api);
+    try testing.expectEqualStrings("https://drive.quark.cn/1/clouddrive", quark_conf.api);
+    try testing.expectEqualStrings("UCBrowser", uc_conf.pr);
+    try testing.expectEqualStrings("ucpro", quark_conf.pr);
+    try testing.expectEqualStrings("https://drive.uc.cn", uc_conf.referer);
+    try testing.expect(std.mem.indexOf(u8, uc_conf.ua, "uc-cloud-drive/") != null);
+    // 两个变体的 addition schema 必须是同一份（Go 里是同一个 Addition 类型）
+    try testing.expectEqualStrings(factory.addition_schema, uc_factory.addition_schema);
+
+    // 驱动自报的名字要跟着变体走 —— fs/get 的 `provider` 直接透传它。
+    const d = try createUc(a, 21, null);
+    try testing.expectEqualStrings("UC", d.vtable.name(d.ptr));
+    const q = try create(a, 22, null);
+    try testing.expectEqualStrings("Quark", q.vtable.name(q.ptr));
 }
 
 
@@ -919,7 +1008,7 @@ test "T2: copy is NotSupported, matching Go" {
     var arena = testArena();
     defer arena.deinit();
     const a = arena.allocator();
-    const self = try createWithId(a, 9, null);
+    const self = try createWithId(a, 9, null, quark_conf);
     defer self.client.deinit();
     const d = driver.asDriver(Quark, self);
     var ctx = driver.Ctx{ .alloc = a };

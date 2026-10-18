@@ -291,12 +291,14 @@ fn buildMounts(gpa: std.mem.Allocator, app: *api.App, cfg: *config.Config) !void
     app.publishMounts(try mounts.toOwned());
 }
 
-/// T3 / 用户 2026-10-12 定的规则：**写回一律用 Go 名**。
+/// 用户 2026-10-12 定的规则：**写回一律用 Go 名**。
 ///
-/// `driver.find` 允许别名与忽略大小写（只为读得进老配置），但配置一旦解析
-/// 成功，`Storage.driver` 就归一成 `factory.key` —— 它逐字节等于 Go 的
-/// `driver.Config.Name`，这样 `cfg.save()`（token/cookie 回写、设置修改）
-/// 落盘的永远是 Go 认识的名字，不会再扩散别名。
+/// `driver.find` 是**精确匹配**（对齐 Go `op.GetDriver` 的 map 查找，无别名、
+/// 不忽略大小写），所以解析失败就是配置里的驱动名与编译进来的驱动名不一致 ——
+/// 直接报错让人改配置，不做大小写/历史名的兼容（用户 2026-10-15：不背兼容性
+/// 包袱）。解析成功后 `Storage.driver` 仍归一成 `factory.key`，它逐字节等于
+/// Go 的 `driver.Config.Name`，这样 `cfg.save()`（token/cookie 回写、设置修改）
+/// 落盘的永远是 Go 认识的名字。
 ///
 /// ⚠️ 必须在**主线程**调用：`save()` → `syncStorages()` 会读 `s.driver`，
 /// 后台初始化线程写它会数据竞争（撕裂的 slice 头 → 配置里出现野指针）。

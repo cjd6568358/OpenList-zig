@@ -1464,10 +1464,10 @@ fn parseTime(v: ?[]const u8) i64 {
 // ---------------------------------------------------------------------------
 
 pub const factory = driver.Factory{
-    // 与 Go `driver.Config.Name` 一致（drivers/itvsh/meta.go:34）。配置里的
-    // `Storage.driver` 存的就是这个字符串，写成 "Itvsh" 会读不懂已有配置。
+    // 逐字等于 Go `driver.Config.Name`（drivers/itvsh/meta.go:34）。配置里的
+    // `Storage.driver` 存的就是这个字符串 —— 曾有过的历史名 "Itvsh" 已按用户
+    // 2026-10-15 的要求删除（不背兼容性包袱）。
     .key = "上海电信智家硬盘",
-    .aliases = &.{"Itvsh"},
     .label = "上海电信智家硬盘",
     // secrets 同时收两种拼写：Go 无 tag 字段以字段名为键（`Cookies`），
     // 本工程早期版本写的是 snake_case（`cookies`）—— 回显脱敏两种都要挡。

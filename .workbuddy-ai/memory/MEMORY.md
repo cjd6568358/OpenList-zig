@@ -119,3 +119,75 @@
   方便逐文件对比上游。届时 Zig 驱动 = `openlist-zig/src/drivers/<name>.zig`，Go = `drivers/<name>/`。
 - 本 `.workbuddy-ai/memory/` 当前挂在 `OpenList` 项目下；项目移动后应随 `openlist-zig` 一起搬迁到
   `OpenList/openlist-zig/.workbuddy-ai/memory/`，使其成为自包含子项目。
+
+## ★ 真机隔离铁律与一个差点犯大错的坑（2026-10-15）
+
+**规则**：光猫上的真机测试**只允许在 `/tmp/olz`**（tmpfs，重启即失），
+绝不碰 `/opt/sq/openlist` 与 Go 的 `config.json` / `data.db`。
+
+**踩过的坑（必须记住）**：
+1. SSH 命令的**默认 cwd 是 `/root`，不是 `/`**。用 paramiko 直接传
+   `"tmp/olz/x"` 这种相对路径，落点实际是 `/root/tmp/olz/x` ——
+   `tools/remote.py` 的"无前导斜杠 → `abs_remote()` 补回斜杠"那套规则，
+   **只对走它自己的 `put()` 的路径生效**；绕过它直接用 paramiko 就会踩坑。
+2. **要写盘一律用绝对路径 `/tmp/olz/...`**，并在同一条命令里 `mkdir -p /tmp/olz`。
+3. 这台设备没有 `setsid`，busybox 也没有 `curl`（用 `wget`）；
+   `nohup ... &` 跨会话不存活——起服务 + 探测必须放在同一条 exec_command 里。
+4. `/root/tmp` 会被周期性清理，不能当可靠暂存。
+5. **诊断出路径错了就不要将错就错**：我已经打出 `pwd` = `/root`、
+   `ls /tmp/olz` = No such directory，却继续用 `$(pwd)/tmp/olz` ——
+   发现问题时立刻停下改路径，而不是换个写法重复同一个错误。
+
+## Zig 编译期驱动白名单 `-Ddrivers=`（2026-10-15）
+
+- `build.zig` 加 `-Ddrivers=`；`driver.zig` 的 `builtin` 改成 `blk:` + 一串
+  `if (has(basename))` 在 comptime 生成。
+- **关键坑**：必须用 comptime **分支**，不能把 `Factory` 收集进数组再过滤 ——
+  factory 里是 fn 指针，一持有就强制生成**全部**驱动代码，裁剪直接失效。
+- 名字两种拼写都收：Go 驱动名（`189Cloud`）或 Zig 源文件名（`cloud189`）。
+  `quarkuc` 一个文件出两个驱动（`Quark`+`UC`），所以 4 个文件 = 5 个注册项。
+- `tools/build_remote.py` 必须走 `zig build test`：`driver.zig` 现在
+  `@import("build_options")`，裸 `zig test src/tests.zig` 编不过。
+- ⚠️ **`zig build` 会吞掉 "All N tests passed."**，并在末尾打一行误导性的
+  `failed command: <test bin>`（实测退出码其实是 0）。判成功看
+  `--summary all` 打出的 `test success`，别找汇总串。
+- 实测：全量 1,183,352 B；`local,webdav,Quark,strm` = 893,352 B（省 24.5%）。
+
+## CI workflow 重组（2026-10-15）
+
+- `build_minimal.yml` → `build_go_minimal.yml`：并入原 build_sqfs.yml 为
+  `build_sqfs` job（多产一个 aarch64 sqfs 镜像），另发 `ci-sqfs-<sha>` Release。
+- `build_sqfs.yml` 已删除，其 §0–§12 方法论文档搬进 build_go_minimal 头部。
+- 新增 `build_zig_minimal.yml`：只产 Zig 版 aarch64 白名单 sqfs。
+  打包参数与 Go 版逐项一致（xz -b 1M -all-root、stage/openlist、openlist、755）。
+- 校验用 `zig build --help -Ddrivers="..."`（**不是 `-Dhelp`**，那不是合法选项）。
+
+## 内置前端与账号（2026-10-15）
+
+- `src/frontend.zig` 的 `BUILTIN_INDEX` 是**静态占位页**，原先既无安装向导也无
+  登录框 ⇒ 普通用户无法在浏览器里初始化。已补一个默认隐藏的 `#setup` 面板：
+  fetch `api/public/init_status`，`initialized:false` 才亮出，提交即 POST
+  `api/public/init/setup`，成功后 reload。
+- **OpenList 没有"注册账号"**（Go 上游也没有）：单管理员设计。public 组只有
+  settings/init_status/init/setup，auth 组只有 login、login/hash、me。
+  Zig 曾自造 `/api/auth/register`，按"对齐 Go"已删。
+- 改 admin 密码只能 CLI：`openlist admin set/random`。且 **`admin set` 在没有
+  任何管理员时会报 NoAdministrator** —— 首次只能走 web setup 或
+  `OPENLIST_ADMIN_PASSWORD` 环境变量。
+
+## 真机后台进程踩坑（2026-10-15）
+
+- SSH 里起后台服务**必须 `< /dev/null`**：否则子进程继承 channel 的 stdout，
+  paramiko 的 read() 永远等不到 EOF，脚本会一直挂着（实测挂了 14 分钟）。
+- busybox 的 `wget` **不支持 `--header`**，也没有 `curl` ⇒ 带 Authorization 的
+  请求要从本机 Python 直连设备端口（LAN 可达）来发。
+- `wget -q` 对非 2xx 不输出 body，验证"被拒绝"的场景别用它。
+
+## workflow 收尾（2026-10-15）
+
+- **UPX 已全部移除**（用户要求）：compress 输入、matrix 的 upx 变体、两个
+  Compress with UPX 步骤。原因写在文件里：stub 把解压体放进匿名内存，
+  128 MB 的 F4610U 上等于凭空多吃一份二进制大小。
+- `build_go_minimal.yml` 的 `drivers` 默认值已与 Zig 的 12 项对齐：
+  `local,webdav,itvsh,aliyundrive_open,189,189pc,123,quark_uc,115,wopan,strm`
+  ⚠ `123` 是 AWS 系，会把 aws-sdk-go 拖回来（约 +7.7 MiB）。
