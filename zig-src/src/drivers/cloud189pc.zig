@@ -2000,16 +2000,31 @@ pub const Cloud189PC = struct {
         var arena = std.heap.ArenaAllocator.init(state.alloc);
         defer arena.deinit();
         const part = state.part0 + @as(i64, @intCast(i));
-        putPartRaw(
-            &state.clients[i],
-            arena.allocator(),
-            state.targets[i],
-            part,
-            state.bufs[i][0..state.lens[i]],
-        ) catch |e| {
-            log.warn("[189pc] 第 {d} 片上传失败: {s}", .{ part, @errorName(e) });
-            state.fail(e);
-        };
+        // 每片 3 次尝试、退避 1s/2s：对齐 Go errgroup 的
+        // `retry.Attempts(3) + Delay(1s) + BackOffDelay`
+        //（drivers/189pc/utils.go:739-742）—— 重试节奏由该片自己的 worker
+        // 承担，别的片不受影响（Go 的 retry 同样只阻塞当前 goroutine）。
+        var attempt: u8 = 0;
+        while (true) {
+            if (putPartRaw(
+                &state.clients[i],
+                arena.allocator(),
+                state.targets[i],
+                part,
+                state.bufs[i][0..state.lens[i]],
+            )) |_| {
+                return;
+            } else |e| {
+                if (attempt >= 2) {
+                    log.warn("[189pc] 第 {d} 片上传失败（3 次尝试）: {s}", .{ part, @errorName(e) });
+                    state.fail(e);
+                    return;
+                }
+                attempt += 1;
+                log.warn("[189pc] 第 {d} 片上传失败: {s}，退避 {d}ms 后重试", .{ part, @errorName(e), if (attempt == 1) @as(i64, 1000) else 2000 });
+                rt.sleepMillis(if (attempt == 1) 1000 else 2000);
+            }
+        }
     }
 
     /// 各分片 MD5（大写）用 "\n" 连起来再 MD5 —— 同样大写。
@@ -2225,7 +2240,22 @@ pub const Cloud189PC = struct {
                 try src.readAllInto(@intCast(off), chunk);
                 off += real;
                 const d = hash.md5(chunk);
-                try self.putPart(a, upload_file_id, part_no, try hash.base64Std(a, &d), chunk);
+                const md5_b64 = try hash.base64Std(a, &d);
+                // 每片 3 次尝试、退避 1s/2s（对齐 Go errgroup 的
+                // `retry.Attempts(3) + Delay(1s) + BackOffDelay`，
+                // drivers/189pc/utils.go:739-742）。修复前单片失败即整体失败，
+                // 弱网下大文件必挂（AUDIT_2026-10-18-drivers.md §4-P1-5）。
+                var attempt: u8 = 0;
+                while (true) {
+                    if (self.putPart(a, upload_file_id, part_no, md5_b64, chunk)) |_| {
+                        break;
+                    } else |e| {
+                        if (attempt >= 2) return e;
+                        attempt += 1;
+                        log.warn("[189pc] 第 {d} 片上传失败: {s}，退避 {d}ms 后重试", .{ part_no, @errorName(e), if (attempt == 1) @as(i64, 1000) else 2000 });
+                        rt.sleepMillis(if (attempt == 1) 1000 else 2000);
+                    }
+                }
             }
         } else {
             log.info("[189pc] {s}: 秒传命中", .{name});

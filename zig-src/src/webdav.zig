@@ -505,7 +505,14 @@ fn put(app: *App, req: *http.Request, res: *http.Response) !void {
         }
     } else |_| {}
 
-    r.mount.driver.put(&ctx, r.rel, req.body.source()) catch {
+    // DAV PUT 的 Content-Type 优先取客户端自己发的（浏览器/rclone 会带真实
+    // 类型），没带再从文件名推断 —— Go 侧等价物是 FileStreamer.GetMimetype()
+    // 被 webdav 驱动的 Put callback 设成 Content-Type
+    // （drivers/webdav/driver.go:117-119；此前本工程一个 CT 都不发，
+    // AUDIT_2026-10-18-drivers.md §4-P1-2）。
+    var src = req.body.source();
+    src.mime = req.header("Content-Type") orelse api.mimeFor(std.fs.path.basename(r.rel));
+    r.mount.driver.put(&ctx, r.rel, src) catch {
         return webdavStatus(res, 405);
     };
     res.setStatus(201);

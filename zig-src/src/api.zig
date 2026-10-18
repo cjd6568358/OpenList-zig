@@ -1738,7 +1738,12 @@ fn handleFsPut(app: *App, req: *http.Request, res: *http.Response) !void {
         .progress = putProgressCb,
         .progress_userdata = &prog,
     };
-    r.mount.driver.put(&ctx, r.rel, body.source()) catch |e| return mapDriverError(res, e, &ctx);
+    // Go 的 FileStreamer 带 mimetype（webdav 驱动的 Put callback 会把它设成
+    // Content-Type，drivers/webdav/driver.go:117-119）。从目标文件名推断补上
+    // —— 目前只有 webdav 驱动消费（AUDIT_2026-10-18-drivers.md §4-P1-2）。
+    var src = body.source();
+    src.mime = mimeFor(std.fs.path.basename(r.rel));
+    r.mount.driver.put(&ctx, r.rel, src) catch |e| return mapDriverError(res, e, &ctx);
     try res.jsonOk("null");
 }
 

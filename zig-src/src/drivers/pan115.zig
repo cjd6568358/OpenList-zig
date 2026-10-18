@@ -54,6 +54,8 @@ const api_download_get_url = "https://proapi.115.com/app/chrome/downurl";
 const api_upload_info = "https://proapi.115.com/app/uploadinfo";
 const api_upload_init = "https://uplb.115.com/4.0/initupload.php";
 const api_upload_oss_token = "https://uplb.115.com/3.0/gettoken.php";
+/// `115driver/pkg/driver/api.go` 的 `ApiGetVersion`（`drivers/115/appver.go:18`）。
+const api_app_version = "https://appversion.115.com/1/web/1.0/api/chrome";
 
 const oss_endpoint = "cn-shenzhen.oss.aliyuncs.com";
 const oss_user_agent = "aliyun-sdk-android/2.9.1";
@@ -61,7 +63,11 @@ const oss_security_token_header = "X-OSS-Security-Token";
 
 /// `drivers/115/appver.go:12` —— 用户备份的 Go 版用的就是这个版本号。
 const md5_salt = "Qclm8MGWUv59TnrR0XPg";
-const app_ver = "35.6.0.3";
+/// 默认 app 版本 = Go `appver.go:12` 的包级回落值。运行期真值由 `init` 从
+/// `api_app_version` 动态拉取（Go `initAppVer`，appver.go:41-47）——版本号进
+/// UA 与 GenerateToken/sign 的 `appversion` 参数，上游改版后编译期常量会
+/// **静默失效**，所以必须拉；只有拉不到才回落这个常量。
+const default_app_ver = "35.6.0.3";
 
 const default_root = "0";
 /// `driver/dir.go:35`：单页上限，超过就按这个截断。
@@ -208,6 +214,8 @@ pub const Pan115 = struct {
     cookie: []const u8 = "",
     user_id: i64 = 0,
     userkey: []const u8 = "",
+    /// 运行期 app 版本（init 时动态拉取，见 `fetchAppVer`）。
+    app_ver: []const u8 = default_app_ver,
     /// 串行化同一驱动的请求（顺带保护 cookie/userkey 的并发写）。
     req_mu: std.Io.Mutex = .init,
     /// 上次请求时间（毫秒），用于 `limit_rate` 限速。
@@ -234,8 +242,7 @@ pub const Pan115 = struct {
     }
 
     fn ua(self: *Pan115, arena: std.mem.Allocator) ![]const u8 {
-        _ = self;
-        return std.fmt.allocPrint(arena, "Mozilla/5.0 115Browser/{s}", .{app_ver});
+        return std.fmt.allocPrint(arena, "Mozilla/5.0 115Browser/{s}", .{self.app_ver});
     }
 
     /// 限速 + 发一次带 115 头的请求。
@@ -315,6 +322,34 @@ pub const Pan115 = struct {
             return Error.UpstreamHttp;
         }
         return res.body;
+    }
+
+    /// `drivers/115/appver.go:14-39 getAppVersion`：GET `ApiGetVersion`，读
+    /// `data.win.version_code`。`error` 非空 / 非 2xx / 非 JSON / 网络失败一律
+    /// 保持默认版本（Go 同样只 warn 后回落 `appVer`）。响应用 `self.alloc`
+    /// （驱动生命周期）解析，版本切片直接留着，无需再 dupe。
+    fn fetchAppVer(self: *Pan115) void {
+        const res = self.client.send(self.alloc, .{
+            .method = "GET",
+            .url = api_app_version,
+            .headers = &.{},
+            .use_cookies = false,
+        }) catch |e| {
+            log.warn("[115] get app version failed: {s}", .{@errorName(e)});
+            return;
+        };
+        if (!res.isOk()) {
+            log.warn("[115] get app version -> HTTP {d}", .{res.status});
+            return;
+        }
+        const v = json.parse(self.alloc, res.body) catch {
+            log.warn("[115] get app version: not JSON", .{});
+            return;
+        };
+        if (parseAppVersion(&v)) |ver| {
+            self.app_ver = ver;
+            log.debug("[115] use app version: {s}", .{ver});
+        }
     }
 };
 
@@ -529,6 +564,25 @@ fn init(ptr: *anyopaque, ctx: *driver.Ctx) anyerror!void {
         return Error.AuthFailed;
     }
     if (numAt(&v, "data.user_id")) |id| self.user_id = id;
+
+    // 动态 app 版本（Go drivers/115/appver.go:41-47 `initAppVer`：Init 时拉取、
+    // 失败只 warn 并回落包级默认值）。放在登录检查之后 —— 版本接口不依赖
+    // 登录态，但保持与 Go 的 Init 顺序一致（确认登录可用之后再取）。
+    self.fetchAppVer();
+}
+
+/// 从 `getAppVersion` 响应里提版本号：`data.win.version_code`（Go
+/// `VersionResp`/`Versions`/`Version` 三层结构，appver.go:48-60）。
+/// `error` 非空、字段缺失或空串都算失败（返回 null）—— Go 的 `getAppVer`
+/// 对这三种情形同样回落默认值。纯函数，便于单测。
+fn parseAppVersion(v: *const json.Value) ?[]const u8 {
+    if (v.strAt("error")) |e| {
+        if (e.len > 0) return null;
+    }
+    const data = v.getPath("data") orelse return null;
+    const win = data.getPath("win") orelse return null;
+    const ver = win.strAt("version_code") orelse return null;
+    return if (ver.len > 0) ver else null;
 }
 
 fn deinit(ptr: *anyopaque, ctx: *driver.Ctx) void {
@@ -817,7 +871,7 @@ fn ensureUploadAvailable(self: *Pan115, arena: std.mem.Allocator) !UploadMeta {
 
 /// `drivers/115/util.go:109-114` `GenerateToken`（注意 `preID` 参数**没被用到**，
 /// 这是 Go 原样的行为）。
-fn generateToken(alloc: std.mem.Allocator, user_id: i64, file_id: []const u8, file_size: i64, sign_key: []const u8, sign_val: []const u8, timestamp: i64) ![]const u8 {
+fn generateToken(alloc: std.mem.Allocator, user_id: i64, file_id: []const u8, file_size: i64, sign_key: []const u8, sign_val: []const u8, timestamp: i64, app_ver: []const u8) ![]const u8 {
     var uid_buf: [24]u8 = undefined;
     const uid = std.fmt.bufPrint(&uid_buf, "{d}", .{user_id}) catch unreachable;
     const um = hash.md5(uid);
@@ -933,7 +987,7 @@ fn rapidUpload(
         const t = rt.nowMillis();
         const encoded_token = ec115.encodeTokenRandom(cipher, @truncate(@as(u64, @bitCast(t))), rnd);
 
-        const token = try generateToken(arena, self.user_id, file_id, file_size, sign_key, sign_val, t);
+        const token = try generateToken(arena, self.user_id, file_id, file_size, sign_key, sign_val, t, self.app_ver);
 
         var uid_buf: [24]u8 = undefined;
         const uid = std.fmt.bufPrint(&uid_buf, "{d}", .{self.user_id}) catch unreachable;
@@ -942,7 +996,7 @@ fn rapidUpload(
 
         var pairs = List([2][]const u8).init(arena);
         try pairs.append(.{ "appid", "0" });
-        try pairs.append(.{ "appversion", app_ver });
+        try pairs.append(.{ "appversion", self.app_ver });
         try pairs.append(.{ "userid", uid });
         try pairs.append(.{ "filename", file_name });
         try pairs.append(.{ "filesize", size_s });
@@ -1224,7 +1278,13 @@ fn ossMultipart(self: *Pan115, arena: std.mem.Allocator, up: UploadInit, src: mo
         try h.append(.{ .name = "Authorization", .value = auth });
 
         const q = try std.fmt.allocPrint(arena, "partNumber={d}&uploadId={s}", .{ c.number, upload_id });
-        const res = try self.client.send(arena, .{
+        // 单片 3 次尝试：Go `drivers/115/util.go:339-359`
+        // `for retry := 0; retry < 3; retry++` —— 失败立即重试、成功即断
+        // （Go 到点还会重取 OSS token，那个 ticker 间隔在 SDK 默认值里、
+        // 不在树内，本工程仍未移植，记在 AUDIT §4-P1-7）。重试沿用同一组
+        // 签名头：重试是毫秒级立即发生的，Date 不会过期。
+        var attempt: u8 = 0;
+        var res = try self.client.send(arena, .{
             .method = "PUT",
             .url = try ossUrl(arena, up.bucket, up.object, q),
             .headers = h.slice(),
@@ -1232,8 +1292,19 @@ fn ossMultipart(self: *Pan115, arena: std.mem.Allocator, up: UploadInit, src: mo
             .use_cookies = false,
             .omit_content_type = true,
         });
+        while ((res.status < 200 or res.status >= 300) and attempt < 2) : (attempt += 1) {
+            log.warn("[115] OSS part {d} -> HTTP {d}, retry {d}/2", .{ c.number, res.status, attempt + 1 });
+            res = try self.client.send(arena, .{
+                .method = "PUT",
+                .url = try ossUrl(arena, up.bucket, up.object, q),
+                .headers = h.slice(),
+                .body = chunk_buf[0..@intCast(c.size)],
+                .use_cookies = false,
+                .omit_content_type = true,
+            });
+        }
         if (res.status < 200 or res.status >= 300) {
-            log.warn("[115] OSS part {d} -> HTTP {d}", .{ c.number, res.status });
+            log.warn("[115] OSS part {d} -> HTTP {d} (3 attempts)", .{ c.number, res.status });
             return Error.UploadFailed;
         }
         const etag = res.header("ETag") orelse return Error.InvalidResponse;
@@ -1515,15 +1586,38 @@ test "T2: GenerateSignature matches the reference (sha1 chain, UPPER hex)" {
     try testing.expectEqualStrings("1BD253A8BD9427CB6315AC8B1521683E430415CE", sig);
 }
 
+test "parseAppVersion reads data.win.version_code and rejects error/empty/missing" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ok = "{\"error\":\"\",\"data\":{\"win\":{\"version_code\":\"35.6.0.4\"}}}";
+    const v1 = try json.parse(a, ok);
+    try testing.expectEqualStrings("35.6.0.4", parseAppVersion(&v1).?);
+
+    // Go VersionResp.Error 非空即失败（appver.go:53-56）。
+    const err = "{\"error\":\"boom\",\"data\":{\"win\":{\"version_code\":\"1.0\"}}}";
+    const v2 = try json.parse(a, err);
+    try testing.expect(parseAppVersion(&v2) == null);
+
+    const empty = "{\"error\":\"\",\"data\":{\"win\":{\"version_code\":\"\"}}}";
+    const v3 = try json.parse(a, empty);
+    try testing.expect(parseAppVersion(&v3) == null);
+
+    const miss = "{\"error\":\"\",\"data\":{}}";
+    const v4 = try json.parse(a, miss);
+    try testing.expect(parseAppVersion(&v4) == null);
+}
+
 test "T2: GenerateToken matches the reference (md5 chain, lower hex)" {
     var arena = testArena();
     defer arena.deinit();
     const a = arena.allocator();
 
-    const t1 = try generateToken(a, 12345678, "ABCDEF0123456789ABCDEF0123456789ABCDEF01", 1048576, "", "", 1700000000000);
+    const t1 = try generateToken(a, 12345678, "ABCDEF0123456789ABCDEF0123456789ABCDEF01", 1048576, "", "", 1700000000000, default_app_ver);
     try testing.expectEqualStrings("e4d15d0310d89073a19b263229afcb2c", t1);
 
-    const t2 = try generateToken(a, 87654321, "0000000000000000000000000000000000000000", 42, "sk", "sv", 1699999999999);
+    const t2 = try generateToken(a, 87654321, "0000000000000000000000000000000000000000", 42, "sk", "sv", 1699999999999, default_app_ver);
     try testing.expectEqualStrings("3729a3cb4208c84b82345301e64792a8", t2);
 }
 

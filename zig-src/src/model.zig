@@ -203,6 +203,12 @@ pub const Storage = struct {
 pub const Source = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// 上传内容的 MIME 类型（由 API 层从文件名/请求头推断后填入）。
+    /// Go 的 `model.FileStreamer.GetMimetype()` 的对应物 —— 目前只有
+    /// webdav 驱动消费它（Put 时设 `Content-Type`，对齐
+    /// `drivers/webdav/driver.go:117-119` 的 callback）；其余驱动不发 CT。
+    /// 空串 = 调用方没有推断（测试/内部路径），驱动应保持不发。
+    mime: []const u8 = "",
 
     pub const VTable = struct {
         size: *const fn (*anyopaque) i64,

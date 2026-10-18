@@ -356,6 +356,20 @@ Addition.AccessToken 有解析但 **schema 未声明**（:976-982）⇒ 前端�
 | 11 | api 层 | STATUS §22.4 遗留三端点仍缺：`POST /api/fs/form`（multipart 直传）、`GET/POST /api/fs/archive/meta`、`POST /api/admin/setting/reset_token`（现以 JSON 404 静默失败） | api.zig 白名单无匹配 |
 | 12 | local | 缩略图整块：list thumb URL + `?type=thumb` + 缓存目录 + 限速（schema 已标 [未实现]） | local.zig:362、48-53 |
 
+**2026-10-18 晚已落地 5 项**（同轮修完，构建 409/409 + 真机 e2e 465/0/1）：
+
+| 原编号 | 项 | 落点 | 验证 |
+|---|---|---|---|
+| P1-6 | pan115 **动态 appver 拉取** | `init` 调 `fetchAppVer`（GET `appversion.115.com/1/web/1.0/api/chrome`，读 `data.win.version_code`，失败回落 `default_app_ver`）；`app_ver` 从常量改为驱动字段，UA/GenerateToken/sign 全部用运行期值 | 纯函数 `parseAppVersion` 单测 4 例；真机 run.log 实证 `appversion.115.com ... status=200` |
+| P1-7（前半） | pan115 **OSS 分片 3 次重试** | `ossMultipart` 每片 3 次尝试（对齐 Go util.go:339-359）；**token 中期刷新仍未移植**（ticker 间隔在 SDK 默认值里、不在树内） | 编译 + e2e 写链路 |
+| P1-5 | 189pc **分片 3 次重试 + 1s/2s 退避** | `partWorker`（并发路径）与 `put` 串行路径各一处，对齐 Go `retry.Attempts(3)+Delay(1s)+BackOffDelay` | 编译 + e2e 写链路 |
+| P1-8 | pan123 **err_detail 接入** | `request/get/post/listPage/findChild/resolveEntry` 全链穿 `?*?[]const u8`；list/details/link/mkdir/move/rename/remove/space/put 传 `&ctx.err_detail`；**worker 线程的 refetch 传 null**（跨线程写请求栈帧 = 数据竞争） | 编译期验证（网络路径无单测，同 quarkuc 先例） |
+| P1-2 | webdav **PUT 发 Content-Type** | `model.Source` 新增 `mime` 字段；`fs/put` 用 `mimeFor(basename)`、DAV PUT 优先用请求自身 CT；驱动侧 `src.mime` 非空即发。**顺带修正原注释的错误论断**（Go callback 实际会设 CT） | 编译 + e2e（WebDAV PUT 201/覆盖/ETag 全过） |
+
+**P1 剩余**：webdav SharePoint、189pc family_transfer / old 上传 / rapid_upload /
+torrent、local 缩略图、aliyun `Other(video_preview)`、api 三端点、err_detail
+其余七驱动（cloud189/cloud189pc/aliyundrive/wopan/webdav/local/strm）。
+
 ### P2 — 取舍/待确认（记录在案，不阻塞）
 
 - **待确认 4 项**：① wopan psToken 个人空间链路（建议真机抓包，§3.10-C2）；

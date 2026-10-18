@@ -670,12 +670,17 @@ fn okProp(a: std.mem.Allocator, resp: *xml.Node) !?*xml.Node {
         // 服务端若要求认证就会 401；实际部署里 PROPFIND（init/list）会先
         // 协商好，PUT 轮到时认证方式已确定。
         try headers.appendSlice(try self.authHeaders(a, "PUT", uriPath(target)));
-        // L12：Go 的 gowebdav `put`（pkg/gowebdav/requests.go:199 起）**根本
-        // 不发** `Content-Type` —— resty 只在 body 是 string/[]byte/struct 时
-        // 才推断，这里是 `io.Reader`，于是什么都不设。以前这里恒定发
-        // `application/octet-stream`，与上游不一致（个别服务端会按 CT 分派
-        // 处理逻辑，照抄上游更安全）。
-
+        // L12 修订（2026-10-18，AUDIT_2026-10-18-drivers.md §4-P1-2）：
+        // 原注释称「Go 的 gowebdav put 根本不发 Content-Type」—— **那是错的**。
+        // gowebdav 的 `put` 确实不自己推断 CT（resty 对 io.Reader body 不推断），
+        // 但 drivers/webdav 的 Put 传了 callback
+        // （driver.go:117-119：`r.Header.Set("Content-Type", s.GetMimetype())`），
+        // 而 gowebdav `req` 会应用它（requests.go:57-59 `if intercept != nil`）
+        // ⇒ Go 实际**会发** streamer 的 mimetype。这里对齐：src.mime 非空就发。
+        // 空串 = 内部路径（copy 的 memSource、测试），保持不发。
+        if (src.mime.len > 0) {
+            try headers.append(.{ .name = "Content-Type", .value = src.mime });
+        }
 
         const total: u64 = @intCast(@max(src.size(), 0));
 

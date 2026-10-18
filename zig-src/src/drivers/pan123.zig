@@ -392,6 +392,10 @@ pub const Pan123 = struct {
         query: ?[]const u8,
         body: []const u8,
         allow_login_retry: bool,
+        /// 上游人类可读消息的出口（`&ctx.err_detail`）。null = 调用方不需要
+        /// （init/deinit，以及 worker 线程上的 refetch —— 跨线程写请求栈帧
+        /// 上的字段是数据竞争，见 driver.zig 的 Ctx 注释）。
+        err_detail: ?*?[]const u8,
     ) ![]const u8 {
         const io = rt.io();
         self.req_mu.lockUncancelable(io);
@@ -431,18 +435,24 @@ pub const Pan123 = struct {
             }
             const msg = v.strAt("message") orelse "(no message)";
             log.warn("[123pan] {s} {s} -> code {d}: {s}", .{ method, ep, code, msg });
+            // 上游消息透出（driver.Ctx.err_detail）：对齐 Go 的
+            // `errors.New(message)`（util.go:244）—— 用户看得到"容量不足"
+            // 这类真因，而不是泛化的 UpstreamError。msg 切片活在调用方
+            // arena（请求级）里，API 层在响应发出前取走，生命周期安全
+            // （同 quarkuc.zig 的做法；STATUS §31.9 的机制）。
+            if (err_detail) |slot| slot.* = msg;
             return Error.UpstreamError;
         }
     }
 
     /// GET + query 的便捷重载。
-    fn get(self: *Pan123, arena: std.mem.Allocator, ep: []const u8, query: ?[]const u8) ![]const u8 {
-        return self.request(arena, ep, "GET", query, "", true);
+    fn get(self: *Pan123, arena: std.mem.Allocator, ep: []const u8, query: ?[]const u8, err_detail: ?*?[]const u8) ![]const u8 {
+        return self.request(arena, ep, "GET", query, "", true, err_detail);
     }
 
     /// POST + JSON body 的便捷重载。
-    fn post(self: *Pan123, arena: std.mem.Allocator, ep: []const u8, body: []const u8) ![]const u8 {
-        return self.request(arena, ep, "POST", null, body, true);
+    fn post(self: *Pan123, arena: std.mem.Allocator, ep: []const u8, body: []const u8, err_detail: ?*?[]const u8) ![]const u8 {
+        return self.request(arena, ep, "POST", null, body, true, err_detail);
     }
 };
 
@@ -485,20 +495,20 @@ fn objFromJson(item: *const json.Value) model.Obj {
 }
 
 /// 列一页。query 的键序对齐 Go `getFiles` 的 map（顺序无关，值要对）。
-fn listPage(self: *Pan123, arena: std.mem.Allocator, parent_id: i64, page: i64) !*const json.Value {
+fn listPage(self: *Pan123, arena: std.mem.Allocator, parent_id: i64, page: i64, err_detail: ?*?[]const u8) !*const json.Value {
     const query = try std.fmt.allocPrint(
         arena,
         "driveId=0&limit={d}&next=0&orderBy=file_id&orderDirection=desc&parentFileId={d}&trashed=false&SearchData=&Page={d}&OnlyLookAbnormalFile=0&event=homeListFile&operateType=4&inDirectSpace=false",
         .{ page_size, parent_id, page },
     );
-    const body = try self.get(arena, ep_file_list, query);
+    const body = try self.get(arena, ep_file_list, query, err_detail);
     const v = json.parse(arena, body) catch return Error.UpstreamNotJson;
     return v.getPath("data") orelse return Error.InvalidResponse;
 }
 
 /// 从根开始逐级按名字找。本工程的 vtable 是路径式的，没有 Go 的 Obj 缓存，
 /// 所以每一级都要翻页找（Go 靠 `op.Get` 直接拿到带 id 的 Obj）。
-fn resolveEntry(self: *Pan123, arena: std.mem.Allocator, path: []const u8) !Entry {
+fn resolveEntry(self: *Pan123, arena: std.mem.Allocator, path: []const u8, err_detail: ?*?[]const u8) !Entry {
     var cur = Entry{
         .id = std.fmt.parseInt(i64, self.cfg.root_folder_id, 10) catch 0,
         .name = "/",
@@ -506,15 +516,15 @@ fn resolveEntry(self: *Pan123, arena: std.mem.Allocator, path: []const u8) !Entr
     };
     var it = std.mem.tokenizeAny(u8, path, "/\\");
     while (it.next()) |seg| {
-        cur = try findChild(self, arena, cur.id, seg);
+        cur = try findChild(self, arena, cur.id, seg, err_detail);
     }
     return cur;
 }
 
-fn findChild(self: *Pan123, arena: std.mem.Allocator, parent_id: i64, name: []const u8) !Entry {
+fn findChild(self: *Pan123, arena: std.mem.Allocator, parent_id: i64, name: []const u8, err_detail: ?*?[]const u8) !Entry {
     var page: i64 = 1;
     while (true) {
-        const data = try listPage(self, arena, parent_id, page);
+        const data = try listPage(self, arena, parent_id, page, err_detail);
         const children = arrAt(data, "InfoList");
         for (children, 0..) |_, i| {
             const item = &children[i];
@@ -550,14 +560,14 @@ fn init(ptr: *anyopaque, ctx: *driver.Ctx) anyerror!void {
     // 而 `Request` 在 `code == 401` 时会**自动重登一次**（util.go:236-243）——
     // 所以这里的 `allow_login_retry` 必须是 true，否则「token 过期但非空」的
     // 存储会在 init 阶段直接失败，永远起不来。
-    _ = try self.request(a, ep_user_info, "GET", null, "", true);
+    _ = try self.request(a, ep_user_info, "GET", null, "", true, null);
 }
 
 fn deinit(ptr: *anyopaque, ctx: *driver.Ctx) void {
     const self = as(ptr);
     _ = ctx;
     // Go 的 Drop：尽力登出，忽略结果。
-    _ = self.post(self.alloc, ep_logout, "{}") catch {};
+    _ = self.post(self.alloc, ep_logout, "{}", null) catch {};
     if (self.cfg.access_token.len > 0) self.alloc.free(self.cfg.access_token);
     self.client.deinit();
 }
@@ -565,13 +575,13 @@ fn deinit(ptr: *anyopaque, ctx: *driver.Ctx) void {
 fn list(ptr: *anyopaque, ctx: *driver.Ctx, dir: []const u8) anyerror![]model.Obj {
     const self = as(ptr);
     const a = ctx.alloc;
-    const entry = try resolveEntry(self, a, dir);
+    const entry = try resolveEntry(self, a, dir, &ctx.err_detail);
     if (!entry.is_dir) return driver.Error.NotFound;
 
     var out = List(model.Obj).init(a);
     var page: i64 = 1;
     while (true) {
-        const data = try listPage(self, a, entry.id, page);
+        const data = try listPage(self, a, entry.id, page, &ctx.err_detail);
         for (arrAt(data, "InfoList")) |item| try out.append(objFromJson(&item));
         const next = data.strAt("Next") orelse "-1";
         if (arrAt(data, "InfoList").len == 0 or std.mem.eql(u8, next, "-1")) break;
@@ -585,7 +595,7 @@ fn details(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8) anyerror!model.F
     const a = ctx.alloc;
     var it = std.mem.tokenizeAny(u8, path, "/\\");
     if (it.next() == null) return .{ .name = "/", .is_dir = true };
-    const entry = try resolveEntry(self, a, path);
+    const entry = try resolveEntry(self, a, path, &ctx.err_detail);
     const raw = entry.raw orelse return .{ .name = entry.name, .is_dir = entry.is_dir };
     const o = objFromJson(raw);
     return .{ .name = o.name, .size = o.size, .is_dir = o.is_dir, .modified = o.modified, .created = o.created };
@@ -595,7 +605,7 @@ fn link(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, args: driver.LinkAr
     const self = as(ptr);
     const a = ctx.alloc;
     _ = args;
-    const entry = try resolveEntry(self, a, path);
+    const entry = try resolveEntry(self, a, path, &ctx.err_detail);
     if (entry.is_dir) return driver.Error.NotSupported;
     const raw = entry.raw orelse return Error.InvalidResponse;
 
@@ -608,7 +618,7 @@ fn link(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, args: driver.LinkAr
         raw.intAt("Size") orelse 0,
         raw.intAt("Type") orelse 0,
     });
-    const res_body = try self.post(a, ep_download_info, body);
+    const res_body = try self.post(a, ep_download_info, body, &ctx.err_detail);
     const v = json.parse(a, res_body) catch return Error.UpstreamNotJson;
     const download_url = v.strAt("data.DownloadUrl") orelse return Error.InvalidResponse;
     var url = download_url;
@@ -659,33 +669,33 @@ fn makeDir(ptr: *anyopaque, ctx: *driver.Ctx, dir: []const u8) anyerror!void {
     // dir = "/a/b/newdir" → parent = "/a/b"，name = "newdir"。
     const parent_path = pathParent(dir) orelse return Error.InvalidPath;
     const name = pathBase(dir) orelse return Error.InvalidPath;
-    const parent = try resolveEntry(self, a, parent_path);
+    const parent = try resolveEntry(self, a, parent_path, &ctx.err_detail);
     const body = try std.fmt.allocPrint(a, "{{\"driveId\":0,\"etag\":\"\",\"fileName\":{s},\"parentFileId\":{d},\"size\":0,\"type\":1}}", .{ try jsonQuote(a, name), parent.id });
-    _ = try self.post(a, ep_upload_request, body);
+    _ = try self.post(a, ep_upload_request, body, &ctx.err_detail);
 }
 
 fn move(ptr: *anyopaque, ctx: *driver.Ctx, src: []const u8, dst_dir: []const u8) anyerror!void {
     const self = as(ptr);
     const a = ctx.alloc;
-    const entry = try resolveEntry(self, a, src);
-    const dst = try resolveEntry(self, a, dst_dir);
+    const entry = try resolveEntry(self, a, src, &ctx.err_detail);
+    const dst = try resolveEntry(self, a, dst_dir, &ctx.err_detail);
     const body = try std.fmt.allocPrint(a, "{{\"fileIdList\":[{{\"FileId\":{d}}}],\"parentFileId\":{d}}}", .{ entry.id, dst.id });
-    _ = try self.post(a, ep_move, body);
+    _ = try self.post(a, ep_move, body, &ctx.err_detail);
 }
 
 fn rename(ptr: *anyopaque, ctx: *driver.Ctx, src: []const u8, new_name: []const u8) anyerror!void {
     const self = as(ptr);
     const a = ctx.alloc;
-    const entry = try resolveEntry(self, a, src);
+    const entry = try resolveEntry(self, a, src, &ctx.err_detail);
     const body = try std.fmt.allocPrint(a, "{{\"driveId\":0,\"fileId\":{d},\"fileName\":{s}}}", .{ entry.id, try jsonQuote(a, new_name) });
-    _ = try self.post(a, ep_rename, body);
+    _ = try self.post(a, ep_rename, body, &ctx.err_detail);
 }
 
 fn remove(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, is_dir: bool) anyerror!void {
     const self = as(ptr);
     const a = ctx.alloc;
     _ = is_dir;
-    const entry = try resolveEntry(self, a, path);
+    const entry = try resolveEntry(self, a, path, &ctx.err_detail);
     // Go 把整个 File 结构体塞进 fileTrashInfoList（PascalCase 全字段）。
     const file_type: i64 = if (entry.is_dir) 1 else 0;
     const raw = entry.raw;
@@ -702,13 +712,13 @@ fn remove(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, is_dir: bool) any
             try jsonQuote(a, if (raw) |r| r.strAt("DownloadUrl") orelse "" else ""),
         },
     );
-    _ = try self.post(a, ep_trash, body);
+    _ = try self.post(a, ep_trash, body, &ctx.err_detail);
 }
 
 fn space(ptr: *anyopaque, ctx: *driver.Ctx) anyerror!driver.DiskUsage {
     const self = as(ptr);
     const a = ctx.alloc;
-    const body = try self.get(a, ep_user_info, null);
+    const body = try self.get(a, ep_user_info, null, &ctx.err_detail);
     const v = json.parse(a, body) catch return Error.UpstreamNotJson;
     const permanent = v.intAt("data.SpacePermanent") orelse 0;
     const temporary = v.intAt("data.SpaceTemp") orelse 0;
@@ -769,7 +779,7 @@ fn put(ptr: *anyopaque, ctx: *driver.Ctx, dst: []const u8, src: model.Source) an
     const size = src.size();
     if (size < 0) return Error.InvalidPath;
     const name = pathBase(dst) orelse return Error.InvalidPath;
-    const parent = try resolveEntry(self, a, pathParent(dst) orelse return Error.InvalidPath);
+    const parent = try resolveEntry(self, a, pathParent(dst) orelse return Error.InvalidPath, &ctx.err_detail);
 
     // 1) 整文件 MD5（小写 hex）= upload_request 的 etag。
     //    一遍读、一块 buffer（T7）：不用 readAll 逐块分配。
@@ -793,7 +803,7 @@ fn put(ptr: *anyopaque, ctx: *driver.Ctx, dst: []const u8, src: model.Source) an
         "{{\"driveId\":0,\"duplicate\":{d},\"etag\":{s},\"fileName\":{s},\"parentFileId\":{d},\"size\":{d},\"type\":0}}",
         .{ duplicate_overwrite, try jsonQuote(a, etag), try jsonQuote(a, name), parent.id, size },
     );
-    const res_body = try self.post(a, ep_upload_request, body);
+    const res_body = try self.post(a, ep_upload_request, body, &ctx.err_detail);
     const v = json.parse(a, res_body) catch return Error.UpstreamNotJson;
     const data = v.getPath("data") orelse return Error.InvalidResponse;
 
@@ -811,9 +821,9 @@ fn put(ptr: *anyopaque, ctx: *driver.Ctx, dst: []const u8, src: model.Source) an
         try uploadSigV4(self, a, data, src, size);
         // SDK 分支的收尾（driver.go:242-247）
         const final_body = try std.fmt.allocPrint(a, "{{\"fileId\":{d}}}", .{data.intAt("FileId") orelse 0});
-        _ = try self.post(a, ep_upload_complete, final_body);
+        _ = try self.post(a, ep_upload_complete, final_body, &ctx.err_detail);
     } else {
-        try uploadPresigned(self, a, data, src, size);
+        try uploadPresigned(self, a, data, src, size, &ctx.err_detail);
     }
     reportProgress(ctx, 100);
 }
@@ -823,7 +833,7 @@ fn put(ptr: *anyopaque, ctx: *driver.Ctx, dst: []const u8, src: model.Source) an
 /// 并发度 = `min(片数, UploadThread)`，对齐 Go 的
 /// `errgroup.NewOrderedGroupWithContext(ctx, thread, retry.Attempts(3), BackOffDelay)`
 /// （`upload.go:104-107`）。以前这里是串行的，`UploadThread` 只被记录不生效。
-fn uploadPresigned(self: *Pan123, a: std.mem.Allocator, data: *const json.Value, src: model.Source, size: i64) !void {
+fn uploadPresigned(self: *Pan123, a: std.mem.Allocator, data: *const json.Value, src: model.Source, size: i64, err_detail: ?*?[]const u8) !void {
     const key = data.strAt("Key") orelse return Error.InvalidResponse;
     const bucket = data.strAt("Bucket") orelse return Error.InvalidResponse;
     const upload_id = data.strAt("UploadId") orelse return Error.InvalidResponse;
@@ -860,7 +870,7 @@ fn uploadPresigned(self: *Pan123, a: std.mem.Allocator, data: *const json.Value,
             "{{\"bucket\":{s},\"key\":{s},\"partNumberEnd\":{d},\"partNumberStart\":{d},\"uploadId\":{s},\"StorageNode\":{s}}}",
             .{ try jsonQuote(a, bucket), try jsonQuote(a, key), end - 1, start, try jsonQuote(a, upload_id), try jsonQuote(a, storage_node) },
         );
-        const res_body = try self.post(a, ep, auth_body);
+        const res_body = try self.post(a, ep, auth_body, err_detail);
         const uv = json.parse(a, res_body) catch return Error.UpstreamNotJson;
         const urls = uv.getPath("data.presignedUrls") orelse return Error.InvalidResponse;
 
@@ -898,7 +908,7 @@ fn uploadPresigned(self: *Pan123, a: std.mem.Allocator, data: *const json.Value,
         "{{\"StorageNode\":{s},\"bucket\":{s},\"fileId\":{d},\"fileSize\":{d},\"isMultipart\":{},\"key\":{s},\"uploadId\":{s}}}",
         .{ try jsonQuote(a, storage_node), try jsonQuote(a, bucket), file_id, size, multipart, try jsonQuote(a, key), try jsonQuote(a, upload_id) },
     );
-    _ = try self.post(a, ep_upload_complete_v2, done_body);
+    _ = try self.post(a, ep_upload_complete_v2, done_body, err_detail);
 }
 
 /// 一个 batch（≤`url_batch` 片）的并发上传状态。
@@ -954,7 +964,10 @@ const BatchState = struct {
         if (self.refetched) return;
         self.refetched = true;
         const a = self.refetch_arena.allocator();
-        const body = self.self.post(a, self.ep, self.auth_body) catch return;
+        // ⚠ worker 线程：err_detail 只能为 null。跨线程写请求栈帧上的
+        // Ctx.err_detail 是数据竞争（driver.zig 的 Ctx 注释）；worker 的
+        // 上游消息只进日志，与 panic/超时类错误同样处理。
+        const body = self.self.post(a, self.ep, self.auth_body, null) catch return;
         const v = json.parse(a, body) catch return;
         if (v.getPath("data.presignedUrls")) |u| self.urls = u;
     }

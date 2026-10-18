@@ -42,6 +42,11 @@
 - ⚠ `zig build` 会吞 "All tests passed" 且末尾打误导性 `failed command`（退出码实为 0）；
   判成功看 `--summary all` 的 `test success`。
 - 每个驱动都要单元测试（`std.testing.allocator` 抓泄漏）。**D 盘满会假报 NoSpaceLeft/泄漏**。
+- **Zig 0.17 语言层坑（2026-10-18 连踩三次）**：① 裸 `assert` 已移除 → `std.debug.assert`；
+  ② `**` 数组重复不再是合法 token（`x ** n` 被词法成两个 `*`，报 whitespace 错）→
+  定长数组 + `@memset(&buf, v)`；③ 驱动里 `init` 常是 struct **外**的自由函数，
+  `self.foo()` 只能调到 struct 内声明的成员 —— 新方法必须放进 struct（否则
+  `no field or member function named ...`）；④ `_ = self;` 在 self 已被使用时是编译错误。
 
 ## ★ 用户明确要求（不得再以"简化/体积/困难"为由跳过）
 

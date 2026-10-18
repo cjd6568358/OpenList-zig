@@ -3253,3 +3253,43 @@ MKCOL 遭设备 TCP reset，实例无 panic、重跑全绿 ⇒ 设备一次性�
 `std.debug.assert`）；`**` 数组重复运算符已不是合法 token（`x ** n` 被词法成
 两个 `*`，报 "binary operator '*' has whitespace on one side"），大数组改用
 定长声明 + `@memset`。
+
+---
+
+## 43. P1 批次（2026-10-18 晚）：可靠性 + 错误透传 + 上传头
+
+按 `docs/AUDIT_2026-10-18-drivers.md` §4 的 P1 清单，本轮落地 5 项（都是
+用户在用挂载直接受益的）：
+
+1. **pan115 动态 appver**：`init` 拉 `https://appversion.115.com/1/web/1.0/api/chrome`
+   （`data.win.version_code`），失败回落 `default_app_ver="35.6.0.3"`
+   （对齐 Go `appver.go:41-47`）。`app_ver` 由编译期常量改为驱动字段，
+   UA / GenerateToken / sign 的 `appversion` 全用运行期值 —— 此前上游改版
+   会让常量静默失效。解析提成纯函数 `parseAppVersion`，4 例单测。
+2. **pan115 OSS 分片重试**：每片 3 次尝试（Go util.go:339-359）。
+   ⚠ token 中期刷新（Go 的 ticker）仍未移植，间隔在 SDK 默认值里、不在树内。
+3. **189pc 分片重试**：并发 `partWorker` 与串行 `put` 两条路径都加
+   3 次尝试 + 1s/2s 指数退避（Go `retry.Attempts(3)+Delay(1s)+BackOffDelay`，
+   utils.go:739-742）。此前单片失败即整体失败。
+4. **pan123 err_detail**：`request/get/post/listPage/findChild/resolveEntry`
+   全链穿线，list/details/link/mkdir/move/rename/remove/space/put 传
+   `&ctx.err_detail`；**worker 线程的 refetch 显式传 null**（跨线程写请求
+   栈帧 = 数据竞争，driver.zig 的 Ctx 注释）。用户现在能看到上游原话
+   （如容量不足）而不是泛化 `UpstreamError`。
+5. **webdav PUT Content-Type**：`model.Source` 新增 `mime` 字段；
+   `fs/put` 从文件名推断、DAV PUT 优先用请求自身 CT；驱动侧非空即发。
+   **顺带纠正 L12 的错误注释** —— Go 的 gowebdav 虽然不自己推断 CT，但
+   `drivers/webdav` 的 Put callback 会设（driver.go:117-119），
+   `req` 会应用（requests.go:57-59）⇒ Go 实际**会发**。
+
+**验证**：打包机 **409/409 单测**（新增 parseAppVersion 4 例），aarch64
+`14b260131658c5fe…`（1,258,144 B）；真机 13 挂载 e2e **465 通过 / 0 失败 /
+1 跳过**（坚果云根目录 403 服务商规则；日志
+`docs/regression/2026-10-18-p1-fixes-e2e.log`）。设备 run.log 实证 115 版本
+接口 200。本轮 e2e 用时 9m43s（上轮 4m15s）—— 新增的退避重试在弱网/限流
+路径上会变慢，属预期。
+
+**教训（Zig 0.17 结构）**：`Pan115` 的 `init` 是**结构体外的自由函数**，
+`self.method()` 只能调到 struct 内声明的成员 —— 新方法必须放进 struct 里，
+否则报 `no field or member function named ...`；另 `_ = self;` 在参数已被
+使用时是编译错误（pointless discard）。
