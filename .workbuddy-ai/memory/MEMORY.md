@@ -15,7 +15,7 @@
 |---|---|---|---|
 | local | `Local` | local.zig | ✅ 真机 |
 | webdav | `WebDav` | webdav.zig | ✅ 真机 |
-| itvsh 上海电信智家硬盘 | `上海电信智家硬盘` | itvsh.zig | ✅ 真机（私有驱动，仅本仓库有） |
+| itvsh | `Itvsh`（2026-10-19 由中文名「上海电信智家硬盘」改，Go/Zig 同步） | itvsh.zig | ✅ 真机（私有驱动，仅本仓库有） |
 | 189 个人 | `189Cloud` | cloud189.zig | ✅ 真机 |
 | 189 家庭 | `189CloudPC` | cloud189pc.zig | ✅ 真机（签名逐字节一致） |
 | 123 | `123Pan` | pan123.zig | ✅ 实现完成 |
@@ -25,7 +25,8 @@
 | wopan 沃云盘 | `WoPan` | wopan.zig | ✅ 实现，未真机（无凭据） |
 | strm | `Strm` | strm.zig | ✅ |
 
-- **驱动名铁律**：`factory.key` 逐字节等于 Go `driver.Config.Name`；别名只能进 `Factory.aliases`。
+- **驱动名铁律**：`factory.key` 逐字节等于 Go `driver.Config.Name`；**不设别名**（2026-10-15 删除别名机制）。itvsh 的 Go 名 2026-10-19 起为 ASCII `Itvsh`（原中文名两侧同步改）。
+- **★ label 不是展示名、没有 API 出口**（2026-10-19 查证）：前端 bundle `assets/entry-*.js` 自带 `drivers:{...}` 109 条 key→中文展示名映射（123Pan→123 云盘 等），前台中文名全来自它；itvsh 表里没有 ⇒ 原样渲染 key。Zig `label` 只进启动日志。曾据错误前提把 11 个 label 改成 key，已回退；**用户明确要求 label 保持中文**。
 - `pan123`/`quarkuc`/`itvsh` 上游 `Copy` 就是 NotSupport ⇒ vtable `.copy=null`，有测试钉住别顺手补。
 - `115 Cloud` 依赖外部 SDK（`SheltonZhu/115driver`）、`WoPan` 依赖 `wopan-sdk-go`
   （其 Go 源码已 vendor 到 `zig-src/wopan-sdk-*.go` 供对照）⇒ 只能靠真实 API 回归。
@@ -66,8 +67,17 @@
 - **绝不碰** `/opt/sq/openlist`、Go 的 `config.json`/`data.db`。
 - **绝不用命令行子串筛进程**（2026-10-15 误杀过生产）。只按 **pidfile / `--port <n>`** 匹配；
   必须循环杀到 0 并 `netstat` 复核。脚本每次 start/stop 主动打印生产实例是否还在。
-- **生产实例**：`/opt/sq/openlist/openlist server --config /opt/armbian/bin/openlist/config.json`，
-  日志 `/tmp/openlist.log`，端口 15244 + SFTP 15222。挂了只能手动按原命令行 `nohup` 恢复。
+- **生产实例（2026-10-19 起为 Zig 持久部署）**：`/opt/armbian/bin/openlist/openlist server --config /opt/armbian/bin/openlist/config.zig.json`，
+  日志 `/tmp/openlist.log`，端口仅 15244（Zig 无 SFTP/FTP，15221/15222 无监听）；启停走 `/opt/script/openlist_start.sh [stop]`（幂等 + CDN 重试），崩溃后手动重跑该脚本。Go sqfs 镜像版已退役（镜像已删、挂载点已 rmdir）。
+- **🔴 绝不对光猫执行重启/停机类命令（2026-10-19 23:06 血的教训）**：容器里**没有**
+  `reboot` 二进制（`reboot` 一律 rc=127，是空操作）；`ubus call system reboot`
+  **会触发宿主机侧停机流程，把容器内其他服务（easytier/xray/rtp2httpd/onuproxy/
+  smart-iot…）全部杀掉，但重启本身不走完**（uptime 不变、SSH 秒恢复，极具迷惑性）。
+  **重启只有用户本人可以发起**，途径两条（用户 2026-10-19 重申，此前也讲过）：
+  ① WEB 管理后台接口；② telnet 到**宿主机**执行 `reboot`。
+  开机自举验证宁可手工反复跑 `/bin/sh /opt/script/openlist_start.sh`
+  （幂等/stop-start/CDN 重试都测过），也不许碰任何重启类命令。
+  ⚠ 本次检索（本地记忆+历史对话检索）均未找到该规矩的原始记录，已补录于此。
 - SSH 默认 cwd 是 `/root` ⇒ 写盘一律绝对路径 `/tmp/olz/...` 且同条命令 `mkdir -p`。
 - 起后台服务必须 `< /dev/null`（否则 paramiko read() 永不到 EOF）；起服务+探测放同一条 exec。
 - 设备 busybox：`chmod` 失效（用 paramiko sftp.chmod）、无 `curl`/`pkill`/`setsid`，
@@ -144,7 +154,9 @@
 - **remote.py 调用坑（2026-10-19 连踩）**：main() 把 argv 用空格拼接，引号会被本地
   shell 吃掉 ⇒ 远端命令必须作为**单个带引号参数**传（`... 22 "cmd1; cmd2"`），且内联
   命令里用**绝对路径**（SSH cwd 是 /root，相对路径必挂）；只有 `--put` 的远端路径
-  要按模块 docstring 去掉前导斜杠（abs_remote 会补回）。光猫 easytier 配置实际路径是
+  要按模块 docstring 去掉前导斜杠（abs_remote 会补回）。
+- **★ 设备文件留档规矩（用户 2026-10-19 再次强调）**：`/opt/armbian/...` → `D:/workspace/server/armbian/...`（**不带 opt**）；`/opt/script`、`/opt/apps`、`/root` → `D:/workspace/server/f4610u/...`；只留最新一份。openlist 镜像在 `server/armbian/bin/openlist/`（含 sqfs 回滚件 + README.txt 三步回滚）。
+- 光猫 easytier 配置实际路径是
   `/opt/armbian/bin/easytier/easytier.yaml`（.yaml，用户口头说的 .yml 不复存在）。
 - **根目录整洁铁律（2026-10-19 用户定）**：仓库根只允许 openlist 上游文件 +
   zig-src/.github/.workbuddy/.workbuddy-ai 四类目录；Zig 工具/脚本一律放 `zig-src/tools/`，
