@@ -1702,19 +1702,24 @@ test "T2: createWithId builds a driver with the expected name" {
 }
 
 // P115-REG（2026-10-18 真机事故）：线上 fs/list /115 拿到**空** content，
-// 而同一 cookie、同一 URL 的 curl 直打有 14 条。本测试用**真机抓下来的
-// 响应体原文**（src/drivers/115list_sample.json，cid=0, limit=1000）钉住
-// 解析链路：json.parse → basicOk → arrAt("data") → entryFrom。
-test "P115-REG: real files response parses to all entries" {
+// 而同一 cookie、同一 URL 的 curl 直打有 14 条。本测试用**合成 fixture**
+// （src/drivers/115list_fixture.json，tools/gen_115_fixture.py 生成，全假数据）
+// 钉住解析链路：json.parse → basicOk → arrAt("data") → entryFrom。
+// fixture 的键集合/键序/值类型/条目构成逐项对齐真机原文（顶层 39 键、目录 31 键、
+// 文件 41 键、7 目录 + 7 文件、count 与 data 等长）。真机原文保留在本地
+// 115list_sample.json（gitignore，不入库）：既含真实文件名不能外泄，fixture
+// 又必须入库 —— 否则新克隆上 @embedFile 编译失败，CI 的 zig build test 全挂
+// （该失败一度被步骤末尾的 `| tail` 吞掉退出码而掩盖）。
+test "P115-REG: fs/list body parses to all entries (synthetic fixture)" {
     var arena = testArena();
     defer arena.deinit();
     const a = arena.allocator();
-    const body = @embedFile("115list_sample.json");
+    const body = @embedFile("115list_fixture.json");
 
     const v = try json.parse(a, body);
     try testing.expect(basicOk(&v));
     const items = arrAt(&v, "data");
-    // 样本是 2026-10-18 抓的：根目录 14 个条目（全目录）。
+    // fixture 沿用真机样本的条目构成：14 条（7 目录 + 7 文件）。
     try testing.expect(items.len > 0);
     // 逐条 entryFrom 不许抛错；首条必须解析出 id/name。
     const first = try entryFrom(&items[0]);

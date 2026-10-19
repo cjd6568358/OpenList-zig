@@ -22,3 +22,8 @@ __pycache__/
 
 # 仓库内可选的本地凭据（首选 ~/.olz_root_pwd，仓库外）
 tools/.root_pwd
+
+# pan115.zig P115-REG 单测的合成 fixture（tools/gen_115_fixture.py 生成）：
+# 必须入库 —— 被 @embedFile，缺文件时新克隆的 zig build test 编译失败。
+# 真机原文 115list_sample.json 含真实文件名，继续由上面的 *.json 规则挡在库外。
+!src/drivers/115list_fixture.json
