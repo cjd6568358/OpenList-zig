@@ -31,15 +31,10 @@ output/
 /daemon/
 /public/dist/*
 !/public/dist/README.md
-/openlist-zig/.zig-cache/
 /zig-src/.zig-cache/
 
 .VSCodeCounter
 *.syso
 
-# ---- 本地调试临时产物（不入库）----
+# ---- 本地临时产物（不入库）----
 /.workbuddy/
-/.browsertest.js
-/.logintrace.js
-/.sandbox_cdn.py
-/probe*.log

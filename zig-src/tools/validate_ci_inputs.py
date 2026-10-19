@@ -23,7 +23,7 @@ import tempfile
 
 import yaml
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (script lives in tools/)
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # zig-src/tools/ -> 仓库根
 WF = [
     os.path.join(ROOT, ".github", "workflows", "build_go_minimal.yml"),
     os.path.join(ROOT, ".github", "workflows", "build_zig_minimal.yml"),

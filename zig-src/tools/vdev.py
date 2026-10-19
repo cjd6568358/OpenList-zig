@@ -1,10 +1,13 @@
 import sys, json, paramiko
+from pathlib import Path
 import os
+# 本脚本现居 zig-src/tools/：parents[2] = 仓库根，不再依赖 cwd
+LOCAL = Path(__file__).resolve().parents[2] / "zig-src" / "dist" / "openlist-aarch64.trimmed"
 c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 c.connect("192.168.1.1", port=10022, username="root", password=os.environ.get("OLZ_ROOT_PWD", ""), timeout=20,
           look_for_keys=False, allow_agent=False)
 sftp = c.open_sftp()
-sftp.put("zig-src/dist/openlist-aarch64.trimmed", "tmp/olz/openlist.trimmed")
+sftp.put(str(LOCAL), "tmp/olz/openlist.trimmed")
 sftp.chmod("tmp/olz/openlist.trimmed", 0o755)
 o,e,rc = sh = None, None, None
 import subprocess

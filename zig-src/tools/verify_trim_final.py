@@ -17,11 +17,13 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 import paramiko
 
 HOST, PORT = "192.168.1.1", 10022
-LOCAL = "D:/workspace/OpenList-zig/zig-src/dist/openlist-aarch64.trimmed"
+# 本脚本现居 zig-src/tools/：parents[2] = 仓库根，不再依赖 cwd 或本机绝对路径
+LOCAL = str(Path(__file__).resolve().parents[2] / "zig-src" / "dist" / "openlist-aarch64.trimmed")
 LISTEN = 15399
 USER = "admin"
 PWD = "trimcheck-verify-2026"
