@@ -139,10 +139,20 @@
   **架构事实**（解释一切差异的前提）：每请求一个 ArenaAllocator（`http.zig:622`）；arena `free` 只在最近一次分配时回退；
   `Client` 每实例一把全局锁（`client.zig:159`），并发靠每 worker 一个 Client；`model.Obj` 无 ID（Go 有），
   189/189pc 靠路径逐段翻页找 ID。**未上真机回归，修复须全量回归。**
-- 验证基线：364 单测全过，aarch64 ~1.21MB；真机 e2e 32/32（2026-10-13 起多次全绿）。
+- 验证基线：411 单测全过（2026-10-19 打包机 `zig build test` 实测，含 115 fixture），
+  aarch64 ~1.21MB；真机 e2e 32/32（2026-10-13 起多次全绿）。
+- **remote.py 调用坑（2026-10-19 连踩）**：main() 把 argv 用空格拼接，引号会被本地
+  shell 吃掉 ⇒ 远端命令必须作为**单个带引号参数**传（`... 22 "cmd1; cmd2"`），且内联
+  命令里用**绝对路径**（SSH cwd 是 /root，相对路径必挂）；只有 `--put` 的远端路径
+  要按模块 docstring 去掉前导斜杠（abs_remote 会补回）。光猫 easytier 配置实际路径是
+  `/opt/armbian/bin/easytier/easytier.yaml`（.yaml，用户口头说的 .yml 不复存在）。
 - **根目录整洁铁律（2026-10-19 用户定）**：仓库根只允许 openlist 上游文件 +
   zig-src/.github/.workbuddy/.workbuddy-ai 四类目录；Zig 工具/脚本一律放 `zig-src/tools/`，
   新脚本用 `Path(__file__).resolve().parents[2]` 定位仓库根，不依赖 cwd。曾经的根目录调试
   残留（.browsertest.js/.logintrace.js/.sandbox_cdn.py/probe*.log/.vdev.py/根 tools/）已全部
   清理或迁入 zig-src。
+- **pan115 fixture 铁律（2026-10-19）**：`src/drivers/115list_fixture.json`（合成 fixture，
+  `tools/gen_115_fixture.py` 生成）**必须入库**——被 pan115.zig P115-REG 单测
+  `@embedFile`，缺文件时新克隆 `zig build test` 编译失败；真机原文
+  `115list_sample.json` 含真实文件名，**永不入库**（`.gitignore` 用 `!` 放行前者即可）。
 - 磁盘紧张是老问题（D 盘曾 100%）；npm pack 的 23MB 前端包用完立刻删。
