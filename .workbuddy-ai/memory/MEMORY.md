@@ -140,4 +140,9 @@
   `Client` 每实例一把全局锁（`client.zig:159`），并发靠每 worker 一个 Client；`model.Obj` 无 ID（Go 有），
   189/189pc 靠路径逐段翻页找 ID。**未上真机回归，修复须全量回归。**
 - 验证基线：364 单测全过，aarch64 ~1.21MB；真机 e2e 32/32（2026-10-13 起多次全绿）。
+- **根目录整洁铁律（2026-10-19 用户定）**：仓库根只允许 openlist 上游文件 +
+  zig-src/.github/.workbuddy/.workbuddy-ai 四类目录；Zig 工具/脚本一律放 `zig-src/tools/`，
+  新脚本用 `Path(__file__).resolve().parents[2]` 定位仓库根，不依赖 cwd。曾经的根目录调试
+  残留（.browsertest.js/.logintrace.js/.sandbox_cdn.py/probe*.log/.vdev.py/根 tools/）已全部
+  清理或迁入 zig-src。
 - 磁盘紧张是老问题（D 盘曾 100%）；npm pack 的 23MB 前端包用完立刻删。
