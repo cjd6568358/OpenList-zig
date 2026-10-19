@@ -89,7 +89,8 @@ pub const Mount = struct {
     driver: driver.Driver,
     /// Normalised: always starts with '/', never ends with one (except "/").
     mount_path: []const u8,
-    /// Human-readable driver label (logs / diagnostics; no longer an API field).
+    /// Human-readable driver label (logs / diagnostics; no longer an API field —
+    /// the client's driver selector renders `driver/names` keys, never this).
     label: []const u8,
 };
 
@@ -2718,9 +2719,10 @@ fn handleDriverList(req: *http.Request, res: *http.Response) !void {
 fn handleDriverInfo(req: *http.Request, res: *http.Response) !void {
     if (!std.mem.eql(u8, req.method, "GET")) return res.jsonError(405, "method not allowed");
     // ⚠ 必须用**解码后**的值：Go `c.Query("driver")`（driver.go:20）会做
-    // 一次百分号解码，而 `115 Cloud`（带空格）与 `上海电信智家硬盘`（非 ASCII）
-    // 经前端 axios 编码后是 `115%20Cloud` / `%E4%B8%8A...` —— 不解码就永远
-    // 404 "not found"，管理页的「添加存储」对这两个驱动直接废掉。
+    // 一次百分号解码，而 `115 Cloud`（带空格）经前端 axios 编码后是
+    // `115%20Cloud` —— 不解码就永远 404 "not found"，管理页的「添加存储」
+    // 对这个驱动直接废掉。（itvsh 的 key 2026-10-19 起为 ASCII "Itvsh"，
+    // 不再有必要拿非 ASCII 名字举例。）
     const name = (try req.queryGetDecoded("driver")) orelse
         return res.jsonError(400, "driver is required");
     const f = driver.find(name) orelse
@@ -4554,7 +4556,7 @@ test "mount resolution matches on segment boundaries" {
     const a = arena.allocator();
 
     var mounts = try a.alloc(Mount, 2);
-    mounts[0] = .{ .storage = .{ .driver = "Itvsh" }, .driver = undefined, .mount_path = "/nas", .label = "" };
+    mounts[0] = .{ .storage = .{ .driver = "Fake" }, .driver = undefined, .mount_path = "/nas", .label = "" };
     mounts[1] = .{ .storage = .{ .driver = "Local" }, .driver = undefined, .mount_path = "/", .label = "" };
 
     var app = App{
@@ -5218,11 +5220,12 @@ test "routing: authed admin endpoints return data, unauthed is 401" {
         try testing.expectEqual(@as(u16, 200), res.status);
         const body = res.buf.slice();
         try testing.expect(std.mem.indexOf(u8, body, "Local") != null);
-        // 驱动名必须与 Go `driver.Config.Name` 一致 —— itvsh 的 Go 名是
-        // 「上海电信智家硬盘」（drivers/itvsh/meta.go:34），配置里存的就是它。
-        // 仅在 itvsh 被 `-Ddrivers=` 选入时才要求出现（裁剪构建本来就不含它）。
-        if (driver.find("上海电信智家硬盘") != null) {
-            try testing.expect(std.mem.indexOf(u8, body, "上海电信智家硬盘") != null);
+        // 驱动名必须与 Go `driver.Config.Name` 一致 —— itvsh 的 Go 名自
+        // 2026-10-19 起是 "Itvsh"（drivers/itvsh/meta.go:34，原中文名已改名），
+        // 配置里存的就是它。仅在 itvsh 被 `-Ddrivers=` 选入时才要求出现
+        // （裁剪构建本来就不含它）。
+        if (driver.find("Itvsh") != null) {
+            try testing.expect(std.mem.indexOf(u8, body, "Itvsh") != null);
         }
     }
 

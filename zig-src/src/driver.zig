@@ -7,7 +7,7 @@
 //!
 //! The method set is a deliberate subset of OpenList's `driver.Driver`
 //! interface: only what the twelve registered drivers (`Local / WebDav /
-//! 上海电信智家硬盘 / 189Cloud / 189CloudPC / 123Pan / AliyundriveOpen /
+//! Itvsh / 189Cloud / 189CloudPC / 123Pan / AliyundriveOpen /
 //! Quark+UC / 115 Cloud / WoPan / Strm`) actually need. `copy` is **optional**
 //! (`null` = the upstream driver's `Copy` is `NotSupport`), and `space` is
 //! optional too (null = no quota). Still absent: `putURL`, `getArchive`,
@@ -273,15 +273,25 @@ pub const Factory = struct {
     /// Value stored in `Storage.driver`.
     ///
     /// 必须与 Go `driver.Config.Name` **逐字节相同** —— Go 把驱动名直接写进
-    /// 配置的 `Storage.driver`，改名就等于读不懂已有配置。例如 itvsh 的 Go 名
-    /// 是「上海电信智家硬盘」（drivers/itvsh/meta.go:34），不是 "Itvsh"。
+    /// 配置的 `Storage.driver`，改名就等于读不懂已有配置。itvsh 的 Go 名
+    /// 2026-10-19 起是 "Itvsh"（原中文名「上海电信智家硬盘」，用户要求驱动名
+    /// 统一 ASCII，Go/Zig 同步改名，见 drivers/itvsh/meta.go:34）。
     ///
     /// **不提供别名 / 不忽略大小写**（用户 2026-10-15 明确要求）：本工程不背
     /// 兼容性包袱。历史名一律删除，配置按最新驱动名重新添加即可。
     /// Go 侧就是 `map[string]DriverConstructor` 的精确查找
     /// （`internal/op/driver.go:26`），这里与之对齐。
     key: []const u8,
-    /// One-line description shown in the admin UI.
+    /// One-line description, used in the startup log line only.
+    ///
+    /// ⚠ 它**不是**展示名、也没有任何 API 出口：上游 Go 的 `driver.Config` /
+    /// `driver.Info` 都没有 label 字段，客户端「添加存储」下拉框的选项文字全部
+    /// 来自 `/api/admin/driver/names` 返回的 **key**（该端点注释原文 "driver
+    /// keys for the selector"；前端各 chunk 里没有任何驱动的中文映射表，
+    /// 2026-10-19 在打包机实测确认）。中文 key 能正常显示也正因为如此 ——
+    /// 显示什么由 key 决定，与 label 无关。
+    /// 2026-10-19 曾据"label 应与上游展示一致"把各驱动 label 统一改成 key，
+    /// 随后证实前提错误（label 根本不展示），已回退为各驱动的中文短名。
     label: []const u8,
     /// JSON text of the `addition` schema (field name -> default/type), served
     /// to the frontend so it can render the storage form without a rebuild.
@@ -423,18 +433,18 @@ test "find matches the Go Config.Name byte for byte — no aliases, no case fold
         try testing.expect(find("Quark") != null); // 同实现，必然同时入选
     }
     if (find("123Pan") != null) try testing.expectEqualStrings("123Pan", find("123Pan").?.key);
-    if (find("上海电信智家硬盘") != null) {
-        try testing.expectEqualStrings("上海电信智家硬盘", find("上海电信智家硬盘").?.key);
+    if (find("Itvsh") != null) {
+        try testing.expectEqualStrings("Itvsh", find("Itvsh").?.key);
     }
 
     for ([_][]const u8{
-        "Itvsh",  // itvsh 的历史名
-        "123",    // 123Pan 的历史名
-        "quark",  // 大小写变体
+        "上海电信智家硬盘", // itvsh 2026-10-19 改名前的旧中文名（无兼容包袱，必须查不到）
+        "123",             // 123Pan 的历史名
+        "quark",           // 大小写变体
         "local",
         "LOCAL",
         "123pan",
-        "",       // 空串
+        "",                // 空串
         "QuarkOpen",
     }) |bad| {
         try testing.expect(find(bad) == null);

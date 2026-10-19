@@ -31,7 +31,12 @@ var config = driver.Config{
 	// 显示在「添加存储」的驱动下拉框里。
 	// 注意这也是持久化到 Storage.Driver 的值，改名会让已配置的存储
 	// 在启动时报 "no driver named: ..."，需要删除后重新添加。
-	Name:        "上海电信智家硬盘",
+	//
+	// 2026-10-19：原名「上海电信智家硬盘」（非 ASCII），用户要求驱动名统一
+	// 为 ASCII，Go 侧与 Zig 侧（itvsh.zig 的
+	// factory.key / drvName）**同时**改名，`key 逐字节等于 Config.Name`
+	// 的铁律不变；旧中文名不做兼容（与 2026-10-15 删除别名机制的决策一致）。
+	Name:        "Itvsh",
 	DefaultRoot: "/",
 	// Link 返回的是需要带 X-NAS-SDKTOKEN 头的地址，浏览器直连拿不到，
 	// 上游还会校验，因此强制走代理。

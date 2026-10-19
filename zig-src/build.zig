@@ -9,13 +9,15 @@ const std = @import("std");
 // "unknown driver" 失败并列岀全部合法值，不会静默产出缺驱动的二进制。
 //
 // `key` 是 Go `driver.Config.Name`（也就是写进 config.json `Storage.driver`
-// 的字符串），两种拼写都接受，因为 itvsh 的 key 是中文「上海电信智家硬盘」，
-// 命令行里打不方便。
+// 的字符串），两种拼写都接受：Go 驱动名（`189Cloud`）或 Zig 源文件名
+// （`cloud189`）—— 后者对 key 与 basename 差异大的驱动（如 `123Pan`↔
+// `pan123`）更顺手。itvsh 的 key 2026-10-19 起为 ASCII `Itvsh`（原中文名
+// 「上海电信智家硬盘」已两侧同步改名），照旧两种拼写都收。
 const Driver = struct { key: []const u8, file: []const u8 };
 const DRIVERS = [_]Driver{
     .{ .key = "Local", .file = "local" },
     .{ .key = "WebDav", .file = "webdav" },
-    .{ .key = "上海电信智家硬盘", .file = "itvsh" },
+    .{ .key = "Itvsh", .file = "itvsh" },
     .{ .key = "AliyundriveOpen", .file = "aliyundrive" },
     .{ .key = "189Cloud", .file = "cloud189" },
     .{ .key = "189CloudPC", .file = "cloud189pc" },

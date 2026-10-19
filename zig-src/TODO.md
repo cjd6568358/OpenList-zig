@@ -126,7 +126,7 @@
 |---|---|---|---|---|---|
 | /quark | Quark | ✅（TLS 补丁后） | **按「读取+删除」回归**（容量满，添加暂不测） | 501 NotSupport ✅ | **账号容量满**（32003）；容量恢复后清 `NO_PUT_MOUNTS` 恢复写测 |
 | /ecloud_self | 189CloudPC | ✅ | ✅ | ✅ 200 | copy 需等目录可见（190 一致性） |
-| /itvsh | 上海电信智家硬盘 | ✅ **首次真机** | ✅ | 501 NotSupport ✅ | 账密登录路径验证通过 |
+| /itvsh | Itvsh | ✅ **首次真机** | ✅ | 501 NotSupport ✅ | 账密登录路径验证通过 |
 | /koofr | WebDav | ✅ | ✅ | ✅ 200 | |
 | /123_2763、/123_5137 | 123Pan | ✅ | ✅ | 501 NotSupport ✅ | |
 | /aliyun | AliyundriveOpen | ✅（token 自动刷新） | ✅ | ✅ 200 | |
@@ -207,7 +207,7 @@ python tools/import_go_config.py <backup.json> <out_config.json> \
   见 STATUS §36A/§36B.5）：UC 全矩阵通过、115 Cloud 写入/mkdir/上传通过、
   WoPan 四连修后 20MB 分片 md5 全链一致。`tools/driver_matrix.py` 仍作为
   「无凭据回归」（注册表/表单/哑凭据添加闭环）保留。**顺带修出两个真 bug**：
-  query 参数未解码（`115 Cloud`/`上海电信智家硬盘` 表单恒 404）、
+  query 参数未解码（`115 Cloud` 与当时 itvsh 的中文名 表单恒 404）、
   189 驱动对非 JSON 响应静默吞掉。
 - ~~**下载响应头遗留**~~ ✅ **已修 2026-10-17（见 STATUS §35，用户实测驱动）**
   `attachHeader` 的 `Etag`/`Last-Modified`、条件请求（304/412/`If-Range`）、

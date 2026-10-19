@@ -17,10 +17,12 @@
 
 Why this exists
 ---------------
-The device already runs the **Go production instance** (pid ~307,
-`/opt/sq/openlist/openlist`, config `/opt/armbian/bin/openlist/config.json`,
-listening on 15244). This script never touches it: everything lands in
-`/tmp/olz` (tmpfs, gone on reboot) on its own port, with its own config.
+The device already runs the **Zig production instance** (2026-10-19 起替代 Go
+sqfs 镜像版)：`/opt/armbian/bin/openlist/openlist server --config
+/opt/armbian/bin/openlist/config.zig.json`，15244。This script never touches
+it: everything lands in `/tmp/olz` (tmpfs, gone on reboot) on its own port,
+with its own config. 生产实例的启停走 `/opt/script/openlist_start.sh`
+（幂等、带 `stop` 子命令），回滚素材见 `server/armbian/bin/openlist/README.txt`。
 
 Isolation rules enforced here
 -----------------------------
@@ -28,7 +30,8 @@ Isolation rules enforced here
     relative `tmp/olz/x` would silently become `/root/tmp/olz/x`;
   * the sftp-server kills the session if the parent dir is missing, so it is
     created *before* the SFTP channel opens;
-  * `/opt/sq/openlist` and the Go `config.json` / `data.db` are never written.
+  * `/opt/armbian/bin/openlist/`（生产二进制与 config.zig.json）绝不写；
+    同目录的 Go 遗留 config.json / data.db 也不动。
 
 Backgrounding
 -------------
@@ -39,12 +42,17 @@ EOF (the script hangs). Verified: the process survives across sessions.
 ⚠⚠ Process selection — this is where a real incident happened ⚠⚠
 ---------------------------------------------------------------
 An early version killed anything matching `ps | grep '[o]penlist server'`.
-The production Go instance runs as
+The production instance used to run as
 
     /opt/sq/openlist/openlist server --config /opt/armbian/bin/openlist/config.json
 
-which **also** contains "openlist server", so that grep killed production
-(it was restarted a minute later, but it must never happen again).
+(Go sqfs 镜像版，2026-10-19 已退役)，which **also** contains "openlist server",
+so that grep killed production (it was restarted a minute later, but it must
+never happen again). 现在的生产实例是
+
+    /opt/armbian/bin/openlist/openlist server --config .../config.zig.json
+
+无 `--port`，按 `--port 15399` 匹配依然与之隔离。
 
 The rule: never select a process by a pattern that production could match.
 Only kill by (a) the recorded pidfile, and (b) a match on this script's own
@@ -255,7 +263,7 @@ sleep 4
 echo '--- log ---'
 tail -6 run.log
 echo '--- isolation check (production must still be there) ---'
-ps | grep 'sq/openlist/openlist' | grep -v grep || echo 'WARNING: production instance NOT running'
+ps | grep 'armbian/bin/openlist/openlist' | grep -v grep || echo 'WARNING: production instance NOT running'
 echo '--- port ---'
 netstat -ltn 2>/dev/null | grep {port} || echo 'NOT LISTENING'
 """)
@@ -285,8 +293,8 @@ echo '--- port {port} ---'
 netstat -ltn 2>/dev/null | grep {port} || echo '(not listening)'
 echo '--- {ISOLATED} ---'
 ls -la {ISOLATED}
-echo '--- production Go instance (must be untouched) ---'
-ps | grep 'sq/openlist/openlist' | grep -v grep || echo '(not running)'
+echo '--- production Zig instance (must be untouched) ---'
+ps | grep 'armbian/bin/openlist/openlist' | grep -v grep || echo '(not running)'
 """).strip())
     finally:
         c.close()
@@ -321,7 +329,7 @@ echo '--- remaining ---'
 ls -A {ISOLATED} || true
 netstat -ltn 2>/dev/null | grep {port} || echo 'port {port} free'
 echo '--- production instance (must still be running) ---'
-ps | grep 'sq/openlist/openlist' | grep -v grep || echo 'WARNING: production NOT running'
+ps | grep 'armbian/bin/openlist/openlist' | grep -v grep || echo 'WARNING: production NOT running'
 """).strip())
     finally:
         c.close()

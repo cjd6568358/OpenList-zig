@@ -50,7 +50,7 @@ import sys
 SUPPORTED = {
     "Local",
     "WebDav",
-    "上海电信智家硬盘",
+    "Itvsh",
     "AliyundriveOpen",
     "189Cloud",
     "189CloudPC",

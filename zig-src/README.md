@@ -29,7 +29,7 @@ e2e 覆盖 13 挂载点全操作（见 [`docs/STATUS.md`](docs/STATUS.md) §3）
 |---|---|---|---|
 | `189pc`（家庭云） | `189CloudPC` | 24,268 B | 最大（5.4%）。RSA + AES-CBC + HMAC 签名；move/delete 走批处理签名 |
 | `pan115` | `115 Cloud` | 23,388 B | T2 新增：Cookie + `ec115` P-224 ECDH 上传链 + `m115` RSA/XOR + 闪传/OSS |
-| `itvsh` | `上海电信智家硬盘` | 15,944 B | 协议最复杂：登录链 + 分块并发；**私有驱动**，上游没有 |
+| `itvsh` | `Itvsh` | 15,944 B | 协议最复杂：登录链 + 分块并发；**私有驱动**，上游没有 |
 | `aliyundrive_open` | `AliyundriveOpen` | 12,560 B | 两阶段秒传（`PreHashMatched`） |
 | `pan123` | `123Pan` | 12,536 B | T2 新增：用户名+密码 + CRC32 签名 + 16 MiB 分片 |
 | `189`（个人云） | `189Cloud` | 11,088 B | RSA 表单登录 + cookie 会话 |
@@ -81,7 +81,7 @@ src/
   drivers/
     local.zig        本地存储
     webdav.zig       WebDAV 客户端
-    itvsh.zig        上海电信智家硬盘（协议最复杂的一个）
+    itvsh.zig        Itvsh（协议最复杂的一个）
     aliyundrive.zig  阿里云盘开放平台
     cloud189.zig     天翼云盘个人版
     cloud189pc.zig   天翼云盘 PC 端 / 家庭云
@@ -194,7 +194,7 @@ Zig 特有的东西放在 `zig` 块里，Go 版会忽略它：
   "cdn": "",
   "dist_dir": "data/dist",
   "storages": [
-    { "id": 1, "mount_path": "/nas", "driver": "上海电信智家硬盘",
+    { "id": 1, "mount_path": "/nas", "driver": "Itvsh",
       "addition": "{\"mobile\":\"138...\",\"password\":\"...\"}",
       "status": "work" }
   ],

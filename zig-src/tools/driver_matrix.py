@@ -90,7 +90,7 @@ def main():
     names = j.get("data") or []
     print("=== 1. 注册表（/api/admin/driver/names）===")
     check("驱动清单非空", bool(names), "%d 个" % len(names))
-    expect = {"Local", "WebDav", "上海电信智家硬盘", "AliyundriveOpen", "189Cloud",
+    expect = {"Local", "WebDav", "Itvsh", "AliyundriveOpen", "189Cloud",
               "189CloudPC", "123Pan", "Quark", "UC", "115 Cloud", "WoPan", "Strm"}
     missing = expect - set(names)
     check("12 个注册驱动齐全", not missing, "缺: %s" % (sorted(missing) or "无"))

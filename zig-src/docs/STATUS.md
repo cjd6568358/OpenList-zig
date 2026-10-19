@@ -13,16 +13,17 @@
 >   需要原文用 `git show 7356589e:<path>` 取回（见 §38.5）。
 > - **待办以 `TODO.md` 为准**；功能边界见 §22。
 >
-> **当前基线（2026-10-18 22:38，构建 `73027007e1763f51…`）**
+> **当前基线（2026-10-19 22:44，构建 `160a8731eeac3327…`；含 itvsh 改名 `Itvsh`）**
 >
 > | 项 | 值 |
 > |---|---|
 > | 单元测试（打包机 10.0.0.4，全量驱动） | **411 / 411 通过** |
-> | 交叉编译（aarch64-linux-musl，`-lc -fstrip`） | 通过，产物 **1,260,816 B** |
+> | 交叉编译（aarch64-linux-musl，`-lc -fstrip`） | 通过，产物 **1,260,808 B** |
 > | 真机 e2e（光猫，13 挂载点） | **464 通过 / 0 失败 / 1 跳过**（跳过 = 坚果云根目录 403 服务商规则） |
 > | 注册驱动 | **12 个注册项 / 11 个实现**（Quark+UC 共用 quarkuc.zig），12/12 真机覆盖 |
 > | 上游错误透传（`ctx.err_detail`） | **8 个驱动**（quarkuc/quark/itvsh/pan115/cloud189/cloud189pc/aliyundrive/wopan） |
 > | 下载签名密钥 | `zig.token`（对齐 Go 的 `token` 设置；`reset_token` 会作废旧链接） |
+| **光猫生产实例** | **Zig 版持久部署**（2026-10-19 起，15244）：`/opt/armbian/bin/openlist/openlist` + `config.zig.json`，开机自启走重写版 `openlist_start.sh`；Go sqfs 镜像已删（见 §47） |
 > | CI（GitHub Actions `build_go_minimal.yml`） | 绿（4 构建 + sqfs + Release） |
 > | 已知 P1 缺口 | webdav SharePoint、189pc family_transfer/old 上传/torrent、local 缩略图、aliyun `Other(video_preview)` |
 
@@ -39,7 +40,7 @@
 |---|---|---|---|
 | local | `Local` | `local.zig` | ✅ |
 | webdav（客户端） | `WebDav` | `webdav.zig` | ✅（PROPFIND 207 / GET 200 逐字节） |
-| itvsh 上海电信智家硬盘 | `上海电信智家硬盘` | `itvsh.zig` | ✅ 样板驱动；**私有驱动**：fork 后独立实现，与上游无关（见 §12.A1） |
+| itvsh | `Itvsh` | `itvsh.zig` | ✅ 样板驱动；**私有驱动**：fork 后独立实现，与上游无关（见 §12.A1） |
 | 189 个人云 | `189Cloud` | `cloud189.zig` | ✅ |
 | 189 家庭云（PC） | `189CloudPC` | `cloud189pc.zig` | ✅ |
 | 123 网盘 | `123Pan`（用户名+密码） | `pan123.zig` | ✅ |
@@ -1469,7 +1470,7 @@ Chromium 装起来**（约 500 MB）。
 |---|---|---|
 | `Local` | `root_folder_path` | 本地根目录，所有路径限制在此目录内 |
 | `WebDav` | `address` | 另有 `username`/`password`/`root_folder_path` 等可选 |
-| `上海电信智家硬盘` | 无必填 | **Zig 特有驱动**；凭据由 `addition` 里的账号/密钥决定 |
+| `Itvsh` | 无必填 | **Zig 特有驱动**；凭据由 `addition` 里的账号/密钥决定 |
 | `AliyundriveOpen` | `refresh_token` | 推荐只填这个，`access_token` 自动换取 |
 | `189Cloud` | `username`（手机号）+ `password` | 密码以 RSA 公钥加密后提交，公钥每次登录现取 |
 | `189CloudPC` | 无必填 | 走 `189Cloud` 的家庭云协议 |
@@ -1597,7 +1598,7 @@ Zig 版没有实现**（Go 本地树里 `drivers/baidu_netdisk`、`drivers/onedr
 | `/aliyun` | `AliyundriveOpen` | ✅ | `refresh_token` |
 | `/koofr`、`/jianguo` | `WebDav` | ✅ | `address`+`username`+`password` |
 | `/hikvision` | `Local` | ✅ | `root_folder_path` |
-| `/itvsh` | `上海电信智家硬盘` | ✅ | `mobile`+`password`+`Cookies` |
+| `/itvsh` | `Itvsh` | ✅ | `mobile`+`password`+`Cookies` |
 | `/onedrive` | `Onedrive` | ❌ 未实现 | `refresh_token` |
 
 （多数条目 `disabled: true`，但凭据本身可用，测的时候显式启用即可。）
@@ -1622,7 +1623,7 @@ Zig 版没有实现**（Go 本地树里 `drivers/baidu_netdisk`、`drivers/onedr
 | `pan115.zig` | `115 Cloud` | `115 Cloud` |
 | `wopan.zig` | `WoPan` | `WoPan` |
 | `strm.zig` | `Strm` | `Strm` |
-| `itvsh.zig` | `上海电信智家硬盘` | （用户私有驱动） |
+| `itvsh.zig` | `Itvsh` | （用户私有驱动） |
 
 **操作集 —— 与上游的 NotSupport 约定一致**
 
@@ -3476,3 +3477,83 @@ AUDIT §5 的 11 处全部修复，其中两处**顺带改了行为**：
 
 **验证**：文档内所有「当前」数字统一为 **411/411 单测、464/0/1 e2e、
 `73027007…`（1,260,816 B）**；改完跑一次全量构建确认注释改动没碰坏编译。
+
+
+## 47. 光猫持久化部署 + itvsh 驱动改名 + label 展示名查证（2026-10-19）
+
+### 47.1 Zig 版接管光猫生产（15244），Go sqfs 时代结束
+
+**背景**：光猫上的 openlist 一直是 Go 全量二进制的 squashfs 镜像版
+（`/opt/armbian/bin/openlist/openlist.sqfs` 21,155,840 B → loop 挂载 `/opt/sq/openlist`）。
+Zig 二进制只有 1.26 MB，镜像方案（省 flash/内存）已无意义。用户要求持久化部署 Zig、
+去掉 sqfs、更新启动脚本与注释。
+
+- **新部署形态**（配置/数据目录从来就没动过，仍在 `/opt/armbian/bin/openlist/`）：
+  二进制 `openlist`（Zig 静态 aarch64 1,260,808 B）+ 配置 `config.zig.json`
+  （Zig 专用单文件：13 个存储 + 管理员凭据 + CDN 全在里面）；日志 `/tmp/openlist.log`
+  （tmpfs，同旧版）；**端口只有 15244(HTTP)** —— Zig 未移植 SFTP/FTP，15221/15222
+  不再监听，原 SFTP 爆破守卫 `port_guard(15222)` 随之从启动脚本移除（`port_guard.sh`
+  本体保留，xray:7890 等仍在用）。
+- **`openlist_start.sh` 重写**（设备 `/opt/script/`，本地镜像
+  `server/f4610u/opt/script/`）：去挂载段；单实例检测仍按 `readlink /proc/pid/exe`
+  精确匹配（**绝不**用 cmdline 子串，2026-10-07 误杀教训）；新增 `stop` 子命令；
+  新增启动重试循环（15 轮 × 10s）—— CDN 是启动强依赖
+  （`CdnIndexFetchFailed` 直接退出），开机时外网未必就绪。
+- **`user_init.sh` §7 注释同步更新**（仅注释，代码行不变；设备侧留
+  `.bak-20261019`）。§6 头部「/opt/sq 货架」清单去掉 openlist 行。
+- **sqfs 已删**：`umount /opt/sq/openlist` → `rm openlist.sqfs` → `rmdir` 挂载点
+  （按 exe 精确停 Go 实例后执行，全程未碰 easytier/xray 的另外两个挂载）。
+  根分区可用 39.8M → 57.6M。
+- **数据来源**：按用户要求**使用测试实例那份配置**（`tools/cfg-restore-fixed.json`，
+  含 UC/WoPan/115 三个测试驱动账号），未从 Go data.db 迁移；hikvision 的
+  `root_folder_path` 用测试配置里已修正的 `/media/camera/hikvision`；启用状态对齐
+  Go 现役 + 测试账号全保留（13 存储，仅 hikvision 禁用）。
+- **验证**（切换后本机 API 全量）：登录 200；`driver/names` 13 项；12 个启用挂载
+  全部 `fs/list` 200 且列出真实内容（itvsh/quark/189×2/aliyun/uc/wo/115/koofr/
+  123×2/jianguo）；首页 CDN 外壳 200；`/@zig-setup` 200。
+- **回滚素材**：本地镜像 `server/armbian/bin/openlist/`（含 sqfs 原件、Go config.json、
+  data.db、Go 旧脚本 `openlist_start.sh.go-sqfs.bak-20261019` 在
+  `server/f4610u/opt/script/`），README.txt 写明三步回滚。
+
+### 47.2 itvsh 驱动改名：`上海电信智家硬盘` → `Itvsh`（Go/Zig 同步）
+
+用户判断「中文名当 key 不太好」，要求 Go `Config.Name` 与 Zig `factory.key`
+**同时**改成 `Itvsh`、**label 不变**、**不引入别名**（与 2026-10-15 删除别名机制一脉相承）。
+
+- 改动落点：`drivers/itvsh/meta.go`（Name）、`itvsh.zig`（key/drvName）、
+  `build.zig` DRIVERS 表、`driver.zig` 字节一致测试（旧中文名进"必须查不到"清单）、
+  `api.zig` 两处测试、`import_go_config.py` SUPPORTED、`driver_matrix.py`、
+  `cfg-restore*.json` 夹具、README/TODO/STATUS 当前态表。
+- **label 保持中文**（`上海电信智家硬盘`）—— 见 47.3，曾一度改错又回退。
+- 构建：打包机 **411/411 单测通过**，aarch64 **1,260,808 B**（sha256 `160a8731…`）；
+  已部署光猫：日志 `storage #1 Itvsh -> /itvsh (上海电信智家硬盘)`，
+  `driver/names` 含 `Itvsh` 无中文残留，`fs/get` 的 `provider=Itvsh`，12 挂载照常。
+- ⚠ 改名影响：Go 侧已配置的 itvsh 存储需重新添加（meta.go 注释已写明）；
+  设备上 Go data.db 已退役（回滚时用回旧 sqfs，自带旧名，自洽）。
+
+### 47.3 label / 展示名查证（本轮最重要的认知修正）
+
+**起因**：用户问「客户端驱动下拉框可以正常显示中文，label 与上游保持一致是什么意思」。
+我第一轮结论「上游没有 label、下拉框显示 Config.Name，所以 label 要对齐成 key」
+**是错的**，并曾据此刻意改掉全部 11 个驱动的中文 label——已回退。
+
+- **事实一（前端有自带映射表）**：OpenList 前端 bundle（`assets/entry-*.js`，
+  本地留档 `ci-artifacts/fe-entry-C3a5RYJI.js`）里有 `drivers:{...}` 表，
+  109 条 `驱动 key → 中文展示名`：`123Pan→123 云盘`、`189Cloud→天翼云盘`、
+  `189CloudPC→天翼云盘客户端`、`AliyundriveOpen→阿里云盘（Oauth2）`、
+  `115 Cloud→115 网盘`、`WoPan→联通云盘`、`Quark→夸克网盘`、`UC→UC 网盘`、
+  `Local→本机存储`、`Strm→Strm`、`WebDav→WebDAV`。**前端中文名全部来自这张表**，
+  与后端无关；全部 chunk（index/store/manage/legacy/AddOrEdit/Storages…）逐一 grep 证实。
+- **事实二（itvsh 表里没有）**：`智家/Itvsh/itvsh` 在 entry.js 全文 0 次 —— 私有驱动
+  不在上游前端的认知里，所以下拉框对它**原样渲染 key**。改名 `Itvsh` 前显示中文
+  （因为 key 是中文），改名后显示 `Itvsh`。这是改名的固有代价，无法两端兼得
+  （前端是 CDN 资产，不能改）。
+- **事实三（Zig label 不出 API）**：`writeDriverInfo` 只输出
+  `{common, additional, config}`；全 src 里 `label` 只出现在 `BuiltMount` 与一行
+  启动日志（`storage #1 Itvsh -> /itvsh (上海电信智家硬盘)`）。
+  `driver/names` 注释原文 "driver keys for the selector"。
+  **所以 label 与"展示名"无关，既不是上游概念、也不展示**；用户「label 不要变」
+  的要求得以完整保留（已回退全部 11 处）。
+- **结论/教训**：驱动生态里"展示名"归前端映射表，"持久化键"归后端 Config.Name，
+  两者是不同的层。Zig 的 label 只是日志短名。以后判断"与上游一致"要先确认
+  **该字段在整条链路上到底有没有出口**，不能凭字段名想当然。
