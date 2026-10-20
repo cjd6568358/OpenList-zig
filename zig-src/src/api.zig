@@ -365,8 +365,32 @@ pub const BuiltMount = union(enum) {
     invalid_addition,
     /// `drv.init` 失败；记录 `@errorName`。调用方应经 `setStorageError` 把
     /// 它写回记录，让管理面能展示「errored」。
-    init_failed: []const u8,
+    ///
+    /// 两段分开存（错误名 + 上游原文）而不是预拼成一条串：调用方的分配器
+    /// 各不相同（启动路径是 gpa，管理面是请求 arena），预拼会让「谁释放」
+    /// 说不清（2026-10-10 审计发现过一次 gpa 泄漏，就是这里拼出来的）。
+    /// 需要文字时用 `initErrText()` 在**调用方的短命 arena** 上拼，
+    /// 要落配置用 `Config.setStorageErrorParts()` 在配置 arena 上拼。
+    init_failed: InitFailure,
 };
+
+/// `init` 失败的两段式原因。
+pub const InitFailure = struct {
+    /// `@errorName(e)` —— 指向静态常量，不需要释放。
+    name: []const u8,
+    /// 驱动写在 `ctx.err_detail` 里的上游原文；没有则为 null（或空串）。
+    detail: ?[]const u8,
+};
+
+/// 把 `InitFailure` 拼成一条可读文字。⚠️ 结果活在 `a` 上 —— 只能在**短命
+/// arena**（请求 arena）上调用，别传 gpa（那正是已修掉的泄漏）。
+pub fn initErrText(a: std.mem.Allocator, f: InitFailure) ![]const u8 {
+    const d = f.detail orelse "";
+    return if (d.len == 0)
+        f.name
+    else
+        try std.fmt.allocPrint(a, "{s}: {s}", .{ f.name, d });
+}
 
 /// 从**已拥有所有权**的 Storage 快照构建一个挂载（find → parse addition →
 /// create → init → 归一路径）。启动 worker 与 `/api/admin/storage/*` 共用。
@@ -391,7 +415,18 @@ pub fn buildMountFromStorage(alloc: std.mem.Allocator, s: *const model.Storage) 
     drv.init(&init_ctx) catch |e| {
         // S03：init 失败的驱动要释放，否则每次重载都漏一个（jar/client 都在 alloc 上）。
         drv.deinit(&init_ctx);
-        return .{ .init_failed = @errorName(e) };
+        // 把驱动写在 `ctx.err_detail` 里的**上游原文**带上。
+        //
+        // 对齐 Go：init 失败时 `GetStorage().SetStatus(fmt.Sprintf("%+v", err))`，
+        // 管理面显示的是真原因，而不是一个错误名。对迅雷尤其关键 —— 它的
+        // `review_panel` 报错正文是一段 JSON，用户要照着官方文档把它粘进
+        // `reviewCb()` 换 credit_key；只剩 "NeedVerify" 就等于流程断了。
+        if (init_ctx.err_detail) |detail| {
+            if (detail.len > 0) {
+                return .{ .init_failed = .{ .name = @errorName(e), .detail = detail } };
+            }
+        }
+        return .{ .init_failed = .{ .name = @errorName(e), .detail = null } };
     };
 
     return .{ .ok = .{
@@ -445,11 +480,17 @@ pub fn buildMountsFromConfig(alloc: std.mem.Allocator, app: *App, cfg: *config.C
                 log.err("storage #{d} {s}: addition is not valid JSON", .{ s.id, s.driver });
                 continue;
             },
-            .init_failed => |msg| {
+            .init_failed => |ef| {
                 // 一个存储坏不拖垮整个进程：记 errored 继续服务其余存储（对齐
                 // Go 的行为，也见 main.zig 同款注释）。
-                log.err("storage #{d} {s}: init failed: {s} — marking as errored", .{ s.id, s.driver, msg });
-                cfg.setStorageError(s.id, msg);
+                // ⚠️ 这里 `alloc` 是 gpa：**不要**在这里拼消息（旧实现正是
+                //    这样每次 init 失败漏几百字节）。拼接交给
+                //    `setStorageErrorParts` 在配置 arena 里做，只做一次。
+                log.err("storage #{d} {s}: init failed: {s}{s}{s} — marking as errored", .{
+                    s.id,  s.driver, ef.name,
+                    if (ef.detail != null and ef.detail.?.len > 0) ": " else "", ef.detail orelse "",
+                });
+                cfg.setStorageErrorParts(s.id, ef.name, ef.detail);
                 continue;
             },
         };
@@ -2369,7 +2410,9 @@ fn handleAdminStorageCreate(app: *App, req: *http.Request, res: *http.Response) 
             log.info("storage #{d} {s} created -> {s}", .{ id, f.key, m.mount_path });
             return res.jsonOk(id_json);
         },
-        .init_failed => |msg| {
+        .init_failed => |ef| {
+            // `a` 是请求 arena，出请求即回收 —— 拼消息落这里是安全的。
+            const msg = try initErrText(a, ef);
             cfg.setStorageError(id, msg);
             log.err("storage #{d} {s}: init failed: {s} — created but errored", .{ id, f.key, msg });
             return jsonErrorWithData(res, 500, try std.fmt.allocPrint(a, "failed init storage but storage is already created: {s}", .{msg}), id_json);
@@ -2464,7 +2507,8 @@ fn handleAdminStorageUpdate(app: *App, req: *http.Request, res: *http.Response) 
             log.info("storage #{d} {s} updated -> {s}", .{ id, snap.driver, m.mount_path });
             return res.jsonOk("null");
         },
-        .init_failed => |msg| {
+        .init_failed => |ef| {
+            const msg = try initErrText(a, ef);
             cfg.setStorageError(id, msg);
             // 旧驱动已按「不 deinit」策略留给了在途请求；新 init 失败 ⇒ 摘挂载。
             try republishWithEdit(app, app.alloc, id, null);
@@ -2537,7 +2581,9 @@ fn handleAdminStorageEnable(app: *App, req: *http.Request, res: *http.Response) 
             log.info("storage #{d} {s} enabled -> {s}", .{ id, snap.driver, m.mount_path });
             return res.jsonOk("null");
         },
-        .init_failed => |msg| {
+        .init_failed => |ef| {
+            // 这个 handler 只有 `req.arena`（请求 arena），同样出请求即回收。
+            const msg = try initErrText(req.arena, ef);
             cfg.setStorageError(id, msg);
             try republishWithEdit(app, app.alloc, id, null);
             log.err("storage #{d} {s}: init failed on enable: {s}", .{ id, snap.driver, msg });
@@ -3326,10 +3372,10 @@ fn handleConfigImport(app: *App, req: *http.Request, res: *http.Response) !void 
                 try republishWithEdit(app, app.alloc, id, m);
                 log.info("config/import: storage #{d} {s} -> {s}", .{ id, snap.driver, m.mount_path });
             },
-            .init_failed => |msg| {
-                cfg.setStorageError(id, msg);
+            .init_failed => |ef| {
+                cfg.setStorageErrorParts(id, ef.name, ef.detail);
                 try republishWithEdit(app, app.alloc, id, null);
-                try fails.append(try std.fmt.allocPrint(a, "{s}: init failed: {s}", .{ snap.mount_path, msg }));
+                try fails.append(try std.fmt.allocPrint(a, "{s}: init failed: {s}", .{ snap.mount_path, try initErrText(a, ef) }));
             },
             .no_driver => try fails.append(try std.fmt.allocPrint(a, "{s}: driver disappeared from build", .{snap.mount_path})),
             .invalid_addition => try fails.append(try std.fmt.allocPrint(a, "{s}: addition is not valid JSON", .{snap.mount_path})),

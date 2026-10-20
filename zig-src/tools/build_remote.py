@@ -4,7 +4,13 @@ The Windows box is only ever used to *read* the sources and to run the unit
 tests locally; every binary that ships is produced here, so the toolchain
 (Zig 0.17.0 @ /root/.cache/zig/zig) and the resulting artifact are reproducible.
 
-    python tools/build_remote.py [--out dist/openlist-aarch64]
+    python tools/build_remote.py                          # aarch64（默认，光猫用）
+    python tools/build_remote.py --target x86_64-linux-musl
+    python tools/build_remote.py dist/openlist-custom     # 自定义产物路径
+
+产物名按目标架构自动取 `dist/openlist-<arch>`；`--target` 缺省为
+`aarch64-linux-musl`（光猫那台）。单测始终在打包机**原生**跑（x86_64），
+所以两个架构共用同一轮 438 条用例。
 """
 import hashlib
 import io
@@ -28,7 +34,23 @@ GCACHE = "/tmp/olz-build/zigcache"
 # ECDHE-RSA）。放在 WORK 内：每次构建都会重建，工具链升级后不会用到旧副本。
 ZIGLIB = "/tmp/olz-build/ziglib"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TARGET = "aarch64-linux-musl"
+DEFAULT_TARGET = "aarch64-linux-musl"
+
+# readelf -h 的 Machine 行长这样：AArch64 / Advanced Micro Devices X86-64。
+# 用「命中任一个就算对」而不是精确相等 —— readelf 的输出随 binutils 版本漂移。
+ELF_MACHINE_HINTS = {
+    "aarch64": ("aarch64", "arm"),
+    "x86_64": ("x86-64", "x86_64", "advanced micro devices"),
+}
+
+
+def arch_tag(target):
+    """`aarch64-linux-musl` → `aarch64`，用来给产物起名/选校验规则。"""
+    if "aarch64" in target:
+        return "aarch64"
+    if "x86_64" in target or "amd64" in target:
+        return "x86_64"
+    return target.split("-")[0]
 
 
 def pack_src():
@@ -41,8 +63,18 @@ def pack_src():
 
 
 def main():
+    # 目标三元组：--target x86_64-linux-musl，缺省 aarch64-linux-musl。
+    target = DEFAULT_TARGET
+    if "--target" in sys.argv:
+        i = sys.argv.index("--target")
+        if i + 1 < len(sys.argv):
+            target = sys.argv[i + 1]
+    arch = arch_tag(target)
+    print(f"target: {target}  (arch={arch})", flush=True)
+
+    # 位置参数可覆盖产物路径；否则按架构自动命名。
     out = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") \
-        else os.path.join(ROOT, "dist", "openlist-aarch64")
+        else os.path.join(ROOT, "dist", f"openlist-{arch}")
     # 编译期驱动白名单：--drivers "local,webdav,quark,strm"，空 = 全量。
     # 名字可以是 Go 驱动名（189Cloud）或 Zig 文件名（cloud189），
     # 与 build.zig 的 -Ddrivers= 完全一致。
@@ -133,7 +165,7 @@ def main():
     # 产物因此落在 `zig-out/bin/openlist` 而不是工作目录根下。
     o, e, rc = sh(c, f"cd {WORK} && ZIG_GLOBAL_CACHE_DIR={GCACHE} "
                      f"ZIG_LIB_DIR={ZIGLIB} {ZIG} build "
-                     f"-Dtarget={TARGET} -Doptimize=small{drv_args}",
+                     f"-Dtarget={target} -Doptimize=small{drv_args}",
                   timeout=900)
     log = (o + e)
     if rc != 0:
@@ -153,10 +185,13 @@ def main():
                      f"file {ART} 2>/dev/null; readelf -h {ART} 2>/dev/null | "
                      f"grep -E 'Machine|Type' || true")
     print(o.strip(), flush=True)
-    # readelf 打的是 "AArch64"，大小写敏感的比较会把正确产物判成非法。
+    # readelf 打的是 "AArch64" / "Advanced Micro Devices X86-64"，大小写敏感
+    # 的比较会把正确产物判成非法。按目标架构选提示词，命中任一个即可。
     head_lower = o.lower()
-    if "aarch64" not in head_lower and "arm" not in head_lower:
-        print("!! remote binary does not look like an aarch64 ELF; aborting", flush=True)
+    hints = ELF_MACHINE_HINTS.get(arch, (arch,))
+    if not any(h in head_lower for h in hints):
+        print(f"!! remote binary does not look like a {arch} ELF "
+              f"(expected one of {hints}); aborting", flush=True)
         sftp.close()
         c.close()
         return 1

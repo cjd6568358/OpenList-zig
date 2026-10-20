@@ -1,4 +1,10 @@
-tools/cfg-restore.json
+# 配置恢复快照（含 jwt_secret 与全部存储凭据）—— 永不入库
+tools/cfg-restore*.json
+
+# ---- 构建产物（不入库）----
+# 每次 `zig build` 都会重写它，入库只产生无意义的二进制 diff。
+# 现役 aarch64 二进制留档在 D:/workspace/server/armbian/bin/openlist/openlist。
+/dist/
 
 # ---- 抓包 / 探针二进制 / 调试日志（本地产物，不入库）----
 dist/*.pcap

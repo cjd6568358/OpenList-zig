@@ -254,6 +254,28 @@ pub const Config = struct {
         s.error_msg = "";
     }
 
+    /// 与 `setStorageError` 相同，但接收「错误名 + 上游原文」两段，在配置
+    /// arena 里拼**一次**。
+    ///
+    /// 为什么需要它（2026-10-20 审计发现的 gpa 泄漏）：调用方手里的两段分别
+    /// 来自 `@errorName(e)`（静态常量）和 `ctx.err_detail`（请求 arena），
+    /// 谁都不该由调用方自己 `allocPrint` 拼 —— 拼出来的串会落在调用方的
+    /// 分配器上（生产是 gpa），而 `setStorageError` 又会 dupe 一份进配置
+    /// arena，原串从此无人释放，每次 init 失败漏几百字节。
+    /// 把拼接放进拥有结果的 arena，所有权才闭环。
+    pub fn setStorageErrorParts(self: *Config, id: i64, name: []const u8, detail: ?[]const u8) void {
+        const io = rt.io();
+        storages_mutex.lockUncancelable(io);
+        defer storages_mutex.unlock(io);
+        const s = self.storageById(id) orelse return;
+        const a = self.arena.allocator();
+        const d = detail orelse "";
+        s.error_msg = if (d.len == 0)
+            (a.dupe(u8, name) catch "")
+        else
+            (std.fmt.allocPrint(a, "{s}: {s}", .{ name, d }) catch "");
+    }
+
     /// Set a top-level config key (used by the settings PUT for `site_url`,
     /// `cdn`, `token_expires_in`, ...). Values must already live in the config
     /// arena — see the callers in `api.zig`, which dupe into `cfg.allocator()`.

@@ -50,6 +50,8 @@
 | 115 网盘 | `115 Cloud`（Cookie） | `pan115.zig` | ✅ |
 | 联通沃云盘 WoPan | `WoPan`（refresh_token） | `wopan.zig` | ✅ 2026-10-17 真机修通（四连修 + 20MB 分片 md5 全链一致，§36B/§36C.2） |
 | STRM（其他挂载→.strm） | `Strm`（paths 行） | `strm.zig` | ✅ 2026-10-14 真机验证（挂载/列表/详情/内容/OnlyProxy 全链路） |
+| 迅雷云盘 | `Thunder`（用户名+密码，参数硬编码） | `thunder.zig` | ✅ 2026-10-20 真机（e2e 62/63，唯一失败项与驱动无关；§48.6） |
+| 迅雷云盘（专家） | `ThunderExpert`（`login_type`/`sign_type` 全可配） | `thunder.zig`（共用实现） | ✅ 2026-10-20 真机登录+列目录（§48.6.6） |
 
 **铁律**：`factory.key` 必须逐字节等于 Go 的 `driver.Config.Name`（即写进 `Storage.driver` 的字符串）。**不提供别名、不忽略大小写**（`Factory.aliases` 已于 2026-10-15 删除，见 §13.9）——配置按最新驱动名重新添加即可。
 **故意不实现 copy**：itvsh / 123 / quark 上游 `Copy` 即 `NotSupport`，Zig 故意把 vtable `.copy` 置 `null`，并有显式测试钉住「别顺手补上」。
@@ -1480,6 +1482,8 @@ Chromium 装起来**（约 500 MB）。
 | `115 Cloud` | `cookie` | Cookie 需含 `UID`/`CID`/`SEID`/`KID` |
 | `WoPan` | `refresh_token` | 联通沃云盘 |
 | `Strm` | `paths` | 每行一条 `名称:源路径` 或 `源路径`，映射同一实例内其他挂载 |
+| `Thunder` | `username`（手机号/邮箱）+ `password` | 其余参数硬编码（对齐 Go `Init`）；可选 `device_id`/`captcha_token`/`credit_key`/`space` |
+| `ThunderExpert` | 按 `login_type`：`user` 用账号密码，`refresh_token` 用 `refresh_token` | `sign_type` 选 `algorithms`（默认算法表）或 `captcha_sign` |
 
 **创建示例**（`POST /api/admin/storage/create`）：
 
@@ -1623,6 +1627,7 @@ Zig 版没有实现**（Go 本地树里 `drivers/baidu_netdisk`、`drivers/onedr
 | `pan115.zig` | `115 Cloud` | `115 Cloud` |
 | `wopan.zig` | `WoPan` | `WoPan` |
 | `strm.zig` | `Strm` | `Strm` |
+| `thunder.zig` | `Thunder` + `ThunderExpert` | `Thunder`（`ThunderExpert` 是设计内的额外注册） |
 | `itvsh.zig` | `Itvsh` | （用户私有驱动） |
 
 **操作集 —— 与上游的 NotSupport 约定一致**
@@ -1641,6 +1646,7 @@ Zig 版没有实现**（Go 本地树里 `drivers/baidu_netdisk`、`drivers/onedr
 | `115 Cloud` | `github.com/SheltonZhu/115driver` + `github.com/OpenListTeam/115-sdk-go` | 协议实现**不在本仓库** |
 | `WoPan` | `github.com/OpenListTeam/wopan-sdk-go` | 同上 |
 | `123Pan` | `github.com/aws/aws-sdk-go`（S3 上传路径） | 部分走 SDK |
+| `Thunder` | `github.com/aws/aws-sdk-go`（`s3manager` 分片上传） | 分片上传走 SDK，其余协议在树内（`drivers/thunder/*.go`） |
 
 ⇒ 对这三个驱动，"对着 Go 源码逐函数对比"**做不到**（源码不在树里）。
 这也解释了体积差异：`pan115.zig` 1471 行 vs Go 115 目录 885 行 —— Zig 把 SDK
@@ -1980,6 +1986,8 @@ cookie 更新后下载应立即可用；在此之前，代理回源会把 CDN �
 
 **目标**：9 个挂载点全驱动的「添删改查」+ UI（Playwright）双回归，全部落档。
 原始输出：`docs/regression/`（e2e 两轮 + final、UI smoke、设备 init、quark 目录写）。
+> ⚠ 该目录已于 2026-10-20 深夜清理（37 个日志、646KB）：结论已全部写进本文件，
+> 需要原文请 `git log --all -- zig-src/docs/regression/` 取回。
 
 ### 31.1 环境准备（三个工具/流程坑，全部固化成工具）
 
@@ -3557,3 +3565,507 @@ Zig 二进制只有 1.26 MB，镜像方案（省 flash/内存）已无意义。�
 - **结论/教训**：驱动生态里"展示名"归前端映射表，"持久化键"归后端 Config.Name，
   两者是不同的层。Zig 的 label 只是日志短名。以后判断"与上游一致"要先确认
   **该字段在整条链路上到底有没有出口**，不能凭字段名想当然。
+
+---
+
+## 48. 迅雷云盘驱动移植（Thunder / ThunderExpert，2026-10-20）
+
+### 48.1 范围与结构
+
+Go 的 `drivers/thunder` 一个包注册**两个**驱动，Zig 侧同一份
+`src/drivers/thunder.zig` 出两个 factory：
+
+| Go `Config.Name` | Zig factory | 登录方式 | addition 字段 |
+|---|---|---|---|
+| `Thunder` | `factory` | 用户名 + 密码 | `username`/`password`/`root_folder_id`/`device_id`/`captcha_token`/`credit_key`/`space` |
+| `ThunderExpert` | `expert_factory` | `login_type=user` 或 `refresh_token` | 上面全部 + `login_type`/`sign_type`/`refresh_token`/`algorithms`/`captcha_sign`/`timestamp`/`client_*`/`package_name`/`*_user_agent`/`use_video_url` |
+
+两者共用 Go 的 `XunLeiCommon` 逻辑，Zig 用 `variant` 字段区分（`normal` /
+`expert`），避免两份代码漂移。**`factory.key` 逐字节等于 Go `Config.Name`**，
+与 §26.1 的铁律一致；`build.zig` 的 DRIVERS 表加了两项（都映射到 `thunder`
+basename），`-Ddrivers=Thunder` 或 `-Ddrivers=thunder` 都能选中。
+
+### 48.2 逐函数对照表（Go → Zig）
+
+| Go（`drivers/thunder/*.go`） | Zig | 备注 |
+|---|---|---|
+| `util.go:GetAction` | `getAction` | 复刻正则 `://[^/]+((/[^/\s?#]+)*)`，取 path |
+| `util.go:GetCaptchaSign` | `captchaSign` / `captchaSignAt` | `"1."+md5(...md5(base+alg))`，算法表逐项链式 md5 |
+| `util.go:generateDeviceSign` | `generateDeviceSign` | `div101.<devid><md5(hex(sha1(devid+pkg+APPID+APPKey)))>` |
+| `util.go:getGcid` | `computeGcid` + `gcidBlockSize` | 分块 sha1 → 外层 sha1，块大小 256KiB→2MiB（`>512` 块翻倍） |
+| `util.go:refreshCaptchaToken` | `refreshCaptchaToken` | 登录时 meta 用账号标识，登录后用 `user_id`+签名 |
+| `util.go:Common.Request` | `sendOnce` | 四个基础头 + 错误信封判定（**不看 HTTP 状态码**） |
+| `driver.go:XunLeiCommon.Request` | `requestLocked` | 4122/4121/10/16 → 刷 token 重试；9 → 刷 captcha 重试 |
+| `driver.go:Login` / `CoreLogin` | `login` / `coreLogin` | 两段式：core login 拿 `sessionID` → signin/token 换令牌 |
+| `driver.go:RefreshToken` | `refreshTokenCall` | `refresh_token` 为空即 `EmptyToken` |
+| `driver.go:Init`（两个变体） | `initNormal` / `initExpert` | device id 派生规则两边**不同**（见 48.3） |
+| `driver.go:List/Link/MakeDir/Move/Rename/Copy/Remove` | 同名 vtable 函数 | 请求体/方法/端点逐字一致 |
+| `driver.go:Put` | `putLocked` + `s3Upload` | 先申请上传，再自签 S3（替代 aws-sdk-go `s3manager`） |
+| `driver.go:GetDetails` | `space` | `GET /about` → `quota.limit`/`quota.usage` |
+
+### 48.3 三个容易做错的细节（都已按 Go 逐字实现）
+
+1. **device id 的派生输入两个变体不同**：`Thunder` 用
+   `md5(username+password)`；`ThunderExpert` 用 `md5(DeviceID)` —— 未配置时
+   就是 `md5("")` = `d41d8cd98f00b204e9800998ecf8427e`。配置里给了非空
+   `device_id` 时两边都直接用配置值（Go 的覆盖分支）。device id 同时进
+   `x-device-id` 头和 captcha 签名，错了就是 4122。
+2. **`strings.TrimLeft(endpoint, bucket+".")` 是字符集语义，不是前缀**。
+   迅雷返回 `<bucket>.oss-cn-xxx.aliyuncs.com`，Go 能剥掉前缀纯属运气
+   （`o` 不在字符集里）。Zig 用 `trimLeftCutset` 逐字复刻，并有单测钉住
+   「不按前缀实现」。
+3. **错误码 0 也算成功**：Go 的 `switch errResp.ErrorCode { case 0: return
+   data, nil }` —— 即使 body 里带了 `error` 文本，只要没有 `error_code`
+   就当作成功。这不是笔误，是上游行为，Zig 保持一致（`requestLocked` 的
+   `0 => return r.body`）。
+
+### 48.4 与 Go 的差异（有意为之）
+
+| 差异 | 原因 |
+|---|---|
+| 路径 → ID 逐级翻页解析 | 本工程 vtable 是路径式的，没有 Go 的 `model.Obj` 缓存 |
+| 离线下载三个方法不移植 | Go 里也没有任何接口/路由调用它们（死代码） |
+| `review_panel` 提示是纯文本 | Go 返回 HTML `<div>`，前端按纯文本渲染只会显示标签 |
+| 重试深度上限 3 | Go 是无界递归（刷新成功但上游仍报错时会一直重试） |
+| `access_token` 为空直接报 `AuthFailed` | Go 不校验，但那种存储必然全请求失败，早报错更好 |
+| S3 用 `UNSIGNED-PAYLOAD` 自签 | 没有 aws-sdk-go；OSS 支持该形态（同 pan123 的做法） |
+
+### 48.5 验证
+
+- **单元测试 17 项**（`THU-1..THU-17`），覆盖纯逻辑与**golden 值**：
+  GCID（700000 字节 + 空文件）、device sign、captcha sign、两种 identity、
+  device id 派生、addition 往返、错误信封判定、`TrimLeft` 字符集语义、
+  路径拆分、邮箱判据、算法拆分、factory key。golden 值全部由 Python
+  `hashlib` **独立**算出，不是用被测代码自证。
+- 打包机（10.0.0.4）`zig build test`：**431/431 通过**；
+  `aarch64-linux-musl` 产物 **1,304,160 字节**
+  （`sha256 d715f07ad558b2145cc227ed1d5f11be4f45f91cd7084d168bba49be4334bebd`），
+  较移植前 1,260,808 字节 **+43,352 字节**。
+- ⚠ **真机回归见 §48.6**（2026-10-20 用真实账号跑通）。仍未覆盖：
+  `use_video_url`（需要媒体文件）、配额 `space`（本工程没有该能力的 HTTP 出口，
+  全驱动共性，见 §48.6.5）、`space` 非空的「远程设备」分支。
+
+### 48.6 真机回归（2026-10-20，真实账号）
+
+**环境**：打包机 10.0.0.4 上跑本机架构（x86_64）实例，独立配置
+`/tmp/olz-thunder/config.json`、端口 15944，**不碰光猫生产实例**。
+工具：`tools/thunder_probe.py`（起实例 + 建存储 + 打错误原文）、
+`tools/e2e_test.py --mounts thunder --write-cloud`、`tools/thunder_extra.py`
+（分片上传 + 专家变体）。凭据走 `XL_USER`/`XL_PASS` 环境变量，**不入库**。
+
+#### 48.6.1 首次登录必然 `review_panel`（不是移植问题）
+
+三条独立证据（Zig 驱动 / 独立 Python 复刻 / 换家宽出口 IP）都得到
+`{"error":"review_panel","errorCode":"1007","verifyType":"MEA"}`。
+`MEA` = 手机验证，`device_id = md5(账号+密码) = 0a226604…62b0` 从未被该账号信任。
+
+按官方文档走完一次：`reviewCb({...})` → 短信 → 页面回写
+`creditkey=ck0.XhmO5t8…`（`error_description=Success`）→ 写进 addition 的
+`credit_key` → **之后登录完全直连**（后续十几次 init 都不再要验证）。
+⇒ 「首次保存报错属正常现象」在 Zig 版上同样成立，且 `credit_key` 一旦落盘就是长期免验证。
+
+配套的两个修复（都是真机暴露的集成缺陷）：
+
+1. `api.zig:buildMountFromStorage`：init 失败只把 `@errorName` 写进 `error_msg`，
+   驱动写在 `ctx.err_detail` 的上游原文被丢弃 ⇒ 用户看不到那段 JSON，
+   `reviewCb` 流程直接做不了。现在拼成 `"{错误名}: {上游原文}"`。
+2. `thunder.zig:initNormal/initExpert`：调 `login(..., null)` 把 `ed` 传丢了，
+   上面那条修复因此也拿不到内容。现在 init 一路透传 `&ctx.err_detail`。
+
+#### 48.6.2 S3 上传必须 virtual-hosted（本轮最大的坑）
+
+真机参数：`bucket=vip-lixian-08`、`endpoint=vip-lixian-08.up.xdrive.xunlei.com`、
+`provider=PROVIDER_ALIYUN`、`region=cn-shanghai`。四种 URL 形态实测：
+
+| 形态 | 结果 |
+|---|---|
+| `https://<bucket>.<trimLeft(endpoint)>/<key>` | **200** ← 唯一可用 |
+| `https://<trimLeft(endpoint)>/<bucket>/<key>` | DNS 解析不到 |
+| `https://<bucket>.<原 endpoint>/<key>` | DNS 解析不到（bucket 重复） |
+| `https://<原 endpoint>/<bucket>/<key>` | **403 AccessDenied**（host 不认 path-style） |
+
+`TrimLeft("vip-lixian-08.up.xdrive.xunlei.com", "vip-lixian-08.")` = `up.xdrive.xunlei.com`
+（`u` 不在字符集里，停在它前面），拼回 bucket 子域**正好等于原始 endpoint** ——
+Go 那行看着像 hack，其实是 aws-sdk-go 默认 virtual-hosted 的必要前置。
+Zig 之前按 pan123 的 path-style 拼，实测报 `UnknownHostName`，已改 `s3Base`。
+签名 region 用 `xunlei`（Go 写死）或 `cn-shanghai` 都能过：网关不校验 scope 里的 region。
+
+#### 48.6.3 通过项（e2e 62/63）
+
+`list` / `fs/get`（含 `raw_url`）/ `下载`（302 直链与 `web_proxy` 回源两条路径）/
+`Range`（206、越界 416、非法头回落 200）/ `mkdir` / `上传`（单次 PUT）/
+`copy`（源保留）/ `rename` / `move` / `remove` / `WebDAV`（PROPFIND、GET、PUT、
+覆盖 PUT、ETag、OPTIONS、目录 HEAD/GET/MKCOL/MOVE）/ 1 挂载点并发 list。
+
+唯一失败项 = `/p/ 前置：fs/get 返回 sign` —— 测试配置没开 `sign_all`，
+与驱动无关（光猫生产配置是 `sign_all=true`）。
+
+#### 48.6.4 分片上传（>5MiB）
+
+6.01 MiB 随机内容上传 **200 success**，列表回来 `size=6303801`（精确）、
+`hash=4607D9B9…`（与本地算的 GCID 一致）⇒ CreateMultipartUpload / 逐片 PUT /
+CompleteMultipartUpload 三步全通。逐字节回读比对被上游限频打断（见 48.6.5），
+**下一次回归第一件事就是补这一步**。
+
+#### 48.6.5 两个注意事项
+
+- **上游会限频**：短时间反复登录会得到
+  `AuthFailed: ErrorCode: 0 ,Error: shield_reject ,Operation too frequent`。
+  官方文档也写了「频繁调用会封号」。回归时登录间隔拉开，别在循环里重建存储。
+- **配额 `space` 没有出口**：`driver.space()` 在整个 `src/` 里**没有任何调用点**
+  （`grep -rn "\.space(" src/` 为空），所以 `/about` 那条路径无法通过 HTTP 验证。
+  这是全驱动共性缺口，不是 thunder 的问题；补的话要在 api 层加端点。
+
+#### 48.6.6 ThunderExpert 变体
+
+用 `login_type=user` + `sign_type=algorithms`（默认 10 段算法链）+
+显式 `device_id`（复用已验证的那个）+ `credit_key` 建 `/thx`：
+**status=work，列出 3 个根目录**。⇒ 专家变体的参数解析、identity、
+captcha 签名链、device id 覆盖逻辑全部走通。
+
+
+#### 48.6.7 上线到光猫：设备出口 IP 会被风控（2026-10-20）
+
+已部署：`/thunder` 存储（id=19，`web_proxy=true`）写进
+`/opt/armbian/bin/openlist/config.zig.json`（14 个存储），二进制换成
+`b7226b68…`（1,305,304 B），服务正常（15244 在听、12 个挂载发布）。
+
+**但 `/thunder` 的 init 在设备上被 `review_panel` 拦住**，而同一份二进制、
+同一个 `credit_key` 在打包机上能直接登录。差别只有出口 IP：
+
+| 位置 | 出口 IP | 结果 |
+|---|---|---|
+| 我的 PC / 打包机（家宽同段） | `180.153.160.x` | 验证后**直连**（十几次 init 全过） |
+| 光猫（走 easytier 出口） | `139.227.20.164` | 每次都发**滑块**挑战 |
+
+从浏览器（家宽 IP）解掉滑块拿到的新 `creditkey` 写回设备**仍然无效** ⇒
+挑战/信任是按**发起 IP** 绑的，跨 IP 不能转移。这也解释了官方文档为什么让人
+「在浏览器里过验证、再把 creditkey 填进同一台机器上的 OpenList」。
+
+⚠ 别再连续重试：账号侧会升级成 `shield_reject: Operation too frequent`
+（打包机和设备同时中招，冷却 > 20 分钟）。回归/上线都要拉开间隔。
+
+**绕过方案（下次继续）**：`ThunderExpert` 的 `login_type=refresh_token` 走
+`POST /v1/auth/token`，**不过验证码**，因此不受 IP 风控影响。取 token 的办法：
+在家宽 IP 上建一个 `ThunderExpert`（`login_type=user`）存储，init 成功后驱动
+会把轮换的 `refresh_token` 写回 addition（`tools/thunder_rt.py` 就是干这个的），
+再把该 token 填到设备的 `/thunder`（driver 改 `ThunderExpert`）。
+
+#### 48.6.8 换路：网页版 refresh_token（2026-10-20 16:00，打通登录但未通业务）
+
+既然驱动用的旧安卓端点必被风控，改从**官方网页体系**取凭证：
+
+| 体系 | 端点 | 风控 |
+|---|---|---|
+| 驱动（旧安卓 SDK，逆向） | `xluser.core.login/v3/login` | 数美，账号+设备+IP 组合触发 |
+| 网页版（官方账号中心） | `i.xunlei.com/center/account/personal/*` → OAuth authorize | **无**（且表单有「账号密码」tab，不必短信） |
+
+实测矩阵（全部真机请求）：
+
+| 组合 | 结果 |
+|---|---|
+| 网页 refresh_token + **网页** client_id(`Xqp0kJBXWhwaTpB6`) | **200 换到新令牌** |
+| 网页 refresh_token + 安卓 client_id(`Xp6vsxz_7IYVw2BB`) | 400 `invalid_grant` ⇒ **token 与 client_id 绑定** |
+| 设备装「网页三元组」后 init | **`status=work`，登录完全不过风控** |
+| 同配置 `fs/list` | **502 `captcha_invalid`** ⇒ 卡在业务接口的 captcha |
+| 网页 client 的 captcha_sign（安卓算法链 / 同 cid / 安卓 UA 三种） | 全部 400 `invalid captcha_sign` ⇒ **网页端签名强制校验、算法未知** |
+| 网页 captcha token + 安卓 device_id | 400 `device not match` ⇒ captcha token 与 device_id 绑定 |
+| 网页 captcha token + 网页 device_id | **200 拿到文件列表** |
+| 网页 captcha token 寿命 | ~10 分钟（15:27 签发、15:37 过期） |
+
+⇒ **结论**：登录能绕（`ThunderExpert` + `login_type=refresh_token` + 网页 client_id），
+但业务接口的 captcha 只有网页自己能签，驱动无法自签 ⇒ 这条路走不通到底。
+上游文档明令「不要逆向」，故不去挖网页端算法。
+
+**设备现状**：`/thunder` 已是 `ThunderExpert`，`status=work`（13/14 挂载 work），
+`fs/list` 502。要停用它在存储编辑里勾「禁用」即可，不影响其余 13 个。
+工具：`tools/thunder_deploy_expert.py`（一条命令改配置+重启+验证+留档）。
+
+#### 48.6.9 改回「迅雷云盘」驱动（同日 16:15）
+
+用户 perspective：选的是 `Thunder`（迅雷云盘），不是专家版。48.6.8 的部署脚本为了用
+网页 token 把 driver 改成了 `ThunderExpert`，已改回：
+
+| 项 | 值 |
+|---|---|
+| driver | `Thunder`（迅雷云盘） |
+| addition | `username`/`password`/`captcha_token`/`credit_key`(短信那枚)/`device_id`/`space`/`root_folder_id` |
+| 状态 | `errored`，`error_msg: NeedVerify`（review_panel） |
+| 其余 13 个挂载 | 全部 work |
+
+结论不变：卡在设备出口 IP 的风控，与选哪个驱动变体无关。
+
+#### 48.6.10 creditkey 是一次性的；错误弹窗改纯文本（同日 17:00）
+
+- **`creditkey` 一次性**：用户 16:26 真机验证拿到的那枚，`set` 写回后登录成功
+  （`status=work` + 列出目录），**同时该 key 即被消耗**；随后重启 → `NeedVerify`。
+  ⇒ 「验证一次、长期免验证」不成立；`review_panel` 响应里每次都带一枚**新** creditkey。
+- **自动解的滑块不被信任**：用合成 MouseEvent 在 iframe 里拖滑块，服务端返回成功
+  （cookie 换新 key），但该 key 写回设备后仍 `NeedVerify`。只有**真人**操作授予信任。
+- 由此得出永久方案：先用一次真人验证让「用户名密码」登录成功，驱动会把换到的
+  **refresh_token 落盘**（expert 变体的 `setToken` 会写回 cfg.refresh_token），
+  再把 `login_type` 切成 `refresh_token` —— `/v1/auth/token` 不过风控，之后永久免验证。
+- **修**：init 失败的 `error_msg` 改成**纯文本**（原来照 Go 包了一层 HTML，
+  前端按纯文本渲染 ⇒ 用户看到"全是代码"）。格式：三行中文指引 + 内嵌完整 JSON。
+- **修**：`initNormal/initExpert` 登录成功后不再清空并落盘 `credit_key`
+  （Go 只在内存里清；本工程 access_token 不落盘，清掉就等于每次重启都要重新验证）。
+- 设备：二进制 `f18a7ef1…`；`/thunder` = `Thunder`（迅雷云盘）、errored/NeedVerify；
+  其余 13 挂载 work。
+
+#### 48.6.11 引导结论：安卓端不发 refresh_token（同日 17:30）
+
+用用户真人验证拿到的一枚 key 走「expert + 用户名密码」登录：**`status=work` 成功**，
+但配置里 `refresh_token` 落盘为空 ⇒ **`/v1/auth/signin/token` 这个 grant 不返回
+refresh_token**（Go 的 `TokenResp` 有该字段，但响应里没有）。官方文档里专家版要用的
+refresh_token 是从**迅雷 PC 客户端**抓包得来的，不是登录响应里的。
+
+⇒ 「一次验证 → 永久免验证」在安卓 client 上**不成立**（web client 又卡在 captcha 签名）。
+且该 key 同样一次性：成功后再次重启 → `userinfo_expired`；连清空 key 裸密码登录也是
+`userinfo_expired`（账号登录态被此前的反复尝试打掉，需等它自己恢复）。
+
+**设备最终状态**：二进制 `f18a7ef1…`；`/thunder` 已是 `ThunderExpert`（等价账号密码登录）、
+`status=errored` / `userinfo_expired`；其余 12 挂载全部 work。等账号恢复后按
+`tools/thunder_review.py show` → 浏览器 `reviewCb()` → `set <key>` 即可重新挂上。
+
+---
+
+## 49. 迅雷网页版 captcha_sign 破解 + thunder_web 驱动（2026-10-20 晚）
+
+> 详细逆向记录（算法、盐表、黄金向量、重取方法）单独成文：
+> **`docs/THUNDER_WEB_RE_2026-10-20.md`**。本节只记结论与工程影响。
+
+### 49.1 核心突破
+
+`captcha_sign` 不是公钥签名，是 **15 轮加盐 MD5 链**（纯 JS，无 WASM / 无子资源）：
+
+```
+h0 = clientId + clientVersion + host + deviceId + timestamp_ms
+hi = md5(h(i-1) + salt_i)          i = 1..15
+captcha_sign = "1." + h15
+```
+
+* 定位链：`service-captcha` 模块 609 → `utils-async` 模块 1643 `a()` →
+  `getPubKeySignUtil("captcha", funName)` → `utils-initial` 模块 22 导出表 →
+  模块 20/21 嵌套包装器 → 模块 0 = **blueimp-md5**（在数组形式 `app.<hash>.js` 里）。
+* 每个包装器形如 `return o(n(e+salt)) || c(n(e+salt))`，右支是死代码
+  （插桩实测：整条链恰好 15 次 md5 调用、完全线性）。
+* 「pubKeySign」这个名字是障眼法：`t(0)` 就是 md5，不存在 RSA/EC。
+
+### 49.2 验证（两段，都过）
+
+1. **离线**：迷你 webpack runtime 加载真实分片 → 与浏览器实抓黄金对逐字节一致
+   （Node + Python 两条独立实现）。
+2. **在线**：算出的签名打真实 `POST /v1/shield/captcha/init`
+   → `HTTP 200 {"captcha_token":"ck0.…","expires_in":300}` ⇒ **服务端认可**。
+
+⇒ 「网页 client 的 captcha_sign 算法未知」这条 §48.6 的结论**作废**。
+另修正：captcha token 寿命是 **300 秒**（原估 ~10 分钟）。
+
+### 49.3 工程落地
+
+* 新增 `tools/thunder_web_sign.py`（参考实现 + `golden` 自检 + `probe` 在线探针）。
+* 新增 `tools/thunder_web_sign_harness.js`（盐表提取器：迷你 runtime + md5 插桩，
+  前端发版后一条命令重取盐表）。
+* `thunder.zig` 新增 `Variant.web` + `web_factory`（key `thunder_web`，中文名
+  「迅雷云盘（网页版）」）。**API 层完全复用**，差异只在认证与签名：
+  - 只走 refresh_token（网页 cid `Xqp0kJBXWhwaTpB6`），refresh 失败**不**回退 core login；
+  - `package_name = pan.xunlei.com`，恰好等于签名 base 里的 `location.host`
+    ⇒ 复用同一个 `captchaSignAt()`，只换算法表；
+  - `device_id` 留空则生成 32-hex 并持久化；
+  - captcha token 按 300 秒 TTL **主动**续（提前 60 秒），不再只靠 `error_code==9` 兜底；
+  - `refreshCaptchaToken` 对 web 变体不发 `captcha_token` / `redirect_uri`
+    （对齐浏览器实际请求体）；
+  - 盐表过期时错误信息直接指向文档 §4.3。
+* `initExpert` 顺序微调：device_id 在算 `identity` **之前**落定，避免首轮多烧一次
+  refresh（网页版每次 refresh 都轮换 token）。
+* 单测：THU-22（黄金签名）、THU-23（盐表字符串/数组一致 + 无逗号）、
+  THU-24（web 默认值）、THU-25（device_id 形态），THU-20/21 扩展覆盖第三个 factory。
+
+### 49.4 真机验证（22:30，设备隔离实例 `:15399`）
+
+* 网页版登录：CDP 自动填表，**无短信、无滑块**，拿到 refresh_token（`a1.` 51 字符）。
+* **实测 refresh_token 不轮换**：连续 3 次 grant 返回同一枚 ⇒ 早前「一次性轮换」
+  的判断作废（驱动仍每次落盘，零成本保险）。
+* 驱动真机：`status=work`、`fs/list` 出 3 个目录、`mkdir`/`rename`/`remove` 全 200。
+* `fs/list` 3 项 vs 探针 20 项 = 驱动带了 Go 的
+  `phase=PHASE_TYPE_COMPLETE & trashed=false` 过滤，探针没带 ⇒ **不是 bug**。
+
+### 49.5 待办
+
+- [ ] 生产实例（`:15244`）尚未换新二进制；是否把 `/thunder` 从 `ThunderExpert`
+      迁到 `thunder_web` 由用户决定（新驱动可与之并存，挂不同 mount_path）。
+- [ ] 网页版 `link`（下载直链）与 S3 分片上传未单独复测（复用安卓同一套代码）。
+- [ ] 回归时别在循环里重建存储（每次重建 = 一次 refresh grant，账号有频率限制）。
+
+---
+
+## 50. 网页版驱动改名 ThunderWeb + 自动登录续期 + 三实例事故（2026-10-20 深夜）
+
+### 50.1 命名定案
+
+驱动 key 由 `thunder_web` 改为 **`ThunderWeb`**（用户 2026-10-20 22:40 拍板）。
+依据：Go 侧 95 个 `driver.Config.Name` 里，迅雷家族 6 个全是 PascalCase
+（`Thunder`/`ThunderExpert`/`ThunderBrowser`/`ThunderBrowserExpert`/`ThunderX`/
+`ThunderXExpert`），全仓只有 2 个带下划线且都是品牌遗留；Zig 侧唯一的
+「上游没有、自己新增」先例 `Itvsh` 同样是 ASCII PascalCase。
+
+### 50.2 「只录一次手机号密码」——网页 OAuth 登录可程序化
+
+抓包查明网页登录是 4 步纯 HTTP，**无短信、无滑块、不需要 captcha_sign**
+（该 action 的 captcha init 只认手机号）。详见
+`docs/THUNDER_WEB_RE_2026-10-20.md` §2.5。要点：
+
+* signin 用 **SSO client** `XW5SkOhLDjnOZP7J`，authorize/token 用 pan client
+  `Xqp0kJBXWhwaTpB6`；
+* authorize 走 **PKCE S256**，`code_verifier` 32 位、`code_challenge` 43 字符；
+* 手机号必须 `+86 18616132763` 形态（带空格），由 `webUsername()` 规范化。
+
+驱动落地：`webLogin()` 实现四步；`webLoginOrRefresh()` 先 refresh、失败即重登；
+`refreshFlow` 对 web 变体直接走自愈。⇒ 令牌链断在任何一环都能自动恢复，
+用户只需初次填账号密码。
+
+**续期链实测**：生产 `/thunderweb` 只填 `username`+`password` → 自动登录 →
+`refresh_token` 落盘 → `status=work`；重启后无人工输入仍 `work`。
+
+### 50.3 之前两个错误结论的更正
+
+| 曾认为 | 实际 |
+|---|---|
+| refresh_token 一次性轮换 | **不轮换**：同一枚连续 7 次 grant 全 200，返回同一枚 |
+| `4126 has been refresh at …` 是令牌 TTL/轮换 | **是三实例并发 refresh 导致的**（见 §50.4） |
+
+### 50.4 ⚠ 生产事故：三个 openlist 实例并发写坏配置（22:52）
+
+`openlist_start.sh stop` 只按 pidfile 杀一个进程，而设备上同时活着 3 个实例
+（17532 / 18066 / 6310），都 bind `0.0.0.0:15244`（SO_REUSEPORT），跑的是三个
+不同版本的二进制（前两个 exe 已 deleted）。后果：
+
+1. 各持一份内存配置互相覆盖 ⇒ 刚建的存储"消失"、`/thunder` 的 driver 在
+   `Thunder` / `ThunderExpert` 之间反复横跳；
+2. `config.zig.json` 被写成**非法 UTF-8**（`/thunderweb` 的 `webdav_policy`
+   混进 NUL + 二进制），二进制拒绝启动 ⇒ 服务不可用；
+3. 同一枚 refresh_token 被并发 refresh ⇒ 4126。
+
+修复：`kill -9` 两个残留 pid → 循环复核到只剩 1 个 → 按字节修好那一个字段 →
+启动一次。15 个存储全部完好，13 个 work。损坏原件留在设备 `/tmp/corrupt.json`，
+事故记录进归档 `server/armbian/bin/openlist/README.txt`。
+
+**运维铁律（新增）**：重启前先数进程，必须是 **1 个**且 exe 不带 `(deleted)`：
+
+```sh
+for p in /proc/[0-9]*; do e=$(readlink $p/exe 2>/dev/null); case "$e" in *openlist*) echo "$(basename $p) $e";; esac; done
+```
+
+### 50.5 基线
+
+438/438 单测（新增 THU-26 PKCE / THU-27 手机号规范化 / THU-28 无凭据即报错），
+aarch64 1,314,560 B，sha256 `3f361898…`。生产已部署该版本。
+
+---
+
+## 51. 双架构构建（aarch64 + x86_64，2026-10-20 深夜）
+
+### 51.1 本地构建脚本
+
+`tools/build_remote.py` 原来把目标写死成 `aarch64-linux-musl`，且产物校验里
+硬编码 `"aarch64" in readelf`。现在：
+
+* 新增 `--target <triple>`，缺省仍是 `aarch64-linux-musl`（光猫）；
+* 产物名随架构走：`dist/openlist-<arch>`；
+* ELF 校验按架构选提示词（`ELF_MACHINE_HINTS`），x86_64 认
+  `Advanced Micro Devices X86-64`；
+* 单测仍只在打包机**原生**跑一轮（与 `-Dtarget` 无关），两架构共用同一批用例。
+
+实测：
+
+| 目标 | 体积 | sha256 前 8 | 单测 |
+|---|---|---|---|
+| `aarch64-linux-musl` | 1,314,560 B | `3f361898` | 438/438 |
+| `x86_64-linux-musl` | 1,476,016 B | `64fbdd49` | 438/438 |
+
+x86_64 产物已在打包机（x86_64 Linux）实跑 `--help`，正常输出 usage。
+
+### 51.2 CI workflow
+
+`.github/workflows/build_zig_minimal.yml` 从「只出 aarch64 sqfs」改成**固定双架构矩阵**：
+
+```yaml
+matrix:
+  include:
+    - { target: aarch64-linux-musl, arch: aarch64 }
+    - { target: x86_64-linux-musl,  arch: x86_64  }
+```
+
+* `fail-fast: false` —— 一腿失败不牵连另一腿；
+* **不再产 squashfs**（用户 2026-10-20 决定）：设备侧 2026-10-19 起就是裸二进制
+  持久部署，`/opt/sq` 挂载点已 rmdir、镜像已删，sqfs 没有任何消费方。
+  每腿只产一个静态裸二进制，落 `build/artifacts/` 后：
+  - `upload-artifact`（name=`openlist-zig-<arch>`，run 页面可直接下载）
+  - 上传到 `ci-zig-<sha>` Release（tag 去掉了 `sqfs` 字样）
+* **资产命名**：
+
+  | arch | 资产名 |
+  |---|---|
+  | aarch64 | `openlist-zig.aarch64_<ver>_<drv>` |
+  | x86_64 | `openlist-zig.x86_64_<ver>_<drv>` |
+
+* 新增**架构断言**：`readelf -h` 的 Machine 必须与矩阵一致
+  （`AArch64` / `X86-64`），防止「配置写错但产物照样出来」。
+* 单测只在 aarch64 腿跑（`if: matrix.arch == 'aarch64'`），省 3 分钟。
+* Release 创建加了并发保护：两条腿可能同时 `gh release create`，
+  用 `|| true` 吞掉竞态后再确认一次存在。
+* `upload-artifact` 用仓库统一的 SHA pin（与 `build.yml` / `beta_release.yml` 一致）。
+
+---
+
+## 52. thunder_web 代码审计（2026-10-20 深夜）与修复
+
+外部审计报告逐条核对，**8 条全部成立**（其中 1 条附带实证）。按「立即修」的
+做了修复，其余登记进差异清单。审计结论与本次结论一致的地方只列要点，不重复。
+
+| # | 问题 | 核实结论 | 处理 |
+|---|---|---|---|
+| 1 | `build.zig` 的 DRIVERS 表缺 `ThunderWeb` | **成立**。打包机实测 `zig build --help -Ddrivers=ThunderWeb` → `unknown driver 'ThunderWeb'`，configure 失败。而 `builtin` 里明明注册了它（thunder basename 时三个 factory 全进） | ✅ 已修 |
+| 2 | `api.zig` init 失败路径 gpa 泄漏 | **成立**。`allocPrint(alloc, "{s}: {s}", …)` 落在 gpa，`setStorageError` 又 dupe 进配置 arena，原串无人释放；`@errorName(e)` 分支是静态串，所以调用方也无法统一 free。由本轮 diff 引入 | ✅ 已修（根治） |
+| 3 | `computeDeviceId` 边缘分歧未登记 | **成立**。Go 是 `len(DeviceID) != 32` 才派生，Zig 是「非空就原样用」；正常流程等价，仅手填非 32 位值分叉 | ✅ 已登记 |
+| 4 | `refreshFlow` 死代码 + 矛盾注释 | **成立**。web 变体在函数开头已 early-return，`only_refresh` 里的 `variant == .web` 永为 false；旁边注释还写着「网页版没有回退」，与上方 web 分支的实际行为相反 | ✅ 已修 |
+| 5 | `webLoginOrRefresh` 盖掉 refresh 失败真因 | **成立**。网络错误 + 未填账号密码时 err_detail 被改写成「需要 username + password」，真因只剩 log.warn | ✅ 已修 |
+| 6 | `link()` 空直链比 Go 严格 | **成立**。Zig 报 `InvalidResponse` + err_detail，Go 把空串塞进 `Link.URL` 交给下游 | ✅ 已登记 |
+| 7 | S3 MPU `uploadId`/`ETag` 未转义 | **成立（提醒级）**。原样进 URL/canonical query/XML；AWS 生态通常安全且安卓版真机验过，列为第一嫌疑点 | ✅ 已登记 |
+| 8 | 单测编号跳过 THU-17、21/20 乱序 | **成立**（纯 cosmetic）。**未改** —— 重排编号会让引用这些名字的检索/记录失效，收益为负 | 保留 |
+
+### 52.1 #1 修复
+
+`build.zig` 补 `.{ .key = "ThunderWeb", .file = "thunder" }`；顺带修正两处计数
+注释（driver.zig:331 / :468，`14 个注册项` → **15 个**，thunder 出 3 个 factory）
+与 driver.zig 文件头的驱动清单（原来只列了 11 个名字、完全没有迅雷）。
+校验：`zig build --help -Ddrivers=ThunderWeb` 现在能通过。
+
+### 52.2 #2 修复（根治，不是打补丁）
+
+根因是 `init_failed` 这个字段**既是静态串又是 gpa 串**，所有权说不清。改成两段式：
+
+```zig
+pub const InitFailure = struct { name: []const u8, detail: ?[]const u8 };
+init_failed: InitFailure,
+```
+
+* `buildMountFromStorage` 不再分配，原样返回两段；
+* 需要文字的调用方用 `initErrText(arena, f)` —— 只在**请求 arena** 上调
+  （4 个管理面 handler 都是）；
+* 落配置用新增的 `Config.setStorageErrorParts(id, name, detail)` —— 在**配置
+  arena** 里拼一次；
+* 启动路径（`alloc` = gpa）**一次分配都没有**：日志用三段 format 参数直接打。
+
+### 52.3 #4/#5 修复细节
+
+* `refreshFlow`：删掉 `only_refresh` 里的 `self.variant == .web or`，注释改写为
+  「什么情形下 refresh 失败不再降级」+ 一句「别在这里再加 web 判断」。
+* `webLoginOrRefresh`：refresh 失败的 `@errorName` 记下来，`webLogin` 也失败时
+  把两段拼成一条写进 err_detail（`refresh_token 失败（X）；账号密码登录也失败：Y`），
+  不再让真因消失。
+
+### 52.4 登记进 `thunder.zig` 头部的「与 Go 的差异」
+
+新增三条：`device_id` 的 `!= 32` 阈值、`Link` 空直链、S3 MPU 未转义；
+并把头部 factory 表从「两个」改成「三个」。

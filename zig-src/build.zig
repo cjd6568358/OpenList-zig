@@ -27,6 +27,9 @@ const DRIVERS = [_]Driver{
     .{ .key = "115 Cloud", .file = "pan115" },
     .{ .key = "WoPan", .file = "wopan" },
     .{ .key = "Strm", .file = "strm" },
+    .{ .key = "Thunder", .file = "thunder" },
+    .{ .key = "ThunderExpert", .file = "thunder" }, // 与 Thunder 同一个实现
+    .{ .key = "ThunderWeb", .file = "thunder" }, // 网页版，同样同一个实现
 };
 
 /// `-Ddrivers=` 的原始串 → 去重后的 basename 串。空 / "all" ⇒ 全量。

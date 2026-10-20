@@ -37,4 +37,9 @@ output/
 *.syso
 
 # ---- 本地临时产物（不入库）----
+# 旧记忆目录 .workbuddy/ 已于 2026-10-20 并入 .workbuddy-ai/memory/；
+# 保留本行只为防止旧版本 agent 再把目录生出来。
 /.workbuddy/
+# 记忆目录里只放 markdown。历史上误存过 5 个 aarch64 构建产物（5.6MB），
+# 2026-10-20 已清理；构建产物一律走 zig-src/dist/ 或归档目录。
+/.workbuddy-ai/memory/*-aarch64

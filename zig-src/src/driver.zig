@@ -6,9 +6,11 @@
 //! measurable next to the network round-trip every one of these performs.
 //!
 //! The method set is a deliberate subset of OpenList's `driver.Driver`
-//! interface: only what the twelve registered drivers (`Local / WebDav /
+//! interface: only what the registered drivers actually need (`Local / WebDav /
 //! Itvsh / 189Cloud / 189CloudPC / 123Pan / AliyundriveOpen /
-//! Quark+UC / 115 Cloud / WoPan / Strm`) actually need. `copy` is **optional**
+//! Quark+UC / 115 Cloud / WoPan / Strm` + `Thunder` / `ThunderExpert` /
+//! `ThunderWeb`，全量 15 个注册名 / 12 个实现文件，见下面 `builtin`).
+//! `copy` is **optional**
 //! (`null` = the upstream driver's `Copy` is `NotSupport`), and `space` is
 //! optional too (null = no quota). Still absent: `putURL`, `getArchive`,
 //! `extractArchive`, `mkdir`-with-recursion, and every optional capability
@@ -325,8 +327,9 @@ pub const Factory = struct {
 /// 用 comptime 分支时，未选中的 `@import(...).factory` 连同整个分支一起被
 /// 消掉，一行代码都不生成 —— 这是整个白名单能省体积的关键。
 pub const builtin = blk: {
-    // 12 个注册项；每个 if 对应一项，与 build.zig 的 DRIVERS 表一一对应
+    // 每个 if 对应一项，与 build.zig 的 DRIVERS 表一一对应
     // （build.zig 负责把用户传的名字翻译成这里的 basename 并校验）。
+    // 2026-10-20 起 15 个注册项 / 12 个实现（thunder 出 Thunder + ThunderExpert + ThunderWeb）。
     @setEvalBranchQuota(200000);
     var list: []const Factory = &.{};
     if (has("local")) list = list ++ [_]Factory{@import("drivers/local.zig").factory};
@@ -345,6 +348,15 @@ pub const builtin = blk: {
     if (has("pan115")) list = list ++ [_]Factory{@import("drivers/pan115.zig").factory};
     if (has("wopan")) list = list ++ [_]Factory{@import("drivers/wopan.zig").factory};
     if (has("strm")) list = list ++ [_]Factory{@import("drivers/strm.zig").factory};
+    // 迅雷云盘：Go 的 `drivers/thunder` 一个包注册两个驱动（普通 + 专家），
+    // 共用一套 `XunLeiCommon` 协议实现，所以这里也是同一份文件出两个 factory。
+    // 第三个 `ThunderWeb` 是本工程新增（网页版 refresh_token + 自签 captcha，
+    // 绕开安卓 SDK 的数美风控），见 docs/THUNDER_WEB_RE_2026-10-20.md。
+    if (has("thunder")) list = list ++ [_]Factory{
+        @import("drivers/thunder.zig").factory, // Thunder
+        @import("drivers/thunder.zig").expert_factory, // ThunderExpert
+        @import("drivers/thunder.zig").web_factory, // ThunderWeb
+    };
 
     // ---------------------------------------------------------------------
     // 暂时下线的入口 —— 这几个是**做错了变体**的驱动，代码保留、不删，
@@ -454,8 +466,9 @@ test "find matches the Go Config.Name byte for byte — no aliases, no case fold
 test "keys() reports exactly the registered driver names, no duplicates" {
     const ks = try keys(testing.allocator);
     defer testing.allocator.free(ks);
-    // 条数随白名单变化（全量 = 12 注册项，11 个实现，quarkuc 出 Quark + UC
-    // 两个），所以不断言固定值，只断言"自洽 + 无重复 + 非空"这些不变量。
+    // 条数随白名单变化（全量 = 15 注册项 / 12 个实现：quarkuc 出 Quark + UC，
+    // thunder 出 Thunder + ThunderExpert + ThunderWeb），所以不断言固定值，
+    // 只断言"自洽 + 无重复 + 非空"这些不变量。
     try testing.expect(ks.len > 0);
     for (ks, 0..) |k, i| {
         for (ks[i + 1 ..]) |other| {

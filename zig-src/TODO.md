@@ -14,7 +14,7 @@
 > 见 STATUS.md §41）：上传/列目录/copy/WebDAV 全链真机通过，产物
 > cd228d85…；115 直链被上游 CDN 拒签（403 invalid signature，§41.4）与
 > koofr GET 目录瞬时 404（§41.5）均已定性为上游行为、Go 同构。
-> **卡住的一件事**：189Cloud（web 驱动）卡账号侧二次验证；UC/115/WoPan 缺凭据。
+> **卡住的一件事**：189Cloud（web 驱动）卡账号侧二次验证；UC/115/WoPan/Thunder 缺凭据。
 >
 > **§35 立下的规矩（这轮最大的教训）**：协议细节**不能凭"实测感觉"**判未对齐
 > —— 上游源码是唯一事实来源，且必须落到函数与行号。本轮之前凭一次"PUT 也
@@ -48,6 +48,7 @@
 | 驱动操作集复查 | ✅ 与上游 NotSupport 一致 | STATUS.md §26.1 |
 | 重写 `tools/import_go_config.py` | ✅ 无损版 | 见 §4 |
 | Playwright 前端自动化 | ✅ 跑通（playwright-core + 系统 Chrome） | 见 §6 |
+| 迅雷云盘驱动（`Thunder` + `ThunderExpert`） | ✅ 2026-10-20 移植 + **真机**（e2e 62/63，分片上传通；431/431 单测） | STATUS.md §48 |
 
 ---
 
@@ -113,7 +114,7 @@
 ## 2. 【已完成 2026-10-16 深夜】全驱动真实 API + UI 回归测试（Task 19）
 
 **结果**：9 挂载点 e2e **165 通过 / 0 失败 / 1 跳过** + UI smoke **11/11**，
-完整报告见 STATUS.md §31，原始输出在 `docs/regression/`。
+完整报告见 STATUS.md §31。（原始日志目录 `docs/regression/` 已于 2026-10-20 清理，结论全部保留在 STATUS.md）
 （唯一跳过 = jianguo 临时目录删不掉，服务商规则，非实现问题。）
 
 **quark 按用户 2026-10-16 的要求改「读取 + 删除」回归**（容量满，添加暂不测）：

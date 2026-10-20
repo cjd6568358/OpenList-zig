@@ -119,16 +119,22 @@ TODO.md                 待办（权威，仓库根目录）
 
 > **规则：交付产物一律走打包机 `10.0.0.4`（工作目录 `/tmp`）。**
 > `tools/build_remote.py` 封装了「打包源码 → 打包机 `zig build test` →
-> 交叉编译 `aarch64-linux-musl`（`-lc -fstrip`）→ 校验 ELF → 取回
-> `dist/openlist-aarch64`」全流程。判成功看 `--summary all` 里的 `test success`
+> 交叉编译（默认 `aarch64-linux-musl`，`-lc -fstrip`）→ 校验 ELF → 取回
+> `dist/openlist-<arch>`」全流程。判成功看 `--summary all` 里的 `test success`
 > —— `zig build` 会吞掉 "All tests passed"，末尾还可能打一条误导性的
 > `failed command`（退出码实为 0）。本机只负责读源码、写代码；**本机产物只能
 > 自测，不能当交付**。
+>
+> 单测始终在打包机**原生**（x86_64）跑一轮，两个目标架构共用同一批用例。
 
 ```sh
-python tools/build_remote.py                 # 全量驱动
-python tools/build_remote.py --drivers "local,webdav,quark,strm"   # 白名单
+python tools/build_remote.py                                      # aarch64（光猫）
+python tools/build_remote.py --target x86_64-linux-musl           # x86_64 服务器
+python tools/build_remote.py --drivers "local,webdav,quark,strm"  # 白名单
 ```
+
+产物名随架构走：`dist/openlist-aarch64` / `dist/openlist-x86_64`（`dist/` 不入库，
+现役 aarch64 二进制留档在 `D:/workspace/server/armbian/bin/openlist/openlist`）。
 
 **Zig 版本：0.17.0**（0.15 把 `std.fs`/`std.net` 搬进 `std.Io`，0.16 搬完，
 0.17 又改了入口签名 `main(std.process.Init)` 与优化档位 `std.lang.Optimize`）。

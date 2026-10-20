@@ -9,7 +9,7 @@
 - Zig 版不内嵌前端：`cdn`（302 到 jsdelivr）或 `dist_dir` 二选一，都不配 ⇒ 内置占位页。
 - 本目录 `.workbuddy-ai/memory/` 随 zig-src 自包含，勿搬。
 
-## 驱动状态（11 个注册项）
+## 驱动状态（13 个注册项 / 12 个实现）
 
 | 驱动 | Go Name | Zig | 状态 |
 |---|---|---|---|
@@ -24,12 +24,35 @@
 | 115 | `115 Cloud` | pan115.zig | ✅ 实现完成 |
 | wopan 沃云盘 | `WoPan` | wopan.zig | ✅ 实现，未真机（无凭据） |
 | strm | `Strm` | strm.zig | ✅ |
+| 迅雷云盘（+专家） | `Thunder`/`ThunderExpert` | thunder.zig | ✅ 2026-10-20 真机（e2e 62/63；S3 必须 virtual-hosted，见 STATUS §48.6） |
+| 迅雷网页版 | `ThunderWeb`（本工程新增，上游无对应 Go 驱动） | thunder.zig（`Variant.web`） | ✅ 2026-10-21 生产 `/thunderweb`（手机号密码自动登录+自愈，含上传/直链/下载） |
 
 - **驱动名铁律**：`factory.key` 逐字节等于 Go `driver.Config.Name`；**不设别名**（2026-10-15 删除别名机制）。itvsh 的 Go 名 2026-10-19 起为 ASCII `Itvsh`（原中文名两侧同步改）。
 - **★ label 不是展示名、没有 API 出口**（2026-10-19 查证）：前端 bundle `assets/entry-*.js` 自带 `drivers:{...}` 109 条 key→中文展示名映射（123Pan→123 云盘 等），前台中文名全来自它；itvsh 表里没有 ⇒ 原样渲染 key。Zig `label` 只进启动日志。曾据错误前提把 11 个 label 改成 key，已回退；**用户明确要求 label 保持中文**。
 - `pan123`/`quarkuc`/`itvsh` 上游 `Copy` 就是 NotSupport ⇒ vtable `.copy=null`，有测试钉住别顺手补。
+- **迅雷两条硬知识（2026-10-20 真机）**：① S3 上传必须 **virtual-hosted**
+  （`https://<bucket>.<trimLeft(endpoint)>/<key>`），path-style 直接 403/DNS 失败；
+  Go 那句 `TrimLeft(endpoint, bucket+".")` 是 aws-sdk 默认 virtual-hosted 的必要前置，
+  不是 hack。② 上游对登录限频（`shield_reject: Operation too frequent`），
+  回归时别在循环里重建存储（每次重建 = 一次登录）。
 - `115 Cloud` 依赖外部 SDK（`SheltonZhu/115driver`）、`WoPan` 依赖 `wopan-sdk-go`
   （其 Go 源码已 vendor 到 `zig-src/wopan-sdk-*.go` 供对照）⇒ 只能靠真实 API 回归。
+- **★ 网页版 captcha_sign 已破解（2026-10-20 晚，权威文档
+  `zig-src/docs/THUNDER_WEB_RE_2026-10-20.md`）**：`"1." + 15 轮 md5(prev+salt)`，
+  纯 JS 无 WASM；`t(0)` 就是 **blueimp-md5**（在**数组形式**的 `app.<hash>.js` 里，
+  下标即模块 id）。服务端已实测认可。**盐表随前端发版变化**，用
+  `tools/thunder_web_sign_harness.js` 一条命令重取；`thunder_web_sign.py` 有
+  golden 自检 + 在线 probe。captcha token 寿命 **300 秒**（非 10 分钟）。
+  web 与安卓是**同一个** `captchaSignAt()`，只差算法表（网页 `package_name`
+  = `pan.xunlei.com` = 签名 base 的 host，天然对齐）。
+  **网页 refresh_token 实测不轮换**（同一枚连续 7 次 grant 全 200）；驱动仍每次落盘。
+  `4126 has been refresh at` 的真因是**多实例并发 refresh**，不是轮换/TTL。
+  **网页登录可程序化**（4 步纯 HTTP，无短信/滑块/不需 captcha_sign）：signin 用 SSO
+  cid `XW5SkOhLDjnOZP7J`，authorize/token 用 pan cid，PKCE S256；手机号要
+  `+86 <11位手机号>`（带空格）。驱动靠它实现「只录一次账号密码」。
+  网页登录无风控：CDP 进 `i.xunlei.com` OAuth iframe → 切「账号密码登录」→ 直接提交。
+  回归：`tools/thunder_web_probe.py`（本机全链路）、`tools/thunder_web_e2e.py`
+  （管理面，`--write`/`--upload`；上传后有**秒级最终一致性**延迟，已内置轮询）。
 - **BaiduNetdisk / Onedrive 暂不移植**（用户 2026-10-16 14:58 明确；`/baidu` 在用户备份里
   实际在用，导入后 init 失败属预期）。重启话题的唯一信号 = 用户说"百度网盘也要"。
 
@@ -78,6 +101,12 @@
   开机自举验证宁可手工反复跑 `/bin/sh /opt/script/openlist_start.sh`
   （幂等/stop-start/CDN 重试都测过），也不许碰任何重启类命令。
   ⚠ 本次检索（本地记忆+历史对话检索）均未找到该规矩的原始记录，已补录于此。
+- **★ 重启生产前必须数进程（2026-10-20 22:52 事故）**：`openlist_start.sh stop` 只按
+  pidfile 杀一个，设备上曾同时活着 3 个实例（SO_REUSEPORT 抢 15244、三个不同版本），
+  互相覆盖 config ⇒ 存储"消失"、driver 横跳，最终把 config.zig.json 写成**非法 UTF-8**
+  导致拒绝启动。检查命令：
+  `for p in /proc/[0-9]*; do e=$(readlink $p/exe 2>/dev/null); case "$e" in *openlist*) echo "$(basename $p) $e";; esac; done`
+  —— 必须是 **1 个**且 exe 不带 `(deleted)`。事故全文见归档 README.txt。
 - SSH 默认 cwd 是 `/root` ⇒ 写盘一律绝对路径 `/tmp/olz/...` 且同条命令 `mkdir -p`。
 - 起后台服务必须 `< /dev/null`（否则 paramiko read() 永不到 EOF）；起服务+探测放同一条 exec。
 - 设备 busybox：`chmod` 失效（用 paramiko sftp.chmod）、无 `curl`/`pkill`/`setsid`，
@@ -149,7 +178,7 @@
   **架构事实**（解释一切差异的前提）：每请求一个 ArenaAllocator（`http.zig:622`）；arena `free` 只在最近一次分配时回退；
   `Client` 每实例一把全局锁（`client.zig:159`），并发靠每 worker 一个 Client；`model.Obj` 无 ID（Go 有），
   189/189pc 靠路径逐段翻页找 ID。**未上真机回归，修复须全量回归。**
-- 验证基线：411 单测全过（2026-10-19 打包机 `zig build test` 实测，含 115 fixture），
+- 验证基线：438 单测全过（2026-10-19 打包机 `zig build test` 实测，含 115 fixture），
   aarch64 ~1.21MB；真机 e2e 32/32（2026-10-13 起多次全绿）。
 - **remote.py 调用坑（2026-10-19 连踩）**：main() 把 argv 用空格拼接，引号会被本地
   shell 吃掉 ⇒ 远端命令必须作为**单个带引号参数**传（`... 22 "cmd1; cmd2"`），且内联
@@ -168,3 +197,6 @@
   `@embedFile`，缺文件时新克隆 `zig build test` 编译失败；真机原文
   `115list_sample.json` 含真实文件名，**永不入库**（`.gitignore` 用 `!` 放行前者即可）。
 - 磁盘紧张是老问题（D 盘曾 100%）；npm pack 的 23MB 前端包用完立刻删。
+- **记忆目录只有一个**：`D:/workspace/OpenList-zig/.workbuddy-ai/memory/`。旧的
+  `.workbuddy/memory/` 已于 2026-10-20 合并进来（10-16 日志并入、10-17/10-18 按
+  追加合并），其 `MEMORY.md` 快照留在 `memory/archive/MEMORY-2026-10-18.md`。

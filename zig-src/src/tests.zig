@@ -55,6 +55,8 @@ test {
     _ = @import("drivers/pan115.zig");
     _ = @import("drivers/wopan.zig");
     _ = @import("drivers/strm.zig");
+    // 2026-10-20：迅雷云盘（Thunder + ThunderExpert）
+    _ = @import("drivers/thunder.zig");
 
     // App
     _ = @import("api.zig");

@@ -1,17 +1,31 @@
-name: Zig Minimal Build (SquashFS)
+name: Zig Minimal Build (aarch64 + x86_64)
 
 # ============================================================================
-#  只产 Zig 版 aarch64 squashfs 镜像 —— 从 build_sqfs.yml 改造而来
+#  产 Zig 版 **aarch64 + x86_64** 两个架构的静态裸二进制
+#  —— 从 build_sqfs.yml 改造而来；2026-10-20 起**不再产 squashfs**
 # ============================================================================
 #
-#  与 Go 版（.github/workflows/build_go_minimal.yml 的 build_sqfs job）的关系：
+#  ★ 为什么不再要 sqfs：设备侧 2026-10-19 起已改成「裸二进制持久部署」
+#    （/opt/armbian/bin/openlist/openlist，systemd 之外由 openlist_start.sh 拉起），
+#    Go 时代的 /opt/sq 挂载点已 rmdir、镜像已删。再打 sqfs 只是多一层
+#    需要挂载的东西，没有任何消费方。
 #
-#    同：都走「编译期白名单 + mksquashfs」得到 /opt/sq/openlist 的镜像，
-#        参数（驱动清单、CDN）与打包参数（-comp xz -b 1M -all-root、
-#        镜像内文件名 openlist、0755）完全一致 —— 直接互换、不挑构建方式。
+#  产物矩阵（固定双架构）：
+#
+#    arch      target                 Release 资产名
+#    aarch64   aarch64-linux-musl     openlist-zig.aarch64_<ver>_<drv>
+#    x86_64    x86_64-linux-musl      openlist-zig.x86_64_<ver>_<drv>
+#
+#  ★ 单测只在 aarch64 那一腿上跑一次（`zig build test` 在 runner 原生执行，
+#    与目标架构无关），避免白跑两遍 3 分钟。
+#
+#  与 Go 版（.github/workflows/build_go_minimal.yml）的关系：
+#
+#    同：都按「编译期白名单 + 全静态 musl」出产物，驱动清单/CDN 语义一致。
 #    异：裁剪手段不同。Go 版在构建**前**用 `go build -overlay` 改写
 #        `drivers/all.go` 等源码；Zig 版不需要，因为 Zig 的注册表本身就是
 #        编译期常量，`-Ddrivers=` 就直接决定谁被编译进去。
+#        （Go 版那边仍带一个 build_sqfs job，本文件与它无关。）
 #
 #  §0  改驱动只看这一节
 #  ---------------------------------------------------------------------------
@@ -23,7 +37,7 @@ name: Zig Minimal Build (SquashFS)
 #    189Cloud | cloud189              189CloudPC | cloud189pc
 #    123Pan | pan123                  Quark / UC | quarkuc（一个文件出两个驱动）
 #    115 Cloud | pan115               WoPan | wopan
-#    Strm | strm
+#    Strm | strm                      迅雷云盘 | thunder（出 Thunder/ThunderExpert/ThunderWeb）
 #
 #  留空或填 all = 全量。未知名字会在配置阶段直接失败并列全部合法值，
 #  不会静默产出缺驱动的二进制。
@@ -32,11 +46,11 @@ name: Zig Minimal Build (SquashFS)
 #    离线下载/ffmpeg/服务端协议裁剪 —— 这个实现里根本没有这些功能点
 #    （见 zig-src/docs/STATUS.md §11）。所以那几个输入不存在。
 #
-#  §1  体积（打包机实测，aarch64-linux-musl，-O small -fstrip）
+#  §1  体积（打包机实测，-O small -fstrip，drivers=all）
 #  ---------------------------------------------------------------------------
-#    drivers=all                 1,183,352 B
-#    local,webdav,Quark,strm       893,352 B   （省 24.5%）
-#  驱动在静态单体里的 xz 边际见 zig-src/dist/driver_size.log，按需估算。
+#    aarch64-linux-musl   1,314,560 B
+#    x86_64-linux-musl    1,476,016 B
+#  驱动维度的体积边际见 zig-src/docs/STATUS.md §51 / tools/driver_size.py。
 #
 #  §2  运行时前提（与 Go 版相同）
 #  ---------------------------------------------------------------------------
@@ -58,20 +72,20 @@ name: Zig Minimal Build (SquashFS)
 #          不是法律原因，是 CDN 防滥用策略）。.js/.css/VERSION 都是 200，
 #          但前端外壳必须是 index.html，所以用不了。
 #        - jsdelivr.pai233.top：402，需付费。
-#    * 不要设 dist_dir：设了会去读镜像里不存在的前端文件然后 Fatal。
-#      更不要把前端副本打进镜像 —— 不内嵌前端正是这个构建的前提。
+#    * 不要设 dist_dir：设了会去读不存在的前端文件然后 Fatal。
+#      更不要把前端副本打进产物 —— 不内嵌前端正是这个构建的前提。
 #    * 被裁掉的驱动若 config.json 里还有对应存储，该存储会 init 失败并记
 #      error_msg，其余存储照常服务。
 #
-#  §3  设备侧挂载注意（与 Go 版一致，都是实测结论）
+#  §3  设备侧部署注意
 #  ---------------------------------------------------------------------------
-#    * mksquashfs 的源目录必须是 stage/openlist 本身，传父目录会让镜像里多一层。
-#    * 必须 -b 1M：128K 块会大 3.4 MiB。-Xbcj arm 对 AArch64 无效，不加。
-#    * 必须 -all-root：否则镜像内文件归 runner 的 uid 1001，与设备现役镜像不一致。
-#    * 可执行位必须显式 chmod 755：设备侧启动脚本会先做 [ ! -x ] 检查。
+#    * 可执行位：产物本来 0755，设备侧启动脚本会先做 [ ! -x ] 检查，别丢。
+#    * 静态：必须无 INTERP 段，否则在 musl 目标机起不来（本文件有断言）。
+#    * 换二进制流程见 server/armbian/bin/openlist/README.txt：
+#      **停之前先数进程**，必须是 1 个且 exe 不带 `(deleted)`。
 
 on:
-  # 只保留手动触发：这个镜像只服务一台特定设备，没有"每次推送都出"的需要。
+  # 只保留手动触发：这个产物只服务自己的设备/服务器，没有"每次推送都出"的需要。
   # 想改成跟随推送就照 build_go_minimal.yml 加 branches 列表。
   workflow_dispatch:
     inputs:
@@ -111,8 +125,17 @@ defaults:
 
 jobs:
   build:
-    name: zig sqfs ${{ inputs.zig_version }} drivers=${{ inputs.drivers || '(all)' }}
+    name: zig ${{ matrix.arch }} ${{ inputs.zig_version }} drivers=${{ inputs.drivers || '(all)' }}
     runs-on: ubuntu-latest
+    strategy:
+      # 一个架构失败不要把另一个也取消掉 —— 两个产物互相独立。
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-musl
+            arch: aarch64
+          - target: x86_64-linux-musl
+            arch: x86_64
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -186,30 +209,34 @@ jobs:
           fi
 
       # ---- 交叉编译 ----
-      # aarch64 + musl、全静态、-O small、strip。Zig 自带 musl 静态 libc，
-      # 不需要额外工具链 —— 这正是 Zig 做 C 交叉编译的优势所在。
+      # musl + 全静态 + -O small + strip。Zig 自带 musl 静态 libc，不需要
+      # 额外工具链 —— 这正是 Zig 做 C 交叉编译的优势所在。
+      # 目标由矩阵决定（aarch64-linux-musl / x86_64-linux-musl），
       # 产物落在 zig-out/bin/openlist。
-      - name: Build (aarch64-linux-musl, static)
+      - name: Build (${{ matrix.target }}, static)
         env:
           DRIVERS: ${{ inputs.drivers }}
-          ZIG_VERSION: ${{ inputs.zig_version }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -e
           DRV_ARGS=""
           if [ -n "${DRIVERS// }" ]; then DRV_ARGS="-Ddrivers=$DRIVERS"; fi
 
-          # 先把 version 写进产物名，便于从 Release 名看出用了什么配置。
-          zig build -Dtarget=aarch64-linux-musl -Doptimize=small $DRV_ARGS
+          zig build -Dtarget="$TARGET" -Doptimize=small $DRV_ARGS
           echo "--- drivers in this build ---"
-          zig build size -Dtarget=aarch64-linux-musl -Doptimize=small $DRV_ARGS || true
+          zig build size -Dtarget="$TARGET" -Doptimize=small $DRV_ARGS || true
           echo "--- artifact ---"
           ls -l zig-out/bin/openlist
           file zig-out/bin/openlist 2>/dev/null || true
           readelf -h zig-out/bin/openlist | grep -E 'Machine|Type'
 
-      # ---- 静态链接断言 ----
+      # ---- 静态链接 + 架构断言 ----
       # 与 build_go_minimal.yml 的断言语义一致：真的静态才能塞进光猫单机跑。
-      - name: Verify musl binary is static
+      # 额外断言 Machine 与矩阵一致 —— 交叉编译最怕「配置写错但产物照样出来」，
+      # 那种错到设备上才炸。
+      - name: Verify musl binary is static and ${{ matrix.arch }}
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           set -e
           if readelf -l zig-out/bin/openlist | grep -q "Requesting program interpreter"; then
@@ -217,12 +244,22 @@ jobs:
             readelf -l zig-out/bin/openlist | grep "Requesting program interpreter" || true
             exit 1
           fi
-          echo "::notice::static confirmed (no INTERP, no dynamic section)"
+          machine=$(readelf -h zig-out/bin/openlist | sed -n 's/.*Machine:[[:space:]]*//p' | head -1)
+          echo "Machine: $machine"
+          case "$ARCH:$machine" in
+            aarch64:*AArch64*) ;;
+            x86_64:*X86-64*) ;;
+            *) echo "::error::arch mismatch: matrix=$ARCH but ELF Machine=$machine"; exit 1 ;;
+          esac
+          echo "::notice::static confirmed (no INTERP) and arch=$ARCH"
 
       # ---- 单元测试 ----
       # 与构建**同一份白名单**下跑：测过的驱动集必须是编进二进制的那个。
       # 失败不影响最终打包（那已经是编译成功的产物），但会让 job 变黄并留痕。
+      # ★ 只在 aarch64 那一腿跑：`zig build test` 在 runner **原生**执行，
+      #   与 -Dtarget 无关，两条腿各跑一遍纯属浪费 3 分钟。
       - name: Unit tests (same whitelist)
+        if: matrix.arch == 'aarch64'
         continue-on-error: true
         env:
           DRIVERS: ${{ inputs.drivers }}
@@ -232,48 +269,43 @@ jobs:
           if [ -n "${DRIVERS// }" ]; then DRV_ARGS="-Ddrivers=$DRIVERS"; fi
           zig build test $DRV_ARGS --summary all 2>&1 | tail -30
 
-      - name: Install squashfs-tools
+      # ---- 收集产物 ----
+      # 2026-10-20 起**不再打 squashfs**：设备侧已是裸二进制持久部署，
+      # /opt/sq 挂载点已 rmdir、镜像已删，sqfs 没有任何消费方。
+      # 这里只把 zig-out 的二进制按「架构 + Zig 版本 + 驱动清单」命名后
+      # 落到 build/artifacts/，供 upload-artifact 与 Release 共用。
+      - name: Collect artifacts
+        env:
+          ARCH: ${{ matrix.arch }}
+          ZIG_VERSION: ${{ inputs.zig_version }}
+          DRIVERS: ${{ inputs.drivers }}
         run: |
           set -e
-          if ! command -v mksquashfs >/dev/null 2>&1; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq squashfs-tools
-          fi
-          mksquashfs -version
+          mkdir -p build/artifacts
+          # 可执行位显式钉一次，不依赖 runner 的 umask / 上游行为。
+          chmod 755 zig-out/bin/openlist
 
-      # ---- 打包 squashfs ----
-      # stage/openlist 的内容即镜像根，与 Go 版逐参数一致。
-      - name: Pack openlist.sqfs
-        run: |
-          set -e
-          stage=build/sqfs-stage/openlist
-          mkdir -p "$stage"
-          cp zig-out/bin/openlist "$stage/openlist"
-          # ★ 可执行位必须显式设：设备侧启动脚本会先做 [ ! -x ] 检查。
-          #   zig build 的产物本来就是 0755，钉一次是不依赖上游行为/runner umask。
-          chmod 755 "$stage/openlist"
-          rm -f build/openlist.sqfs
-          # ★ 源目录必须是 stage/openlist 本身。传父目录会让镜像里多一层
-          #   openlist/，挂载后变成 /opt/sq/openlist/openlist/openlist。
-          # -comp xz -b 1M 是设备侧实测结论（128K 块大 3.4 MiB）。
-          # -all-root 让镜像内文件归 root:root，否则是 runner 的 uid 1001。
-          # -noappend 保证重跑幂等。
-          mksquashfs "$stage" build/openlist.sqfs -comp xz -b 1M -noappend -all-root
-          echo "--- raw vs sqfs ---"
-          du -h "$stage/openlist" build/openlist.sqfs
-          echo "--- image header ---"
-          unsquashfs -s build/openlist.sqfs
+          drv="${DRIVERS:-all}"
+          # 驱动清单是自由文本，资产名里只允许安全字符。
+          drv="${drv//[^a-zA-Z0-9._-]/_}"
+          raw_name="openlist-zig.${ARCH}_${ZIG_VERSION}_${drv}"
 
-          # ---- 断言：镜像内 openlist 必须可执行且属主为 root ----
-          # 打包完立刻验，别把一个设备侧起不来的镜像发出去。
-          line=$(unsquashfs -ll build/openlist.sqfs | grep 'squashfs-root/openlist$' || true)
-          case "$line" in
-            -rwxr-xr-x\ root/root*)
-              echo "::notice::image perms OK: $line" ;;
-            *)
-              echo "::error::image perms wrong (want -rwxr-xr-x root/root): $line"
-              exit 1 ;;
-          esac
+          cp zig-out/bin/openlist "build/artifacts/${raw_name}"
+          echo "RAW_NAME=${raw_name}" >> "$GITHUB_ENV"
+          echo "--- artifacts ---"
+          ls -l build/artifacts
+          sha256sum "build/artifacts/${raw_name}"
+
+      # 把两个产物挂到本次 run 上（Release 之外也能直接下载）。
+      # ⚠ path 相对**仓库根**，不受 defaults.run.working-directory 影响，
+      #   所以这里必须写全 `zig-src/` 前缀。
+      - name: Upload workflow artifacts
+        # 与仓库其余 workflow 用同一个 pin（renovate 统一升级）。
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openlist-zig-${{ matrix.arch }}
+          path: zig-src/build/artifacts/*
+          if-no-files-found: error
 
       - name: Publish to GitHub Release
         # 输入一律经 env 传进来：自由文本直接插值进 shell 有注入风险。
@@ -283,24 +315,28 @@ jobs:
           DRIVERS: ${{ inputs.drivers }}
           ZIG_VERSION: ${{ inputs.zig_version }}
           CDN: ${{ inputs.cdn }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -e
-          tag="ci-zig-sqfs-${SHA}"
+          # 2026-10-20 起不再产 sqfs，tag 也去掉 sqfs 字样（旧 tag 留在历史里，
+          # 不影响任何东西；只是新跑出来的 release 用新名字）。
+          tag="ci-zig-${SHA}"
           drv="${DRIVERS:-all}"
-          name="openlist-zig.sqfs_${ZIG_VERSION}_${drv//[^a-zA-Z0-9._-]/_}"
-          mv build/openlist.sqfs "build/${name}"
-          ls -l "build/${name}"
 
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "release $tag exists, adding asset"
           else
+            # ⚠ 两条矩阵腿是并行的：可能都看到「不存在」然后同时 create，
+            #   其中一个必然失败。这里用 `|| true` 吞掉竞态，下面再确认一次。
             gh release create "$tag" \
-              --title "Zig SquashFS build ${SHA}" \
+              --title "Zig build ${SHA} (aarch64 + x86_64)" \
               --prerelease \
               --target "${GITHUB_SHA}" \
-              --notes "$(printf 'Zig 版 squashfs 镜像（白名单驱动 + CDN 前端）。\n\n- commit: %s\n- Zig: %s\n- 驱动: %s\n- 前端 CDN: %s\n\n镜像内可执行文件名为 openlist，挂载到 /opt/sq/openlist 后直接运行。\n运行时必须配置 cdn（config.json 的 cdn 字段或环境变量 OPENLIST_CDN），否则启动 Fatal。\n\n注意：\n1. 被裁掉的驱动若 config.json 里还有对应存储，该存储 init 失败，其余照常服务。\n2. 驱动名可用 Go 驱动名（如 189Cloud）或 Zig 源文件名（如 cloud189），见本 workflow 头部 §0。\n\n构建与裁剪方法论见 .github/workflows/build_zig_minimal.yml 头部，Zig 侧结论见 zig-src/docs/STATUS.md。' \
-                "${GITHUB_SHA}" "${ZIG_VERSION}" "${drv}" "${CDN}")"
+              --notes "$(printf 'Zig 版静态裸二进制（白名单驱动 + CDN 前端），双架构。\n\n- commit: %s\n- Zig: %s\n- 驱动: %s\n- 前端 CDN: %s\n\n资产：\n- `openlist-zig.aarch64_*` —— aarch64（光猫那台）\n- `openlist-zig.x86_64_*` —— x86_64（普通服务器）\n\n两者都是静态 musl 单体，无 INTERP 段，拷到目标机 chmod +x 即可运行。\n运行时必须配置 cdn（config.json 的 cdn 字段或环境变量 OPENLIST_CDN），否则启动 Fatal。\n\n注意：\n1. 被裁掉的驱动若 config.json 里还有对应存储，该存储 init 失败，其余照常服务。\n2. 驱动名可用 Go 驱动名（如 189Cloud）或 Zig 源文件名（如 cloud189），见本 workflow 头部 §0。\n\n换二进制流程见 server/armbian/bin/openlist/README.txt（停之前先数进程）。\n构建与裁剪方法论见 .github/workflows/build_zig_minimal.yml 头部，Zig 侧结论见 zig-src/docs/STATUS.md。' \
+                "${GITHUB_SHA}" "${ZIG_VERSION}" "${drv}" "${CDN}" || true
           fi
+          gh release view "$tag" >/dev/null 2>&1 || {
+            echo "::error::release $tag still missing after create"; exit 1; }
 
-          gh release upload "$tag" "build/${name}" --clobber
-          echo "::notice::released ${tag}: ${name} ($(stat -c %s "build/${name}") bytes)"
+          gh release upload "$tag" "build/artifacts/${RAW_NAME}" --clobber
+          echo "::notice::released ${tag}: ${RAW_NAME} ($(stat -c %s "build/artifacts/${RAW_NAME}") B) [${ARCH}]"

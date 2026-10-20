@@ -39,7 +39,11 @@ COPY_OK_MOUNTS = {"hikvision", "koofr", "jianguo", "aliyun", "ecloud_self", "ecl
                   "115",
                   # WoPan 实现了 SDK 的 CopyFile（Go drivers/wopan/driver.go:134 同款），
                   # 2026-10-17 真机验证 copy 成功，移出"不支持"名单
-                  "wo"}
+                  "wo",
+                  # Thunder：Go `drivers/thunder/driver.go:361` 的 Copy 走
+                  # `files:batchCopy`，Zig thunder.zig 的 vtable 有 `.copy` 槽，
+                  # 2026-10-20 真机验证。
+                  "thunder"}
 
 # 上游**账号容量已满**、暂时不测「添加」（上传）的挂载点 —— 用户 2026-10-16
 # 明确：quark 目前只需要测**读取和删除**，添加后面再说。
