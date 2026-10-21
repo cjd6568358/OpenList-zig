@@ -7,25 +7,33 @@ name: Go Minimal Build
 #  本 workflow 相对上游 build.yml 的两处改造（都是为了减体积）
 # ============================================================================
 #
-#  ① 前端走 CDN —— 不再把前端 dist 嵌进二进制
-#     上游做法是 `bash build.sh release web` 把前端下载到 public/dist，
-#     再由 public/public.go 的 `//go:embed all:dist` 吸进二进制（标准版
-#     ~55MB，是二进制的绝对大头）。本 workflow **跳过 Setup web 步骤**，
-#     public/dist 保持仓库里的 README.md 占位，体积立刻掉一大截。
+#  ① 前端：只内嵌 index.html，其余（assets / images / static / streamer）走 CDN
+#     （2026-10-22 改；此前是"完全走 CDN"，启动时现拉 index.html）
 #
-#     ⚠ 代价（部署时必须知道）：
-#       - 运行时要配 `cdn`（config.json 的 cdn 字段，或环境变量 OPENLIST_CDN），
-#         否则启动直接 Fatal —— 见 server/static/static.go 的 initIndex：
-#         只有 `DistDir == "" && Cdn != "" && WebVersion ∈ {"", beta, dev, rolling}`
-#         才走 CDN 分支，三个条件缺一不可。
-#       - WebVersion 必须是 rolling（或空/beta/dev）。本 workflow 的
-#         LDFLAGS 与 cgo-actions 的 x-flags 都已经写死 `WebVersion=rolling`。
-#       - **不要设 dist_dir**：一旦非空，CDN 分支失效，会回头去读内嵌的
-#         index.html 然后 Fatal。
-#       - CDN 地址里别写 `$version`：代码会把 `$version` 替换成 WebVersion
-#         即 `rolling`，而 npm 上没有 rolling 这个 dist-tag。用 `@latest`
-#         或写死版本号。
-#       环境变量是 `OPENLIST_CDN=`，不是裸 `CDN=`。
+#     上游做法是 `bash build.sh release web` 把**整个**前端 dist（~55MB，
+#     二进制的绝对大头）下载到 public/dist，再由 public/public.go 的
+#     `//go:embed all:dist` 吸进二进制。本 workflow 只抓**一个文件**
+#     `dist/index.html`（4KB 量级）放进 public/dist，assets 依旧 302 到 CDN。
+#
+#     分支条件见 server/static/static.go 的 initIndex：
+#       `DistDir == "" && Cdn != "" && WebVersion ∈ {"", beta, dev, rolling}`
+#       → 从 CDN 拉 index.html；**否则** → 读内嵌的 public/dist/index.html。
+#     所以只要把 WebVersion 钉成固定版本号（`env.FRONTEND_VERSION`，本文件
+#     已写死 4.2.6），就会走"内嵌外壳 + 资源走 CDN"，与 zig-src 的
+#     EMBEDDED_SHELL 完全同构。
+#
+#     ⚠ 部署时必须知道：
+#       - 运行时仍**必须**配 `cdn`（config.json 的 cdn 字段，或环境变量
+#         OPENLIST_CDN）—— Cdn=="" 时 `initStatic` 会去 `fs.Sub(static,
+#         "assets")` 直接 Fatal，因为内嵌的只有 index.html 一个文件。
+#         环境变量是 `OPENLIST_CDN=`，不是裸 `CDN=`。
+#       - **运行时的 cdn 必须指向同一版本**的 dist URL（用 `$version`
+#         占位即可，代码会替换成 WebVersion）。外壳里烙着该版本的 Vite
+#         哈希资源名，版本错配 ⇒ 页面白屏。
+#       - **不要设 dist_dir**：一旦非空，就去读那个目录下的 index.html 了。
+#       - 内嵌外壳后启动时**不再拉 index.html**，因此原先"不能用作外壳源"
+#         的 npmmirror（专拦 .html，451；js/css 全通）现在可以当运行时 cdn：
+#         `https://registry.npmmirror.com/@openlist-frontend/openlist-frontend/4.2.6/files/dist`
 #
 #  ② 数据库只留 SQLite —— 摘掉 mysql / postgres
 #     internal/bootstrap/db.go **无条件** import 了
@@ -448,7 +456,10 @@ on:
       cdn:
         description: 前端 CDN 基址（写进产物说明，运行时仍需配置 cdn 字段或 OPENLIST_CDN）
         required: false
-        default: "https://cdn.jsdelivr.net/npm/@openlist-frontend/openlist-frontend@latest/dist"
+        # ⚠ 必须指向与 env.FRONTEND_VERSION **同一版本**的 dist（这里写死
+        #   4.2.6，与内嵌的外壳配对）。用 `@latest` ⇒ 资源哈希与外壳对不上
+        #   ⇒ 白屏。也可以写 `...@$version/dist`，代码会替换成 WebVersion。
+        default: "https://cdn.jsdelivr.net/npm/@openlist-frontend/openlist-frontend@4.2.6/dist"
 
 concurrency:
   # 同一分支连推两次会取消上一次运行（cancel-in-progress）。
@@ -462,6 +473,17 @@ concurrency:
 # 不显式声明会在 gh release create / release upload 时得到 403。
 permissions:
   contents: write
+
+# 内嵌前端外壳的版本号。**升版本只改这一处**：
+#   - "Fetch frontend shell" 步骤按它抓 dist/index.html 进 public/dist；
+#   - LDFLAGS / x-flags 按它钉 `conf.WebVersion`（决定 initIndex 走内嵌分支）。
+# 两者必须相等 —— 外壳里烙着该版本的 Vite 哈希资源名，与运行时 cdn 指向的
+# 版本对不上就是白屏。
+# 与 zig-src 对齐：那边是 `frontend.zig` 的 `embedded_shell_version` +
+# `@embedFile("frontend_shell_v<ver>.html")`，用
+# `python zig-src/tools/fetch_frontend_shell.py <版本>` 一键升。
+env:
+  FRONTEND_VERSION: "4.2.6"
 
 jobs:
   build:
@@ -570,12 +592,36 @@ jobs:
           echo "--- 剩余的后端分支 ---"
           grep -n 'case "\|default:' internal/bootstrap/db.go
 
-      # ---- 注意：这里刻意没有 "Setup web" 步骤 ----
-      # 上游 build_minimal.yml 会 `bash build.sh release web` 把前端下载到
-      # public/dist 再被 //go:embed 吸进二进制。本 workflow 走 CDN，所以跳过；
-      # public/dist 保持仓库里的 README.md 占位（全空目录会让
+      # ---- 前端：只抓 index.html 一个文件，交给 //go:embed 内嵌 ----
+      # 刻意**不**跑上游的 `bash build.sh release web`：那只一股脑下整个 dist
+      # （~55MB）再全嵌进二进制。这里只取外壳 4KB，assets 依旧走 CDN 302。
+      # public/dist 里的 README.md 占位保留（全空目录会让
       # //go:embed all:dist 报 "contains no embeddable files"）。
-      # 见文件头 ① 的运行时要求。
+      - name: Fetch frontend shell (index.html only)
+        run: |
+          set -euo pipefail
+          VER="${FRONTEND_VERSION:?}"
+          URL="https://registry.npmjs.org/@openlist-frontend/openlist-frontend/-/openlist-frontend-${VER}.tgz"
+          mkdir -p public/dist
+          # 走 npm tarball 而不是 CDN 的 files 端点：registry.npmmirror.com
+          # 之类镜像专拦 .html（451），而 tarball 是 npm 的正规分发路径。
+          curl -fsSL "$URL" | tar -xzO package/dist/index.html > public/dist/index.html
+
+          # 占位符自检：initIndex 的 replaceMap 依赖它们，缺一个页面就是坏的。
+          # 在这里炸，比编出一个白屏二进制再上线排查便宜得多。
+          for m in "cdn: undefined" "base_path: undefined" 'href="/manifest.json"' "Loading..."; do
+            if ! grep -qF "$m" public/dist/index.html; then
+              echo "::error::shell 缺少占位符: $m"
+              exit 1
+            fi
+          done
+          # 拿到的必须是 built dist：dev 版引用 /src/main.tsx，嵌进去只会
+          # 得到一个永远加载不出资源的空壳。
+          if grep -qF "/src/main.tsx" public/dist/index.html; then
+            echo "::error::拿到的是 dev index.html，不是 built dist"
+            exit 1
+          fi
+          echo "::notice::embedded shell: v${VER} ($(wc -c < public/dist/index.html) bytes)"
 
       - name: Build (cgo)
         # nocgo 变体走下面独立的 go build 步骤，这里跳过。
@@ -596,7 +642,7 @@ jobs:
             github.com/OpenListTeam/OpenList/v4/internal/conf.GitAuthor=The OpenList Projects Contributors <noreply@openlist.team>
             github.com/OpenListTeam/OpenList/v4/internal/conf.GitCommit=$git_commit
             github.com/OpenListTeam/OpenList/v4/internal/conf.Version=$tag
-            github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=rolling
+            github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=${{ env.FRONTEND_VERSION }}
           output: openlist$ext
 
       - name: Build (pure Go, CGO_ENABLED=0)
@@ -620,13 +666,15 @@ jobs:
           #   Actions 也会先解析，空表达式会让整个 workflow 校验失败。）
           # ⚠ cgo 那侧走的是 cgo-actions 的 $tag，两者不一定相等 ——
           #   想让同名变体自报一致，需要核对 cgo-actions 里 $tag 的实际取值。
-          # WebVersion=rolling 是 CDN 分支的硬要求，见文件头 ①。
+          # WebVersion 钉成 $FRONTEND_VERSION（不是 rolling！）才会走内嵌外壳
+          # 分支 —— initIndex 见到 rolling/空/beta/dev 就会去 CDN 现拉
+          # index.html，把内嵌的那份晾在一边。见文件头 ①。
           LDFLAGS="-w -s \
             -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.BuiltAt=$(date +'%F %T %z')' \
             -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.GitAuthor=The OpenList Projects Contributors <noreply@openlist.team>' \
             -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.GitCommit=$(git rev-parse HEAD)' \
             -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.Version=${GITHUB_REF_NAME}' \
-            -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=rolling'"
+            -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=${FRONTEND_VERSION:?}'"
 
           # 纯 Go 产物统一命中 glebarez 纯 Go sqlite 驱动
           # （见 internal/bootstrap/sqlite_driver_*.go 的 build tag 约束），
@@ -775,6 +823,28 @@ jobs:
       - uses: benjlevesque/short-sha@dbe07338b37c456ce06d23409b35a56a7815eef4 # v4.0
         id: short-sha
 
+      # 与 build job 同名步骤一致：只把 dist/index.html 抓进 public/dist 让
+      # //go:embed 内嵌，assets 走 CDN。两个 job 各抓一次 —— 各自 checkout，
+      # 工作区不共享。
+      - name: Fetch frontend shell (index.html only)
+        run: |
+          set -euo pipefail
+          VER="${FRONTEND_VERSION:?}"
+          URL="https://registry.npmjs.org/@openlist-frontend/openlist-frontend/-/openlist-frontend-${VER}.tgz"
+          mkdir -p public/dist
+          curl -fsSL "$URL" | tar -xzO package/dist/index.html > public/dist/index.html
+          for m in "cdn: undefined" "base_path: undefined" 'href="/manifest.json"' "Loading..."; do
+            if ! grep -qF "$m" public/dist/index.html; then
+              echo "::error::shell 缺少占位符: $m"
+              exit 1
+            fi
+          done
+          if grep -qF "/src/main.tsx" public/dist/index.html; then
+            echo "::error::拿到的是 dev index.html，不是 built dist"
+            exit 1
+          fi
+          echo "::notice::embedded shell: v${VER} ($(wc -c < public/dist/index.html) bytes)"
+
       # ---- 输入归一化（本 workflow 同时挂在 push 上，push 时 inputs 全空）----
       # ⚠ 2026-10-18 事故复盘：GitHub 的 `inputs` 上下文只在
       #   workflow_dispatch / workflow_call 时填充。本 workflow 由
@@ -810,7 +880,8 @@ jobs:
           SEARCH_BACKENDS="${SEARCH_BACKENDS:-all}"
           STRIP_PROTOCOLS="${STRIP_PROTOCOLS:-none}"
           ARCH="${ARCH:-linux-arm64}"
-          CDN="${CDN:-https://cdn.jsdelivr.net/npm/@openlist-frontend/openlist-frontend@latest/dist}"
+          # 必须与 env.FRONTEND_VERSION 同一版本（内嵌外壳的配对资源）。
+          CDN="${CDN:-https://cdn.jsdelivr.net/npm/@openlist-frontend/openlist-frontend@4.2.6/dist}"
 
           # arch 白名单硬校验：空 arch 曾让 case 静默落空、编出 runner 原生
           # 架构的二进制。宁可在这里炸，也不要发一个上不了设备的镜像。
@@ -1651,7 +1722,7 @@ jobs:
             -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.GitAuthor=The OpenList Projects Contributors <noreply@openlist.team>' \
             -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.GitCommit=$(git rev-parse HEAD)' \
             -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.Version=${GITHUB_REF_NAME}' \
-            -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=rolling'"
+            -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=${FRONTEND_VERSION:?}'"
 
           # -tags=nomsgpack 摘掉 gin 的 msgpack 绑定（连带 ugorji/go/codec 2.93MB）
           # 不传 jsoniter：项目里没有这个 build tag，是死开关（见文档 §8）
