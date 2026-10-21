@@ -28,6 +28,10 @@ ZIG = "/root/.cache/zig/zig"
 # 打包机工作目录（用户 2026-10-11 指定用 /tmp）。仍然不碰 /root/.cache/ 里的工具链。
 WORK = "/tmp/olz-build"
 GCACHE = "/tmp/olz-build/zigcache"
+# ★ 局部缓存也显式指定（2026-10-21 规则：构建只写 /tmp）。
+#   不指定的话 zig 会在 $WORK/.zig-cache 建一份 —— 那也在 /tmp，但两份缓存
+#   不共享、清理时容易漏。统一指到 GCACHE，全局/局部共用一处。
+LCACHE = GCACHE
 # 打过 TLS 补丁的 std 副本（tools/ziglib_patch.py 生成）。工具链本体保持
 # 只读，编译器通过 ZIG_LIB_DIR 指向这份副本 —— 详见 ziglib_patch.py 的模块
 # 文档（drive.quark.cn 只接受 ECDSA 套件，上游 Zig 0.17.0 却只提供
@@ -142,7 +146,7 @@ def main():
     drv_args = f' -Ddrivers="{drivers}"' if drivers else ""
     # 多分钟的构建：remote.sh() 默认 120s 不够，显式放大到 15 分钟
     # （正常 3–4.5 分钟，留 3 倍余量；仍然有界，不会无限挂死）。
-    o, e, rc = sh(c, f"cd {WORK} && ZIG_GLOBAL_CACHE_DIR={GCACHE} "
+    o, e, rc = sh(c, f"cd {WORK} && ZIG_GLOBAL_CACHE_DIR={GCACHE} ZIG_LOCAL_CACHE_DIR={LCACHE} "
                      f"ZIG_LIB_DIR={ZIGLIB} {ZIG} build test --summary all{drv_args}",
                   timeout=900)
     log = (o + e)
@@ -163,7 +167,7 @@ def main():
     # B03: 同样按 rc 判定；失败不得继续下载旧产物。
     # 走 `zig build`（而不是裸 build-exe）才能带上 `-Ddrivers=` 白名单，
     # 产物因此落在 `zig-out/bin/openlist` 而不是工作目录根下。
-    o, e, rc = sh(c, f"cd {WORK} && ZIG_GLOBAL_CACHE_DIR={GCACHE} "
+    o, e, rc = sh(c, f"cd {WORK} && ZIG_GLOBAL_CACHE_DIR={GCACHE} ZIG_LOCAL_CACHE_DIR={LCACHE} "
                      f"ZIG_LIB_DIR={ZIGLIB} {ZIG} build "
                      f"-Dtarget={target} -Doptimize=small{drv_args}",
                   timeout=900)

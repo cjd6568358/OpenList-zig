@@ -103,6 +103,12 @@
 ## 5. 工程约定（硬规则）
 
 - **⚠️ 本地需要打包 / 编译时，务必一律走打包编译机 `10.0.0.4`（工作目录 `/tmp`，即 `tools/build_remote.py` 用的 `/tmp/olz-build`）—— 这是唯一交付路径。** 原因：本地机器**性能不行、磁盘空间不够**。打包机 Debian 13 x86_64，root/（口令见 ~/.olz_root_pwd）；zig 0.17.0 在 `/root/.cache`（只读使用）。**本机产物只能自测，不能当交付。**
+- **★ 写盘边界（2026-10-21 与 `server` 仓库对齐的硬规则）：构建/调试只许写 `/tmp`，`/tmp` 以外一个字节都不落（除非显式指定）。**
+  - 工具链本体**只读**：`/root/.cache/zig/zig`（0.17.0）只被 exec，不许往里写缓存。
+  - zig 必须显式给缓存目录：`ZIG_GLOBAL_CACHE_DIR` **和** `ZIG_LOCAL_CACHE_DIR` 都指 `/tmp/olz-build/zigcache`（`build_remote.py` 已设）。**裸调 `/root/.cache/zig/zig` 而不设这两个变量，zig 会把缓存写进工具链目录 `/root/.cache/zig/{o,h,z}`**（实测一次 `zig cc` 就 +60 MB）。
+  - 若以后还要编 Go（如 `wrapper/` 那套），一律先 `. /root/build-env.sh`：它把 `GOCACHE/GOMODCACHE/GOPATH/zig 缓存/npm 缓存` 全收进 `BUILD_ENV_STATE`（默认 `/tmp/.build-state`），`/root` 不落盘。
+  - 编译机侧自检：`sh /root/check-layout.sh`（第 6 项直接打印写盘边界）。
+  - 规则全文见 `D:\workspace\server 806\BUILD-ENV.md` §0.5.3。
 - **Zig 0.17.0 硬下界**。**本机当前没有 Zig 工具链**（`~/.workbuddy-ai/binaries/` 下只有 git/go/node/python），`zig test` 与交叉编译都只能在打包机跑 —— 一条命令走 `tools/build_remote.py`（打包源码 → 打包机 test → 交叉编译 → 取回，全包）。
 - **本机 D 盘不能 `zig build`**（maker.exe 无法在 D 盘建子进程）→ 一律 `zig build-exe`/`zig test` 直接调用 + 独立 `ZIG_GLOBAL_CACHE_DIR` + 非沙箱执行。
 - **每个驱动必须有单元测试**（`std.testing.allocator` 抓泄漏）。提交前 `zig test` 与交叉编译都要过。
@@ -1761,7 +1767,9 @@ std 的套件列表是硬编码 comptime 常量、没有开关，而项目约定
 `/root/.cache` 里的工具链**只读**。所以：
 
 - `tools/ziglib_patch.py` 把 `/root/.cache/zig/lib` 复制到
-  `/tmp/olz-build/ziglib`，给 `std/crypto/tls/Client.zig` 打四处补丁
+  `/tmp/olz-build/ziglib`（**这是"不往项目里拷 std 库"规则的唯一例外**：它是
+  **打过补丁的副本**，且放在 `/tmp`、每次构建重建，不占持久盘、也不污染工具链），
+  给 `std/crypto/tls/Client.zig` 打四处补丁
   （offer 列表两个分支各追加 c02b/c02c/cca9；ServerHello 的两个 switch 各补
   ECDSA 分支），锚点失配会**大声失败**（工具链升级后必须重审）。
 - `tools/build_remote.py` 每次构建前跑该脚本，`zig build` 时设
