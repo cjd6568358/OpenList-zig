@@ -142,13 +142,16 @@ pub fn main(init: std.process.Init) !void {
 
     switch (app.frontend.source) {
         .cdn => log.info("frontend: shell from CDN {s}", .{app.frontend.site.cdn}),
+        // 内嵌外壳：壳由二进制出（版本见 frontend.zig 的分支日志），启动没有
+        // 网络往返；assets 仍走 `cdn` 的 302，所以与 .cdn 同属"有 CDN"这一类。
+        .embedded => log.info("frontend: shell from the binary; assets from {s}", .{app.frontend.site.cdn}),
         .dist_dir => log.info("frontend: shell and assets from {s}", .{cfg.dist_dir}),
         .builtin => log.warn(
             "frontend: serving the built-in placeholder page — set \"dist_dir\" to an OpenList frontend build, or \"cdn\", for the real UI",
             .{},
         ),
     }
-    if (app.frontend.source == .cdn) {
+    if (app.frontend.source == .cdn or app.frontend.source == .embedded) {
         log.info("frontend: /assets /images /streamer /static redirect to {s}", .{app.frontend.site.cdn});
     } else if (!app.frontend.has_dist) {
         log.warn("frontend: asset requests will 404 (no dist_dir, no cdn)", .{});

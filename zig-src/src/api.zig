@@ -178,6 +178,7 @@ pub const App = struct {
             .cdn_fallbacks = cfg.cdn_fallbacks,
             .dist_dir = cfg.dist_dir,
             .web_version = cfg.web_version,
+            .embed_index_html = cfg.embed_index_html,
             .settings = .{
                 .site_title = cfg.site_title,
                 .main_color = cfg.main_color,

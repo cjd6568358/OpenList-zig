@@ -67,10 +67,13 @@ name: Zig Minimal Build (aarch64 + x86_64)
 #          "https://unpkg.com/@openlist-frontend/openlist-frontend@latest/dist"
 #        ] }
 #      也可写成逗号分隔的字符串。每个候选默认重试 2 次，最多试 8 个候选。
-#      不可用：
+#      内嵌外壳（默认开，本构建内嵌 v4.2.6 外壳）：web_version 钉在同一版本时
+#      启动不拉外壳，CDN 全挂也能起（zig.embed_index_html=false 关闭）。此模式
+#      下 npmmirror 固定版本 URL 可直接当 cdn 用。
+#      不可用（仅指"启动拉取"路径）：
 #        - registry.npmmirror.com：**专门拦 .html**（451 + {"error":"blocked"}，
 #          不是法律原因，是 CDN 防滥用策略）。.js/.css/VERSION 都是 200，
-#          但前端外壳必须是 index.html，所以用不了。
+#          拦的恰好只是外壳拉取要的 index.html。
 #        - jsdelivr.pai233.top：402，需付费。
 #    * 不要设 dist_dir：设了会去读不存在的前端文件然后 Fatal。
 #      更不要把前端副本打进产物 —— 不内嵌前端正是这个构建的前提。

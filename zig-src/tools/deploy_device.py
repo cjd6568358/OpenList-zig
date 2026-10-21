@@ -107,11 +107,14 @@ DEFAULT_ADMIN_PASSWORD = "openlist-zig-test"
 DEFAULT_CDN = ("https://cdn.jsdelivr.net/npm/"
                "@openlist-frontend/openlist-frontend@latest/dist")
 
-# 备用 CDN。主 CDN 取不到时按顺序往下试，全失败才退出。
+# 备用 CDN。走"启动拉取"路径（web_version 未钉在内嵌外壳版本上，或
+# zig.embed_index_html=false）时主 CDN 取不到才按顺序往下试，全失败才退出。
 # 全部经打包机 curl 实测可达（2026-10-15）：
 #   cdn.jsdelivr.net / fastly.jsdelivr.net / gcore.jsdelivr.net / unpkg.com  → 200
-# 不可用的（不要加进来）：
-#   registry.npmmirror.com → 451 Unavailable For Legal Reasons
+# 不可用的（不要加进 fallbacks）：
+#   registry.npmmirror.com → 451，专拦 .html（防滥用策略；js/css 均 200）。
+#     内嵌外壳模式下（默认开，见 frontend.zig EMBEDDED_SHELL，本构建 v4.2.6）
+#     启动不拉 index.html，它的固定版本 URL 可直接当 cdn 用。
 #   jsdelivr.pai233.top    → 402 需付费
 # 前三个是同一个 jsdelivr 的不同边缘域名，换域名有时能绕开单点故障；
 # unpkg 是完全独立的实现，留它做最后一道。

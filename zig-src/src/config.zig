@@ -46,6 +46,12 @@ pub const Config = struct {
     /// leading `"v"` stripped, so `"v4.2.6"` pins and `"rolling"` tracks edge.
     web_version: []const u8,
 
+    /// `zig.embed_index_html`。`web_version` 钉在与内嵌外壳（frontend.zig 的
+    /// `EMBEDDED_SHELL`）相同的版本时，启动直接用二进制内的外壳、不再从 CDN
+    /// 拉取 index.html —— 上游 pinned release 语义。默认开；设 false 回到
+    /// "永远启动拉取"的旧行为。版本不匹配时无论如何都走拉取。
+    embed_index_html: bool,
+
     /// 备用前端 CDN 列表（`zig.cdn_fallbacks`，字符串数组）。
     ///
     /// 为什么需要：CDN 是**启动时的强依赖** —— 取不到 index.html 就
@@ -579,6 +585,9 @@ pub fn load(alloc: std.mem.Allocator, path: []const u8) !*Config {
     //   "a,b"            逗号分隔字符串（写起来方便，Go 版也能当普通字符串忽略）
     // 空串 / 空数组都表示"没有备用"。
     cfg.cdn_fallbacks = try parseStringList(cfg.allocator(), cfg.root.getPath("zig.cdn_fallbacks"));
+    // 内嵌外壳开关（默认开，与 frontend.zig 的 Input 默认一致）。见
+    // `frontend.zig` 的 `EMBEDDED_SHELL`：版本匹配才生效，不匹配仍走拉取。
+    cfg.embed_index_html = boolean(cfg.root.getPath("zig.embed_index_html"), true);
     cfg.token_expires_in = int(cfg.root.getPath("token_expires_in"), 48);
     // 下载签名开关。放在 `zig` 块里而不是顶层：这两个是 Zig 侧才能持久化的
     // 设置（Go 侧存在数据库 settings 表），且 Go 版会原样忽略未知的 `zig` 键，

@@ -7,10 +7,11 @@
 //!   * `cdn` empty — assets are served by this process out of `dist_dir`, and
 //!     the SPA shell is read from `dist_dir/index.html`.
 //!   * `cdn` set   — `/assets|images|streamer|static/*` answer 302 into the
-//!     CDN, and the shell itself is fetched from `{cdn}/index.html` once at
-//!     startup, so the served HTML and the assets it references come from the
-//!     same build. See `loadRawIndex` for the one place this diverges from
-//!     upstream's branch condition.
+//!     CDN, and the shell itself comes from the binary when the deployment
+//!     pins `web_version` to the baked shell release (upstream pinned-release
+//!     semantics, `zig.embed_index_html`), or else is fetched from
+//!     `{cdn}/index.html` once at startup so the served HTML and the assets
+//!     it references come from the same build. See `loadRawIndex`.
 //!
 //! `$version` inside the `cdn` value expands to `web_version` with a leading
 //! `"v"` stripped — `"v4.2.6"` -> `"4.2.6"`, `"rolling"` -> `"rolling"`. That is
@@ -45,7 +46,8 @@ const Buf = @import("util/buf.zig").Buf;
 /// else falls through to the SPA shell.
 pub const asset_folders = [_][]const u8{ "assets", "images", "streamer", "static" };
 
-/// Largest `index.html` we will read. The real one is ~1.3 KB; 4 MiB leaves
+/// Largest `index.html` we will read. The real built one is ~4.3 KB (v4.2.6);
+/// 4 MiB leaves
 /// room for a heavily customised build without letting a hostile `dist_dir`
 /// exhaust memory at startup.
 const max_index_bytes: usize = 4 * 1024 * 1024;
@@ -53,6 +55,35 @@ const max_index_bytes: usize = 4 * 1024 * 1024;
 /// CDN 候选上限（主 + 备用）。比这更长的列表只取前 N 个 —— 再多也不会
 /// 全部试完，启动延迟反而不可控。
 const max_cdn_candidates: usize = 8;
+
+/// 内嵌前端外壳：上游 pinned release 用 `//go:embed public/dist` 把整份 dist
+/// （约 20 MB）带进二进制；本构建只带这一份 `index.html`（v4.2.6 实测 4363
+/// 字节），取自 npm 包 `@openlist-frontend/openlist-frontend` 的
+/// `dist/index.html`，用 `tools/fetch_frontend_shell.py` 抓取更新。
+///
+/// 它解决的只是"外壳从哪来"：`web_version` 钉在同一版本时，启动不再从 CDN
+/// 拉 index.html —— 启动的网络强依赖（`CdnIndexFetchFailed` 直接退出）随之
+/// 消失。npmmirror 这类**只拦 .html**（451 `{"error":"blocked"}`，防滥用
+/// 而非法律原因）、但 js/css 与 CORS 头齐全的 CDN，也因此可以直接当 `cdn`
+/// 用（外壳由本二进制出，assets 由浏览器从它加载）。
+///
+/// 硬约束：外壳里烙着该版本的 Vite 哈希资源名，`cdn` 必须指向**同一版本**
+/// 的 dist。`web_version` 对不上时自动退回 CDN 拉取路径，绝不错配。
+const EMBEDDED_SHELL = @embedFile("frontend_shell_v4.2.6.html");
+
+/// The upstream frontend release `EMBEDDED_SHELL` was taken from, without a
+/// leading `"v"`. Kept next to the `@embedFile` name on purpose: bumping the
+/// shell means updating both together, which is exactly what
+/// `tools/fetch_frontend_shell.py` does.
+pub const embedded_shell_version = "4.2.6";
+
+/// True when `web_version` pins exactly `embedded_shell_version` — `"v4.2.6"`
+/// or `"4.2.6"`. `rolling`/`beta`/empty/any other pin do not match, mirroring
+/// `expandVersion`'s lowercase-`v` handling.
+fn embeddedShellMatches(web_version: []const u8) bool {
+    const v = if (web_version.len > 0 and web_version[0] == 'v') web_version[1..] else web_version;
+    return std.mem.eql(u8, v, embedded_shell_version);
+}
 
 /// Presentation defaults, copied from OpenList's
 /// `internal/bootstrap/data/setting.go`. These are the values a *fresh*
@@ -89,6 +120,11 @@ pub const Input = struct {
     /// The frontend release this deployment targets. OpenList bakes this in
     /// with `-ldflags`; we read it from config.
     web_version: []const u8 = "rolling",
+    /// `zig.embed_index_html`. When `web_version` pins exactly the release
+    /// `EMBEDDED_SHELL` was taken from, the shell is served from the binary
+    /// and the startup CDN fetch is skipped — upstream pinned-release
+    /// semantics. `false` restores the always-fetch behaviour.
+    embed_index_html: bool = true,
     settings: Settings = .{},
 };
 
@@ -105,7 +141,17 @@ pub const SiteConfig = struct {
 
 /// Where the served shell came from. Reported at startup, and used by tests to
 /// assert which branch ran.
-pub const Source = enum { cdn, dist_dir, builtin };
+pub const Source = enum {
+    /// Fetched from `{cdn}/index.html` at startup (or a fallback).
+    cdn,
+    /// Read from `dist_dir/index.html`.
+    dist_dir,
+    /// `EMBEDDED_SHELL`, baked into the binary at build time. Only when the
+    /// deployment pins the matching `web_version` and did not opt out.
+    embedded,
+    /// `BUILTIN_INDEX`, the diagnostic placeholder page.
+    builtin,
+};
 
 pub const Frontend = struct {
     /// Owns every string in this struct.
@@ -458,21 +504,30 @@ const RawIndex = struct {
 pub fn sourceFor(in: Input) Source {
     // 配了 fallback 也算"有 CDN"：用户给了来源就是要走 CDN 分支，
     // 不该因为主 cdn 留空而静默退回占位页。
-    if (in.dist_dir.len == 0 and (in.cdn.len > 0 or in.cdn_fallbacks.len > 0)) return .cdn;
+    if (in.dist_dir.len == 0 and (in.cdn.len > 0 or in.cdn_fallbacks.len > 0)) {
+        // 上游 pinned-release 语义：`web_version` 钉死且与内嵌外壳同一版本
+        // ⇒ 直接用内嵌的，启动零网络往返。版本对不上（rolling / beta /
+        // 别的 pin）⇒ 仍走 CDN 拉取 —— 拿 4.2.6 的哈希文件名去配 rolling
+        // 的 assets 只会得到一个白屏，宁可多一次启动拉取。
+        if (in.embed_index_html and embeddedShellMatches(in.web_version)) return .embedded;
+        return .cdn;
+    }
     if (in.dist_dir.len > 0) return .dist_dir;
     return .builtin;
 }
 
 /// Port of OpenList's `initIndex` branch selection.
 ///
-/// One divergence, forced by the fact that nothing is embedded here. Upstream
-/// also requires a rolling-style `web_version` (`""`, `beta`, `dev`, `rolling`)
-/// before it will fetch the shell from the CDN, because its *pinned* releases
-/// carry a copy of the frontend inside the binary and prefer that. With no
-/// embedded copy, honouring that condition would mean a deployment that pins
-/// `web_version` — which is precisely what `$version` exists for — silently
-/// dropped through to the placeholder page. So: a configured `cdn` is always
-/// the source of truth when there is no `dist_dir`.
+/// Upstream serves a rolling-style `web_version` (`""`, `beta`, `dev`,
+/// `rolling`) from the CDN and prefers its `//go:embed`ed copy for pinned
+/// releases. This port mirrors both halves: pinned on `EMBEDDED_SHELL`'s
+/// release (with `zig.embed_index_html` not disabled) serves the baked shell
+/// with no network round trip; everything else fetches `{cdn}/index.html`
+/// through the fallback chain below. The one divergence left: a pinned
+/// version that does *not* match the baked shell still fetches from the CDN,
+/// where upstream would use its embedded dist — fetching keeps the shell and
+/// the assets on the same build instead of serving a guaranteed-mismatched
+/// pair.
 fn loadRawIndex(a: std.mem.Allocator, in: Input, site: SiteConfig) !RawIndex {
     switch (sourceFor(in)) {
         .cdn => {
@@ -540,6 +595,17 @@ fn loadRawIndex(a: std.mem.Allocator, in: Input, site: SiteConfig) !RawIndex {
             };
             log.info("frontend: using custom dist directory {s}", .{in.dist_dir});
             return .{ .html = html, .source = .dist_dir };
+        },
+        .embedded => {
+            // 没有网络往返：外壳就在二进制里。`cdn` 留空，`init` 便沿用
+            // `site.cdn`（`$version` 已展开），assets 的 302 因此指向配置的
+            // 主 CDN；`cdn_fallbacks` 在这个分支**不参与** —— 那是拉取失败时
+            // 的换源机制，这里没有拉取。也刻意不做可达性探测：探测一次就把
+            // 启动网络依赖请回来了，与这个分支存在的意义矛盾。CDN 挂掉的
+            // 表现是浏览器侧资源加载失败，二进制照常起 —— 与上游 pinned
+            // release 的姿态一致。
+            log.info("frontend: using embedded shell (upstream v{s}); assets come from the configured cdn", .{embedded_shell_version});
+            return .{ .html = EMBEDDED_SHELL, .source = .embedded };
         },
         .builtin => return .{ .html = BUILTIN_INDEX, .source = .builtin },
     }
@@ -796,6 +862,11 @@ const BUILTIN_INDEX =
     \\    <p>启动时会从 <code>{cdn}/index.html</code> 拉取页面外壳，
     \\    <code>/assets/</code>、<code>/images/</code>、<code>/streamer/</code>、
     \\    <code>/static/</code> 四个前缀则 302 跳转到 CDN。</p>
+    \\    <p class="sub">当前构建内嵌了 v4.2.6 的页面外壳：把
+    \\    <code>web_version</code> 钉在同一版本时启动不再拉取外壳，二进制断网也能起；
+    \\    registry.npmmirror.com 这类只拦 .html（451）的 CDN 也能直接当
+    \\    <code>cdn</code> 用 —— 外壳由本二进制出，assets 由浏览器从它加载。
+    \\    配 <code>"zig": {"embed_index_html": false}</code> 回到“启动拉取”。</p>
     \\
     \\    <h2>接口</h2>
     \\    <ul>
@@ -951,12 +1022,26 @@ test "expandVersion substitutes every occurrence and strips a leading v" {
 test "sourceFor picks the CDN whenever no dist_dir is set" {
     try testing.expectEqual(Source.builtin, sourceFor(.{}));
     try testing.expectEqual(Source.cdn, sourceFor(.{ .cdn = "https://c.example.com/dist" }));
-    // The divergence from upstream: a *pinned* web_version must still fetch from
-    // the CDN, because there is no embedded frontend to prefer. Upstream would
-    // fall back to its embedded copy here.
+    // Upstream pinned-release semantics, now mirrored: pinning the baked
+    // shell's release serves the embedded copy instead of fetching.
+    try testing.expectEqual(Source.embedded, sourceFor(.{
+        .cdn = "https://c.example.com/$version/dist",
+        .web_version = "v4.2.6",
+    }));
+    // Opt-out switch restores the always-fetch behaviour.
     try testing.expectEqual(Source.cdn, sourceFor(.{
         .cdn = "https://c.example.com/$version/dist",
         .web_version = "v4.2.6",
+        .embed_index_html = false,
+    }));
+    // 版本对不上 ⇒ 仍然拉取：4.2.6 的外壳配 rolling 的 assets 是必然白屏。
+    try testing.expectEqual(Source.cdn, sourceFor(.{
+        .cdn = "https://c.example.com/dist",
+        .web_version = "rolling",
+    }));
+    try testing.expectEqual(Source.cdn, sourceFor(.{
+        .cdn = "https://c.example.com/dist",
+        .web_version = "v4.2.5",
     }));
     // A dist_dir wins over the CDN, as upstream.
     try testing.expectEqual(Source.dist_dir, sourceFor(.{ .cdn = "https://c/x", .dist_dir = "/fe" }));
@@ -971,6 +1056,59 @@ test "sourceFor picks the CDN whenever no dist_dir is set" {
         .cdn_fallbacks = &.{"https://f.example.com/dist"},
         .dist_dir = "/fe",
     }));
+}
+
+test "embedded shell matches only its own pinned version" {
+    try testing.expect(embeddedShellMatches("v" ++ embedded_shell_version));
+    try testing.expect(embeddedShellMatches(embedded_shell_version));
+    // 与 `expandVersion` 一致：只认小写 `v` 前缀。
+    try testing.expect(!embeddedShellMatches("V4.2.6"));
+    try testing.expect(!embeddedShellMatches("4.2.5"));
+    try testing.expect(!embeddedShellMatches("rolling"));
+    try testing.expect(!embeddedShellMatches("beta"));
+    try testing.expect(!embeddedShellMatches(""));
+}
+
+test "embedded shell is the real built artefact, placeholders intact" {
+    // 内嵌的是 npm 包里的 built dist/index.html 本尊，不是转述。占位符集合
+    // 与 renderShell 的 needle 一一对应 —— 上游改了占位符写法时，这里先炸，
+    // 不会把 `cdn: undefined` 原样发给用户。
+    for ([_][]const u8{
+        "window.OPENLIST_CONFIG",
+        "cdn: undefined",
+        "base_path: undefined",
+        "main_color: undefined",
+        "href=\"/manifest.json\"",
+        "https://res.oplist.org/logo/logo.svg",
+        "https://res.oplist.org/logo/logo.png",
+        "Loading...",
+        "<!-- customize head -->",
+        "<!-- customize body -->",
+    }) |needle| {
+        try testing.expect(std.mem.indexOf(u8, EMBEDDED_SHELL, needle) != null);
+    }
+    // 是 built 产物而不是仓库里的 dev 版 index.html（那个引用 /src/main.tsx），
+    // 且带着本版本的哈希资源名。
+    try testing.expect(std.mem.indexOf(u8, EMBEDDED_SHELL, "/src/main.tsx") == null);
+    try testing.expect(std.mem.indexOf(u8, EMBEDDED_SHELL, "/assets/") != null);
+}
+
+test "renderer fills the embedded shell like any other shell" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const site = SiteConfig{
+        .base_path = "/",
+        .cdn = "https://registry.npmmirror.com/@openlist-frontend/openlist-frontend/4.2.6/files/dist",
+    };
+    const out = try renderShell(a, EMBEDDED_SHELL, site, .{}, "/manifest.json", true);
+    try testing.expect(std.mem.indexOf(u8, out, "cdn: 'https://registry.npmmirror.com/@openlist-frontend/openlist-frontend/4.2.6/files/dist'") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "cdn: undefined") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "Loading...") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "main_color: '#1890ff'") != null);
+    // 烙进外壳的哈希资源名必须原样存活 —— 改写管线只碰 OPENLIST_CONFIG 一带。
+    try testing.expect(std.mem.indexOf(u8, out, "/assets/index-") != null);
 }
 
 test "cdn fallback list is deduplicated and version-expanded" {
