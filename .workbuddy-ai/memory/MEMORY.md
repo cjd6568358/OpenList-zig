@@ -7,7 +7,7 @@
 - Zig 版不内嵌前端：`cdn`（302 jsdelivr）或 `dist_dir` 二选一，都不配 ⇒ 内置占位页。
 - 记忆目录只有一个：`D:/workspace/OpenList-zig/.workbuddy-ai/memory/`（旧 `.workbuddy/memory/` 已合并）。
 
-## 驱动状态（13 注册项 / 12 实现，全部有单测）
+## 驱动状态（15 注册项 / 12 实现，全部有单测；+3 编译期可选变体）
 
 | 驱动 | Go Name | Zig | 状态 |
 |---|---|---|---|
@@ -19,14 +19,28 @@
 | wopan 沃云盘 | `WoPan` | wopan.zig | ✅ 实现，未真机（无凭据） |
 | 迅雷（+专家） | `Thunder`/`ThunderExpert` | thunder.zig | ✅ 真机（e2e 62/63） |
 | 迅雷网页版（本工程新增） | `ThunderWeb` | thunder.zig `Variant.web` | ✅ 生产 `/thunderweb` |
+| 123 Open / QuarkOpen / 115 Open | 同名 | 123open / quark / 115open.zig | ⚠️ **编译期可选**（`opted()`，默认不进产物）；2026-10-22 真机注册表+表单+哑凭据闭环，**缺真实凭据** |
 
 - **驱动名铁律**：`factory.key` 逐字节等于 Go `driver.Config.Name`，**不设别名**（2026-10-15 删别名机制）。
 - **★ label 不是展示名、无 API 出口**：前端 bundle `assets/entry-*.js` 自带 109 条 key→中文名映射，
   前台中文名全来自它；Zig `label` 只进启动日志。**用户要求 label 保持中文**（曾误改成 key 已回退）。
 - `pan123`/`quarkuc`/`itvsh` 上游 `Copy` 就是 NotSupport ⇒ vtable `.copy=null`，有测试钉住别补。
+  （`123 Open`/`115 Open` 上游**有** Copy，Zig 已实现；`QuarkOpen` 是 NotSupport。）
+- **★ 编译期可选驱动 = `opted()` 而不是 `has()`**：`has()` 在 `drivers_all`（默认全量构建）
+  下为 true，`opted()` 只认 `-Ddrivers=` 显式点名 ⇒ 变体默认一个字节都不进产物、前端列表不变。
+  `-Ddrivers=` 按 `,` **和空格**分词 ⇒ 只能传 Zig 文件名（`115open`），带空格的 key 会被拆碎。
+- **★ addition_schema 的键必须等于 Go 的 json tag**（不是 Go 字段名）：`115 Open` 曾写
+  `AccessToken` 而 parse 读 `access_token` ⇒ 从管理页添加恒 `NoToken`。每驱动有
+  "schema 键 == parse 键"一致性单测（把 schema 每个键填 "probe" 再 parse）。
+- **★ select 的 `options` 必须是逗号字符串**（Go `driver.Item.Options` 是 string，
+  `internal/driver/item.go:11`）；写成 JSON 数组会被 `writeAdditionalItems` 静默降级成
+  空串 ⇒ 前端下拉框没有选项。2026-10-22 修了 5 个驱动 16 处，有遍历 `builtin` 的防复发单测。
 - 迅雷硬知识：① S3 上传必须 **virtual-hosted**（`https://<bucket>.<trimLeft(endpoint)>/<key>`），path-style 直接 403/DNS 失败；
   ② 上游登录限频（`shield_reject: Operation too frequent`）⇒ 回归别在循环里重建存储（每次重建=一次登录）。
 - `115`/`WoPan` 依赖外部 SDK（Go 源码已 vendor 到 `zig-src/wopan-sdk-*.go` 供对照）⇒ 只能真实 API 回归。
+- **★ WoPan refresh_token 是一次性轮换**：刷一次即换发新令牌，旧令牌立刻作废。
+  **只能用驱动去刷**（刷新成功会立刻 `save()` 落盘，wopan.zig:273）；外部探针/变体矩阵刷一次
+  就消费掉、新令牌只在响应里 ⇒ 必丢。令牌保存位置：`zig-src/tools/creds.local.json`（gitignored，0600）。
 - **★ 迅雷网页版（权威文档 `zig-src/docs/THUNDER_WEB_RE_2026-10-20.md`）**：
   `captcha_sign = "1." + 15 轮 md5(prev+salt)`，纯 JS 无 WASM，`t(0)` = blueimp-md5（在数组形式 `app.<hash>.js` 里，下标即模块 id）；
   **盐表随前端发版变化** ⇒ `tools/thunder_web_sign_harness.js` 一键重取，`thunder_web_sign.py` 有 golden + probe。
@@ -36,9 +50,15 @@
   （上传后有秒级最终一致性延迟，已内置轮询）。
 - **BaiduNetdisk / Onedrive 暂不移植**（用户 2026-10-16 明确；`/baidu` 导入后 init 失败属预期）。重启信号 = 用户说"百度网盘也要"。
 
-## 构建约定（打包机 10.0.0.4）
+## 构建约定（2026-10-22 起：本机有工具链）
 
-- **本机无 Zig 工具链**：编译/测试一律 `zig-src/tools/build_remote.py`（`/tmp/olz-build`，zig 0.17.0，目标 `aarch64-linux-musl`，`-lc -fstrip`）。本机产物只能自测。
+- **★ 本机 Zig 0.17.0 已装好**：`C:\Program Files\zig-x86_64-windows-0.17.0\zig.exe`。
+  `zig build test`（448 pass + 3 skip，3 条 Linux-only）与交叉编译都能本机跑，
+  **aarch64 产物与打包机逐字节相同**（1,320,952 B / `c90dd73e…`）。
+  必须：① 先 `tools/ziglib_patch.py "<toolchain>/lib" C:/zigcache/olz-ziglib`；
+  ② 用 **`ZIG_LIB_DIR`** 环境变量（`--zig-lib-dir` 不是 `zig build` 的参数，0.17 会报 unrecognized）；
+  ③ `ZIG_GLOBAL_CACHE_DIR`/`ZIG_LOCAL_CACHE_DIR` 都指 `C:/zigcache/olz`（D 盘只剩 1.9G）。
+- 打包机 `10.0.0.4` 仍是可选路径（`zig-src/tools/build_remote.py`，`/tmp/olz-build`，zig 0.17.0）：
 - **下载 GitHub 产物走 `https://ghfast.top/<原始URL>`**（release 资产域名直连卡死）；api.github.com JSON 可直连（共享 IP 60 次/小时）。
 - `build.zig` 的 `-Ddrivers=` 白名单：收 Go 名或 Zig 源文件名，**必须 comptime 分支**（收进数组会强制生成全部驱动）。
 - `build_remote.py` 必须走 `zig build test`（`driver.zig` 依赖 `build_options`）。
@@ -79,6 +99,11 @@
 - SSH 默认 cwd `/root` ⇒ 写盘用绝对路径 `/tmp/olz/...` 且同条命令 `mkdir -p`；起后台服务必须 `< /dev/null`，
   起服务+探测放同一条 exec。设备 busybox：`chmod` 失效（用 sftp.chmod）、无 `curl`/`pkill`/`setsid`，`wget` 无 `--header`；大二进制用 SCP。
 - 工具：`zig-src/tools/deploy_device.py start|stop|status|restart [bin] [--port]`（默认 15399）。
+  ⚠ **换二进制前必须先 `stop`**：`start` 是「先 SFTP 上传、再杀旧进程」，覆盖正在运行的
+  二进制会 `OSError: Failure`（ETXTBSY）。
+- 无凭据回归：`tools/driver_matrix.py <base> --user admin --password ...`
+  （base 是**位置参数**）；`--expect` 补期望注册名、`--only` 只跑指定驱动，
+  用于点名构建验证 opt-in 变体。
 - **设备文件留档**：`/opt/armbian/...` → `D:/workspace/server/armbian/...`（不带 opt）；`/opt/script`、`/opt/apps`、`/root` → `D:/workspace/server/f4610u/...`；只留最新一份。
 - 光猫 easytier 配置实际是 `/opt/armbian/bin/easytier/easytier.yaml`。
 
