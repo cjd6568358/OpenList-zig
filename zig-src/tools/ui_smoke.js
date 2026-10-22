@@ -66,7 +66,11 @@ const check = (name, ok, detail = '') => {
   // 2. 登录
   await page.goto(`${BASE}/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.waitForTimeout(4000);
-  check('未登录跳转到 /@login', page.url().includes('@login'), page.url());
+  // 判据不能只看 URL：前端 4.2.7 起登录页停在 `/`（SPA 内部路由），
+  // 只有 4.2.6 才是 `/@login?redirect=%2F`。所以「URL 命中 或 登录表单在」即可。
+  const loginFormCount = await page.locator('input[name=username]').count();
+  check('未登录进入登录页', page.url().includes('@login') || loginFormCount > 0,
+        page.url() + (loginFormCount > 0 ? '  (登录表单已渲染)' : ''));
   await page.fill('input[name=username]', USER);
   await page.fill('input[name=password]', PASS);
   await page.getByRole('button', { name: '登录', exact: true }).click();
@@ -76,9 +80,15 @@ const check = (name, ok, detail = '') => {
   collecting = true;
 
   // 3. 首页列表
-  await page.waitForTimeout(3000);
-  txt = await page.locator('body').innerText();
-  check('首页渲染挂载点 quark', txt.includes('quark'), txt.slice(0, 80).replace(/\n/g, ' '));
+  // 首页要等所有挂载点各自 list 完才渲染；固定等 3s 在挂载多/前端版本更新时会
+  // 假失败（4.2.7 就比 4.2.6 慢）。改成轮询，最多 12s。
+  let homeTxt = '';
+  for (let i = 0; i < 12; i++) {
+    homeTxt = await page.locator('body').innerText();
+    if (homeTxt.includes('quark')) break;
+    await page.waitForTimeout(1000);
+  }
+  check('首页渲染挂载点 quark', homeTxt.includes('quark'), homeTxt.slice(0, 80).replace(/\n/g, ' '));
 
   // 4. 进 quark 目录
   const [resp] = await Promise.all([

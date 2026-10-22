@@ -15,9 +15,15 @@
 为什么在创建后要等：`create` 是"先建行再 init"，init 是异步的（它就是
 真机回归里那个"created but errored"路径，Go 同款语义）。
 
-用法：
-    python tools/driver_matrix.py --base http://192.168.1.1:15399 \
+用法（base 是**位置参数**）：
+    python tools/driver_matrix.py http://192.168.1.1:15399 \
         --user admin --password e2e-test-123456
+
+    # 点名构建（含三个 opt-in 变体）：
+    python tools/driver_matrix.py http://192.168.1.1:15399 \
+        --user admin --password e2e-test-123456 \
+        --expect "123 Open,QuarkOpen,115 Open" \
+        --only "123 Open,QuarkOpen,115 Open"
 """
 import argparse
 import base64
@@ -29,12 +35,31 @@ import urllib.request
 
 PASS, FAIL = [], []
 
+# 默认产物（`zig build`，全量）里的 12 个注册驱动。
+BASE_EXPECT = {"Local", "WebDav", "Itvsh", "AliyundriveOpen", "189Cloud",
+               "189CloudPC", "123Pan", "Quark", "UC", "115 Cloud", "WoPan", "Strm"}
+
+# 三个"编译期可选"变体（`driver.zig` 的 `opted()`）：默认产物里**不该有**，
+# 只有 `-Ddrivers=123open,quark,115open` 点名构建才注册。用 `--expect` 传进来。
+OPT_IN_EXPECT = {"123 Open", "QuarkOpen", "115 Open"}
+
 # 哑凭据：只要能触发一次真实上游请求（→ 优雅的 init 失败）即可。
 DUMMY = {
     "189Cloud":  {"username": "13800000000", "password": "olz-dummy-password"},
     "UC":        {"cookie": "__pus=olz-dummy; __puus=olz-dummy"},
     "115 Cloud": {"cookie": "UID=olz_dummy; CID=olz_dummy; SEID=olz_dummy; KID=olz_dummy"},
     "WoPan":     {"refresh_token": "olz-dummy-refresh-token"},
+    # ---- 编译期可选的三个变体 ----
+    # 123 Open：走开发者密钥（不用 renewapi），init 会打 access_token 端点 → 401。
+    "123 Open":  {"ClientID": "olz-dummy", "ClientSecret": "olz-dummy",
+                  "use_online_api": False},
+    # QuarkOpen：直接填 refresh_token，init 会打 /open/v1/user/info → 401。
+    "QuarkOpen": {"refresh_token": "olz-dummy", "access_token": "olz-dummy",
+                  "use_online_api": False},
+    # 115 Open：init 会打 /open/user/info → 401。
+    # ⚠ 键名必须与 Go 的 json tag 一致（小写），2026-10-22 之前 schema 里写成
+    # `AccessToken` 导致 parse 读不到、init 恒 NoToken，就是这轮修掉的。
+    "115 Open":  {"access_token": "olz-dummy", "refresh_token": "olz-dummy"},
 }
 
 
@@ -76,6 +101,11 @@ def main():
     ap.add_argument("base")
     ap.add_argument("--user", default="admin")
     ap.add_argument("--password", required=True)
+    ap.add_argument("--expect", default="",
+                    help="额外期望注册的驱动（逗号分隔），用于点名构建的变体，"
+                         "例如 --expect \"123 Open,QuarkOpen,115 Open\"")
+    ap.add_argument("--only", default="",
+                    help="只跑这些驱动的表单+添加闭环（逗号分隔）；注册表检查仍按 expect 全量")
     args = ap.parse_args()
 
     st, j = req(args.base, "/api/auth/login",
@@ -85,19 +115,31 @@ def main():
         return 2
     tok = j["data"]["token"]
 
+    expect = set(BASE_EXPECT)
+    if args.expect:
+        expect |= {s.strip() for s in args.expect.split(",") if s.strip()}
+    only = {s.strip() for s in args.only.split(",") if s.strip()}
+    todo = sorted(only or expect)
+
     # ---- 1) 注册表完整性：编译进二进制的驱动清单 ----
     st, j = req(args.base, "/api/admin/driver/names", token=tok)
     names = j.get("data") or []
     print("=== 1. 注册表（/api/admin/driver/names）===")
     check("驱动清单非空", bool(names), "%d 个" % len(names))
-    expect = {"Local", "WebDav", "Itvsh", "AliyundriveOpen", "189Cloud",
-              "189CloudPC", "123Pan", "Quark", "UC", "115 Cloud", "WoPan", "Strm"}
     missing = expect - set(names)
-    check("12 个注册驱动齐全", not missing, "缺: %s" % (sorted(missing) or "无"))
+    check("%d 个注册驱动齐全" % len(expect), not missing,
+          "缺: %s" % (sorted(missing) or "无"))
+
+    # 反向断言：没点名的 opt-in 变体**不该**在默认产物里出现。
+    # 这是 `driver.zig` 的 `opted()` 在真机上的唯一可观测证据。
+    if not (expect & OPT_IN_EXPECT):
+        leaked = OPT_IN_EXPECT & set(names)
+        check("默认产物不含 opt-in 变体", not leaked,
+              "多出: %s" % (sorted(leaked) or "无"))
 
     # ---- 2) 逐驱动表单：/api/admin/driver/info 必须能渲染 ----
     print("\n=== 2. 驱动表单（admin/driver/info）===")
-    for drv in sorted(expect):
+    for drv in todo:
         st, j = req(args.base, "/api/admin/driver/info?driver=" + urllib.request.quote(drv),
                     token=tok)
         ok = j.get("code") == 200 and (j.get("data") or {}).get("common") is not None
@@ -105,7 +147,10 @@ def main():
 
     # ---- 3) 无凭据驱动：哑凭据走「添加 → 优雅失败 → 删除」闭环 ----
     print("\n=== 3. 无凭据驱动：添加闭环（哑凭据 ⇒ 优雅失败）===")
-    for drv, add in DUMMY.items():
+    for drv in todo:
+        add = DUMMY.get(drv)
+        if add is None:
+            continue
         mp = "/olz-drvtest-%s" % drv.replace(" ", "").lower()
         st, j = req(args.base, "/api/admin/storage/create", method="POST",
                     token=tok, body={"mount_path": mp, "driver": drv,

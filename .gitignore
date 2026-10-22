@@ -32,6 +32,8 @@ output/
 /public/dist/*
 !/public/dist/README.md
 /zig-src/.zig-cache/
+# 本机构建产物（2026-10-22 起本机有 zig 工具链，`zig build` 会在这里落产物）
+/zig-src/zig-out/
 
 .VSCodeCounter
 *.syso
@@ -43,3 +45,5 @@ output/
 # 记忆目录里只放 markdown。历史上误存过 5 个 aarch64 构建产物（5.6MB），
 # 2026-10-20 已清理；构建产物一律走 zig-src/dist/ 或归档目录。
 /.workbuddy-ai/memory/*-aarch64
+# 本地凭据保管（2026-10-22：WoPan 轮换令牌等，绝不入库）
+/zig-src/tools/creds.local.json
