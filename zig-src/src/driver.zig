@@ -330,6 +330,9 @@ pub const builtin = blk: {
     // 每个 if 对应一项，与 build.zig 的 DRIVERS 表一一对应
     // （build.zig 负责把用户传的名字翻译成这里的 basename 并校验）。
     // 2026-10-20 起 15 个注册项 / 12 个实现（thunder 出 Thunder + ThunderExpert + ThunderWeb）。
+    // 另有 3 个**编译期可选**项（`123 Open` / `QuarkOpen` / `115 Open`，用
+    // `opted()` 而不是 `has()`）—— 默认全量构建里不出现，只有 `-Ddrivers=`
+    // 点名才注册，所以注册项总数仍是 15。
     @setEvalBranchQuota(200000);
     var list: []const Factory = &.{};
     if (has("local")) list = list ++ [_]Factory{@import("drivers/local.zig").factory};
@@ -359,19 +362,20 @@ pub const builtin = blk: {
     };
 
     // ---------------------------------------------------------------------
-    // 暂时下线的入口 —— 这几个是**做错了变体**的驱动，代码保留、不删，
-    // 只是不注册进 `builtin`，所以不会出现在驱动列表里，也不会被配置命中。
+    // 编译期可选（opt-in）入口 —— 代码完整、有单测，但**默认不进产物**。
     //
     // OpenList 里同一个网盘常有两个互不兼容的驱动：
     //   `123`/`123Pan`(用户名+密码)      vs `123_open`/`123 Open`(开放平台)
     //   `quark_uc`/`Quark`(Cookie)       vs `quark_open`/`QuarkOpen`(refresh_token)
     //   `115`/`115 Cloud`(Cookie)        vs `115_open`/`115 Open`(开放平台)
     //
-    // T2 已补齐前者，后者按用户 2026-10-12 的指示保留代码但不注册。
+    // T2（2026-10-12）补齐了前者，后者的处理方式见 `opted()`：**默认不注册**
+    // （前端下拉框不会出现两个语义相近的入口，用户 2026-10-12 的指示），
+    // 但可以 `-Ddrivers=123open,quark,115open` 显式点名编进产物做验证/使用。
     // ---------------------------------------------------------------------
-    // if (has("123open"))  ... // 123 Open
-    // if (has("quark"))    ... // QuarkOpen
-    // if (has("115open"))  ... // 115 Open
+    if (opted("123open")) list = list ++ [_]Factory{@import("drivers/123open.zig").factory};
+    if (opted("quark")) list = list ++ [_]Factory{@import("drivers/quark.zig").factory};
+    if (opted("115open")) list = list ++ [_]Factory{@import("drivers/115open.zig").factory};
 
     break :blk list;
 };
@@ -385,7 +389,28 @@ pub const builtin = blk: {
 /// 这里会直接编译失败而不是静默跑出个空注册表。
 fn has(comptime name: []const u8) bool {
     if (build_options.drivers_all) return true;
-    var it = std.mem.splitScalar(u8, build_options.drivers, ',');
+    return nameInList(build_options.drivers, name);
+}
+
+/// 「编译期可选」查询：**只认显式点名**，`drivers_all`（默认全量构建）一律不算。
+///
+/// 这是 `has()` 的严格版，专门给三个"同名变体"驱动用（`123 Open` /
+/// `QuarkOpen` / `115 Open`）。为什么需要两个语义：
+///   * `has()` = "全量构建里应该有我" —— 12 个主驱动都是这个语义；
+///   * `opted()` = "只有我名字出现在 `-Ddrivers=` 里才有我" —— 变体驱动是
+///     这个语义，否则 `zig build`（全量）会把它们一并注册，前端下拉框里就会
+///     冒出 `123 Open`/`123Pan`、`115 Open`/`115 Cloud` 这种易混的两项。
+///
+/// 副作用是好的：默认产物里不会多出这三个驱动的**任何一个字节**，`keys()`
+/// 仍是 15 项；要验证/使用变体时显式点名即可，例如
+///   `zig build -Ddrivers=local,123open,quark,115open`
+fn opted(comptime name: []const u8) bool {
+    if (build_options.drivers_all) return false;
+    return nameInList(build_options.drivers, name);
+}
+
+fn nameInList(raw: []const u8, comptime name: []const u8) bool {
+    var it = std.mem.splitScalar(u8, raw, ',');
     while (it.next()) |tok| {
         const t = std.mem.trim(u8, tok, " ");
         if (t.len != 0 and std.mem.eql(u8, t, name)) return true;
@@ -457,9 +482,16 @@ test "find matches the Go Config.Name byte for byte — no aliases, no case fold
         "LOCAL",
         "123pan",
         "",                // 空串
-        "QuarkOpen",
     }) |bad| {
         try testing.expect(find(bad) == null);
+    }
+
+    // `QuarkOpen` 是 opt-in 变体（见 `opted()`）：默认全量构建里查不到，
+    // 但 `-Ddrivers=quark` 点名时必须查得到 —— 否则白名单等于失效。
+    if (build_options.drivers_all) {
+        try testing.expect(find("QuarkOpen") == null);
+    } else {
+        try testing.expectEqual(nameInList(build_options.drivers, "quark"), find("QuarkOpen") != null);
     }
 }
 
@@ -476,6 +508,54 @@ test "keys() reports exactly the registered driver names, no duplicates" {
         }
         // find 必须能按这个 key 找到自己
         try testing.expectEqualStrings(k, find(k).?.key);
+    }
+}
+
+test "nameInList is exact, whitespace-tolerant, and does not know 'all'" {
+    // `opted()` 的全部判断都落在这个纯函数上，所以逐条钉住：
+    // 分隔符是逗号、两侧空格容忍、**子串不算命中**（`quark` ≠ `quarkuc`）。
+    try testing.expect(nameInList("local,123open", "123open"));
+    try testing.expect(nameInList(" local , 123open ", "123open"));
+    try testing.expect(nameInList("123open", "123open"));
+    try testing.expect(!nameInList("local,quarkuc", "quark"));
+    try testing.expect(!nameInList("all", "quark")); // `all` 由 drivers_all 表示，不是名字
+    try testing.expect(!nameInList("", "quark"));
+    try testing.expect(!nameInList("123open2", "123open"));
+}
+
+test "opt-in variants stay out of the default (drivers_all) build" {
+    // 用户 2026-10-12：这三个变体"代码保留但不注册"。2026-10-22 收尾时改成
+    // "编译期可选"：默认全量构建（`zig build` / `-Ddrivers=all`）里**必须没有**
+    // 它们，否则前端「添加存储」下拉框会出现 `123 Open` 与 `123Pan`、
+    // `115 Open` 与 `115 Cloud` 这种易混的两项。
+    //
+    // 只有全量构建能断言这一点；`-Ddrivers=123open` 这类点名构建里它们本该
+    // 存在，跳过即可（用 SkipZigTest 而不是让它红）。
+    if (!build_options.drivers_all) return error.SkipZigTest;
+
+    for ([_][]const u8{ "123 Open", "QuarkOpen", "115 Open" }) |name| {
+        try testing.expect(find(name) == null);
+    }
+    // 同时钉住"已注册的那些还在"—— 防止哪天 opt-in 写错把整张表带崩。
+    try testing.expect(find("123Pan") != null);
+    try testing.expect(find("Quark") != null);
+    try testing.expect(find("115 Cloud") != null);
+}
+
+test "every addition_schema writes select options as a comma string" {
+    // Go 的 `driver.Item.Options` 是 **string**（`internal/driver/item.go:11`，
+    // 值来自 struct tag `options:"a,b,c"`），前端按逗号 split 出下拉项。
+    // Zig 侧 `api.zig` 的 `writeAdditionalItems` 同样只认字符串：写成数组会被
+    // 静默降级成 `"options":""` —— 下拉框变成空的，只能用它自己填的默认值。
+    //
+    // 2026-10-22 真机抓到 QuarkOpen / Quark / 115 Cloud / AliyundriveOpen /
+    // 189CloudPC 五个驱动都是数组形态（共 16 处），全部已改成逗号串。
+    // 这个测试是防复发：新增驱动时写数组会在这里立刻红。
+    for (builtin) |f| {
+        if (std.mem.indexOf(u8, f.addition_schema, "\"options\":[") != null) {
+            std.debug.print("driver {s}: addition_schema uses an array for options\n", .{f.key});
+            return error.ArrayOptionsInSchema;
+        }
     }
 }
 

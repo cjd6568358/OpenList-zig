@@ -1436,20 +1436,20 @@ pub const factory = driver.Factory{
     .secrets = &.{ "refresh_token", "AccessToken", "access_token", "client_id", "client_secret" },
     .addition_schema =
     \\{
-    \\  "drive_type":           {"type":"select","default":"resource","options":["default","resource","backup"],"help":"默认盘 / 资源盘 / 备份盘，对应 getDriveInfo 返回的三个 drive_id"},
+    \\  "drive_type":           {"type":"select","default":"resource","options":"default,resource,backup","help":"默认盘 / 资源盘 / 备份盘，对应 getDriveInfo 返回的三个 drive_id"},
     \\  "root_folder_id":       {"type":"string","default":"root","help":"根目录 file_id，阿里云盘的根是 root"},
     \\  "refresh_token":        {"type":"string","required":true,"secret":true,"help":"必填。推荐只填这个，access_token 自动换取"},
-    \\  "order_by":             {"type":"select","default":"name","options":["name","size","updated_at","created_at"],"help":"排序字段"},
-    \\  "order_direction":      {"type":"select","default":"ASC","options":["ASC","DESC"],"help":"排序方向"},
+    \\  "order_by":             {"type":"select","default":"name","options":"name,size,updated_at,created_at","help":"排序字段"},
+    \\  "order_direction":      {"type":"select","default":"ASC","options":"ASC,DESC","help":"排序方向"},
     \\  "use_online_api":       {"type":"bool","default":true,"help":"用第三方 renewapi 续期；关闭则必须填 client_id/client_secret"},
-    \\  "alipan_type":          {"type":"select","default":"default","options":["default","alipanTV"],"help":"影响 renewapi 走哪条通道"},
+    \\  "alipan_type":          {"type":"select","default":"default","options":"default,alipanTV","help":"影响 renewapi 走哪条通道"},
     \\  "api_url_address":      {"type":"string","default":"https://api.oplist.org/alicloud/renewapi","help":"renewapi 地址"},
     \\  "client_id":            {"type":"string","required":false,"secret":true,"help":"没有就留空（用 renewapi 时不需要）"},
     \\  "client_secret":        {"type":"string","required":false,"secret":true,"help":"没有就留空"},
-    \\  "remove_way":           {"type":"select","default":"trash","options":["trash","delete"],"help":"trash 进回收站，delete 永久删除"},
+    \\  "remove_way":           {"type":"select","default":"trash","options":"trash,delete","help":"trash 进回收站，delete 永久删除"},
     \\  "rapid_upload":         {"type":"bool","default":false,"help":"秒传。开启后先算 pre_hash，命中则不上传内容，进度条会不准"},
     \\  "internal_upload":      {"type":"bool","default":false,"help":"阿里云北京 ECS 上打开可走内网上传"},
-    \\  "livp_download_format": {"type":"select","default":"jpeg","options":["jpeg","mov"],"help":"实况照片取不到直链时回退成静态帧还是视频"},
+    \\  "livp_download_format": {"type":"select","default":"jpeg","options":"jpeg,mov","help":"实况照片取不到直链时回退成静态帧还是视频"},
     \\  "callback_concurrency": {"type":"number","default":1,"help":"保留字段：本仓库 Go 树里没有这个键（上游版本差异），并发闸门由 API 层负责，本工程原样保留但不使用"},
     \\  "AccessToken":          {"type":"string","required":false,"secret":true,"help":"由 refresh_token 换得；与 Go 版一致使用大写键名"}
     \\}

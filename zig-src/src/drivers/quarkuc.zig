@@ -864,8 +864,8 @@ const addition_schema =
     \\{
     \\  "cookie":                   {"type":"string","required":true,"secret":true,"help":"浏览器里抓的 Cookie（含 __pus/__puus 等）"},
     \\  "root_folder_id":           {"type":"string","default":"0","help":"根目录 fid，夸克的根是 0"},
-    \\  "order_by":                 {"type":"select","default":"none","options":["none","file_type","file_name","updated_at"],"help":"排序字段"},
-    \\  "order_direction":          {"type":"select","default":"asc","options":["asc","desc"],"help":"排序方向"},
+    \\  "order_by":                 {"type":"select","default":"none","options":"none,file_type,file_name,updated_at","help":"排序字段"},
+    \\  "order_direction":          {"type":"select","default":"asc","options":"asc,desc","help":"排序方向"},
     \\  "use_transcoding_address":  {"type":"bool","default":false,"help":"视频走转码地址（可 302）"},
     \\  "only_list_video_file":     {"type":"bool","default":false,"help":"只列出视频与目录"}
     \\}

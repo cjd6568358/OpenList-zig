@@ -30,6 +30,12 @@ const DRIVERS = [_]Driver{
     .{ .key = "Thunder", .file = "thunder" },
     .{ .key = "ThunderExpert", .file = "thunder" }, // 与 Thunder 同一个实现
     .{ .key = "ThunderWeb", .file = "thunder" }, // 网页版，同样同一个实现
+    // 编译期可选（opt-in）：这三个是"同名变体"，**默认不进产物**，
+    // 只有显式点名才会注册（见 `driver.zig` 的 `opted()` 与 `TODO.md`）。
+    //   zig build -Ddrivers=local,123open,quark,115open
+    .{ .key = "123 Open", .file = "123open" }, // 123 开放平台（≠ 123Pan）
+    .{ .key = "QuarkOpen", .file = "quark" }, // 夸克开放平台（≠ Quark）
+    .{ .key = "115 Open", .file = "115open" }, // 115 开放平台（≠ 115 Cloud）
 };
 
 /// `-Ddrivers=` 的原始串 → 去重后的 basename 串。空 / "all" ⇒ 全量。

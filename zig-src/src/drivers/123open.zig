@@ -26,8 +26,11 @@
 //!   * **上传前必定本地算 SHA1 和 MD5**。Go 的 `file.GetHash()` 可能已经被上层
 //!     算过；本工程的 `model.Source` 只有 `size`/`readAt`，没有哈希，所以无论
 //!     如何都要自己过一遍。两个哈希在**同一遍**读里算完，不是两遍。
-//!   * **`Copy` 不提供**。vtable 里本来就没有 `copy` 槽位，上游那个"用 MD5 秒传
-//!     模拟复制"的实现依赖 `create` 的副作用，移植过来价值低、坑多。
+//!   * **`Copy` 走「创建 + MD5 秒传」**，与 Go `drivers/123_open/driver.go:151-169`
+//!     一致：123pan 没有服务端复制接口，上游是用**源文件 etag 的 create** 去撞
+//!     秒传。命中即复制成功；没命中就报 `NotSupport`（Go 同款，不退化成本地
+//!     下载再上传）。`copy` 槽位是 2026-10 才加到 vtable 的可选项，本文件
+//!     2026-10-22 收尾时补上。
 //!   * **离线下载未移植**。它需要任务中心（`/api/task/*`）配合，属于已知缺口。
 
 const std = @import("std");
@@ -162,6 +165,15 @@ pub const Addition = struct {
 fn dupeOr(alloc: std.mem.Allocator, v: ?[]const u8, fallback: []const u8) ![]const u8 {
     const s = v orelse return alloc.dupe(u8, fallback);
     return alloc.dupe(u8, s);
+}
+
+/// ASCII 小写副本。Go 在 `upload.go:35` 用 `strings.ToLower(etag)`；上传路径
+/// 传进来的 MD5 本来是小写，但 `copy()` 传的是列表记录里的原始 `etag`（可能
+/// 大写），所以统一在 `create()` 里降一次，保证与 Go 逐字节一致。
+fn lowerAscii(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const out = try alloc.alloc(u8, s.len);
+    for (s, 0..) |c, i| out[i] = std.ascii.toLower(c);
+    return out;
 }
 
 /// 极小的有序对象写入器。字段顺序在源码里一眼可见 —— `addition` 是要跟
@@ -327,6 +339,7 @@ pub const Open123 = struct {
         .move = move,
         .rename = rename,
         .remove = remove,
+        .copy = copy,
         .put = put,
         .space = space,
     };
@@ -840,6 +853,41 @@ pub const Open123 = struct {
         _ = try self.postJson(a, &endpoints.trash, b.slice());
     }
 
+    /// `Copy`：Go `drivers/123_open/driver.go:151-169` 的逐条移植。
+    ///
+    /// 123pan 没有服务端复制接口，上游用「create + MD5 秒传」模拟：
+    ///   * 目标目录 ID 当 `parentFileId`，源文件名原样保留；
+    ///   * `etag` 传**源文件的 MD5**（列表记录里的 `etag` 字段，Go 里是
+    ///     `srcObj.(File).Etag`），`duplicate=2`（重名自动改名）；
+    ///   * `data.reuse == true` ⇒ 秒传命中，复制成功；
+    ///   * 没命中 ⇒ `NotSupport`。**故意不清理那条半成品记录** —— Go 也不清，
+    ///     多一步删除就与上游行为分叉了（前端会看到 501 并保留源文件）。
+    ///
+    /// 源是目录、或列表记录里没有 `etag` 时直接 `NotSupported`：Go 那边这两种
+    /// 情况也会走到 create（`Etag` 为空 → 服务端不会命中秒传），结果同样是失败，
+    /// 这里把结论显式化、省掉一次必然失败的请求（也不会留下半成品记录）。
+    fn copy(ptr: *anyopaque, ctx: *driver.Ctx, src: []const u8, dst_dir: []const u8) anyerror!void {
+        const self = as(ptr);
+        const a = ctx.alloc;
+
+        const s = try self.resolveEntry(a, src);
+        if (s.is_dir) return driver.Error.NotSupported;
+        const raw = s.raw orelse return Error.InvalidResponse;
+        const etag = raw.strAt("etag") orelse "";
+        if (etag.len == 0) return driver.Error.NotSupported;
+        const size = raw.intAt("size") orelse 0;
+
+        const d = try self.resolveEntry(a, dst_dir);
+        if (!d.is_dir) return driver.Error.NotFound;
+
+        const created = try self.create(a, d.id, s.name, etag, size);
+        if (created.reuse) {
+            log.info("[123open] {s}: copy via md5 instant-upload hit", .{s.name});
+            return;
+        }
+        return driver.Error.NotSupported;
+    }
+
     fn space(ptr: *anyopaque, ctx: *driver.Ctx) anyerror!driver.DiskUsage {
         const self = as(ptr);
         const a = ctx.alloc;
@@ -949,8 +997,9 @@ pub const Open123 = struct {
         try w.begin();
         try w.int("parentFileId", parent_id);
         try w.str("filename", filename);
-        // Go 用 strings.ToLower(etag)；我们传进来的已经小写，但保持显式。
-        try w.str("etag", etag);
+        // Go 用 `strings.ToLower(etag)`（upload.go:35）：这里统一降一次，
+        // 上传路径（已是小写 MD5）与 copy 路径（列表里的原始 etag）都对齐。
+        try w.str("etag", try lowerAscii(arena, etag));
         try w.int("size", size);
         try w.int("duplicate", duplicate_keep_both);
         try w.boolean("containDir", false);
@@ -1665,4 +1714,64 @@ test "mkdir body writes parentID as a string" {
     try testing.expect(std.mem.indexOf(u8, body, "\"parentID\":\"12345\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"parentID\":12345") == null);
     try testing.expect(std.mem.indexOf(u8, body, "新目录") != null);
+}
+
+test "copy is wired and rejects directories without touching the network" {
+    // Go `drivers/123_open/driver.go:151-169` 的 Copy 是「create + MD5 秒传」。
+    // 这里钉两件事：
+    //   1. vtable 的 `copy` 槽位**必须非空** —— 上游有这个能力，不能悄悄留空
+    //      （对比 quarkuc/pan123：那两家的 Go 是 `errs.NotSupport`，所以留空）；
+    //   2. 源是目录时直接 `NotSupported`，且**不发任何请求**（本测试没有网络
+    //      也没有凭据，一旦发请求就会以别的错误失败）。
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expect(Open123.vtable.copy != null);
+
+    const self = try createWithId(a, 7, null);
+    defer self.client.deinit();
+    const d = driver.asDriver(Open123, self);
+    var ctx = driver.Ctx{ .alloc = a };
+    // 根路径解析不产生请求（直接回 `root_folder_id`），且 is_dir = true。
+    try testing.expectError(driver.Error.NotSupported, d.copy(&ctx, "/", "/dst"));
+}
+
+test "lowerAscii normalises an etag the way Go's strings.ToLower does" {
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expectEqualStrings("abcdef0123", try lowerAscii(a, "ABCDEF0123"));
+    try testing.expectEqualStrings("", try lowerAscii(a, ""));
+    // 非字母字节原样保留（etag 只含 [0-9a-fA-F]，这里顺手钉住不误伤）。
+    try testing.expectEqualStrings("a-1_z", try lowerAscii(a, "A-1_Z"));
+}
+
+test "addition_schema keys are exactly the ones parse() reads" {
+    // 同 115open 的同名测试：前端按 schema 渲染表单、提交同名字段，驱动按
+    // parse 的键名读。这里逐字段验证一遍（`UploadThread` 等数字字段被喂了
+    // "probe" 会解析失败并退回默认值，属预期）。
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const schema = try json.parse(a, factory.addition_schema);
+    const obj = schema.asObject().?;
+
+    var b = Buf.init(a);
+    try b.appendByte('{');
+    for (obj.keys, 0..) |k, i| {
+        if (i != 0) try b.appendByte(',');
+        try b.print("\"{s}\":\"probe\"", .{k});
+    }
+    try b.appendByte('}');
+
+    const v = try json.parse(a, b.slice());
+    const cfg = try Addition.parse(a, &v);
+    try testing.expectEqualStrings("probe", cfg.client_id);
+    try testing.expectEqualStrings("probe", cfg.client_secret);
+    try testing.expectEqualStrings("probe", cfg.access_token);
+    try testing.expectEqualStrings("probe", cfg.refresh_token);
+    try testing.expectEqualStrings("probe", cfg.direct_link_private_key);
 }

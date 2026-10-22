@@ -20,6 +20,9 @@
 //!
 //!   * **分片上传串行**（同 `123open.zig`）：本工程 HTTP 客户端有全局互斥锁。
 //!   * **上传前必定本地算 MD5 + SHA1**（同一遍读）：`model.Source` 没有哈希。
+//!   * **`Copy` 不提供**，与 Go `drivers/quark_open/driver.go:129-131` 一致
+//!     （上游就是 `return errs.NotSupport`）。vtable 的 `copy` 槽位留空，
+//!     `Driver.copy` 统一回 `NotSupported`，有单测钉住别"顺手补上"。
 //!   * **`space` 不提供**。Go 版也没有实现 `GetDetails`，vtable 里留 null，
 //!     API 层会报零而不是报错 —— 这正是 `space` 设计成可选的原因。
 //!   * **本地刷新 token 未实现**，与 Go 版一致（上游那里是 `TODO`）。
@@ -348,6 +351,8 @@ pub const QuarkOpen = struct {
         .rename = rename,
         .remove = remove,
         .put = put,
+        // copy 留空：Go `drivers/quark_open/driver.go:129-131` 就是
+        // `return errs.NotSupport`，夸克开放平台没有服务端复制接口。
         // space 留空：上游没有 GetDetails，报零比编一个数字诚实。
     };
 
@@ -1077,8 +1082,8 @@ pub const factory = driver.Factory{
     .addition_schema =
     \\{
     \\  "root_folder_id":  {"type":"string","default":"0","help":"根目录 fid，夸克的根是 0"},
-    \\  "order_by":        {"type":"select","default":"none","options":["none","file_type","file_name","updated_at","created_at"],"help":"排序字段"},
-    \\  "order_direction": {"type":"select","default":"asc","options":["asc","desc"],"help":"排序方向"},
+    \\  "order_by":        {"type":"select","default":"none","options":"none,file_type,file_name,updated_at,created_at","help":"排序字段"},
+    \\  "order_direction": {"type":"select","default":"asc","options":"asc,desc","help":"排序方向"},
     \\  "use_online_api":  {"type":"bool","default":true,"help":"用第三方 renewapi 续期 token"},
     \\  "api_url_address": {"type":"string","default":"https://api.oplist.org/quarkyun/renewapi","help":"renewapi 地址"},
     \\  "access_token":    {"type":"string","required":false,"secret":true,"help":"可留空，由 refresh_token 换得"},
@@ -1520,4 +1525,46 @@ test "partRetryDelayMs mirrors retry-go's BackOffDelay" {
     try testing.expectEqual(@as(u32, 0), partRetryDelayMs(1));
     try testing.expectEqual(@as(u32, 1000), partRetryDelayMs(2));
     try testing.expectEqual(@as(u32, 2000), partRetryDelayMs(3));
+}
+
+test "copy is NotSupported, matching Go" {
+    // Go `drivers/quark_open/driver.go:129-131`：`Copy` 直接 `errs.NotSupport`。
+    // vtable 的 `.copy` 留空 ⇒ `Driver.copy` 回 `Error.NotSupported`。
+    // 哪天有人「顺手补上」，这个测试会提醒他上游根本没有这个能力。
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expect(QuarkOpen.vtable.copy == null);
+
+    const self = try createWithId(a, 7, null);
+    defer self.client.deinit();
+    const d = driver.asDriver(QuarkOpen, self);
+    var ctx = driver.Ctx{ .alloc = a };
+    try testing.expectError(driver.Error.NotSupported, d.copy(&ctx, "/src", "/dst"));
+}
+
+test "addition_schema keys are exactly the ones parse() reads" {
+    // 同 115open 的同名测试，见那边的长注释（2026-10-22 的 casing 事故）。
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const schema = try json.parse(a, factory.addition_schema);
+    const obj = schema.asObject().?;
+
+    var b = Buf.init(a);
+    try b.appendByte('{');
+    for (obj.keys, 0..) |k, i| {
+        if (i != 0) try b.appendByte(',');
+        try b.print("\"{s}\":\"probe\"", .{k});
+    }
+    try b.appendByte('}');
+
+    const v = try json.parse(a, b.slice());
+    const cfg = try Addition.parse(a, &v);
+    try testing.expectEqualStrings("probe", cfg.access_token);
+    try testing.expectEqualStrings("probe", cfg.refresh_token);
+    try testing.expectEqualStrings("probe", cfg.app_id);
+    try testing.expectEqualStrings("probe", cfg.sign_key);
 }

@@ -36,9 +36,11 @@
 //!   * **`singleUpload` 没有移植**。它在 Go 版里是死代码 —— `Put()` 只有
 //!     分片上传一条路径（`upload.go` 里 `singleUpload` 没有任何调用点）。
 //!     把死代码搬过来只会让光猫多背几百字节。
-//!   * **`Copy` / 离线下载 / 回收站没有移植**。vtable 里本来就没有 `copy`
-//!     槽位；离线下载依赖任务中心，回收站是另一个驱动（`115_open` 的
-//!     `meta.go` 也没暴露它们）。属于已知缺口。
+//!   * **离线下载 / 回收站没有移植**。离线下载依赖任务中心（`/api/task/*`），
+//!     回收站是另一个驱动（`115_open` 的 `meta.go` 也没暴露它们）。属于已知缺口。
+//!   * **`Copy` 已补**（2026-10-22）：`POST /open/ufile/copy`，form 为
+//!     `pid` / `file_id` / `no_dupli=1`，与 Go `drivers/115_open/driver.go:279-289`
+//!     的 `sdk.Copy` 逐字段一致（`no_dupli=1` = 目标目录不允许重名）。
 //!   * **分片上传串行**。Go 版也是串行（`for i := 1; i <= partNum; i++`），
 //!     这里没有改动，只是把 OSS SDK 的 `bucket.UploadPart` 换成手写 PUT。
 //!   * **`limit_rate` 实现为最小间隔**。Go 用 `rate.NewLimiter(limit, 1)`；
@@ -80,6 +82,7 @@ const api_files = api_base ++ "/open/ufile/files";
 const api_folder_info = api_base ++ "/open/folder/get_info";
 const api_folder_add = api_base ++ "/open/folder/add";
 const api_move = api_base ++ "/open/ufile/move";
+const api_copy = api_base ++ "/open/ufile/copy";
 const api_update = api_base ++ "/open/ufile/update";
 const api_delete = api_base ++ "/open/ufile/delete";
 const api_down_url = api_base ++ "/open/ufile/downurl";
@@ -877,6 +880,16 @@ pub const Open115 = struct {
         _ = try self.request(arena, "POST", api_move, form.slice(), null);
     }
 
+    /// `POST /open/ufile/copy`（form `pid`、`file_id`、`no_dupli`）。
+    ///
+    /// 对齐 Go `drivers/115_open/driver.go:279-289` 的 `sdk.Copy`：
+    /// `PID` = 目标目录 ID、`FileID` = 源 ID、`NoDupli` = `"1"`（不允许重名）。
+    /// SDK 侧常量是 `ApiFsCopy = ApiBaseURL + "/open/ufile/copy"`（v0.2.6
+    /// `const.go:30`），这里同值。目录与文件走同一个接口，不需要分支。
+    fn apiCopy(self: *Open115, arena: std.mem.Allocator, pid: []const u8, file_id: []const u8) !void {
+        _ = try self.request(arena, "POST", api_copy, try copyForm(arena, pid, file_id), null);
+    }
+
     /// `POST /open/ufile/update`（form `file_id`、`file_name`）。
     fn updateFile(self: *Open115, arena: std.mem.Allocator, file_id: []const u8, new_name: []const u8) !void {
         var form = urlmod.Query.init(arena);
@@ -1212,6 +1225,21 @@ pub const Open115 = struct {
         try self.updateFile(a, s.id, new_name);
     }
 
+    /// `Copy`：Go `drivers/115_open/driver.go:279-289` 的逐条移植。
+    ///
+    /// 115 开放平台**有**服务端复制接口，所以这里不是"秒传模拟"，就是一次
+    /// `POST /open/ufile/copy`。`no_dupli=1` 表示目标目录已有同名文件时上游
+    /// 报错而不是生成副本 —— 与 Go 传的字面量一致。
+    fn copy(ptr: *anyopaque, ctx: *driver.Ctx, src: []const u8, dst_dir: []const u8) anyerror!void {
+        const self = as(ptr);
+        const a = ctx.alloc;
+
+        const s = try self.resolveEntry(a, src);
+        const d = try self.resolveEntry(a, dst_dir);
+        if (!d.is_dir) return driver.Error.NotFound;
+        try self.apiCopy(a, d.id, s.id);
+    }
+
     fn remove(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, is_dir: bool) anyerror!void {
         const self = as(ptr);
         const a = ctx.alloc;
@@ -1310,6 +1338,7 @@ pub const Open115 = struct {
         .move = move,
         .rename = rename,
         .remove = remove,
+        .copy = copy,
         .put = put,
         .space = space,
     };
@@ -1454,6 +1483,16 @@ const WindowSource = struct {
     }
 };
 
+/// `POST /open/ufile/copy` 的 form body。单独抽出来是为了能在没有网络的情况下
+/// 逐字节钉住字段名与 `no_dupli` 的值（Go 传的是字符串 `"1"`，不是布尔）。
+fn copyForm(arena: std.mem.Allocator, pid: []const u8, file_id: []const u8) ![]const u8 {
+    var form = urlmod.Query.init(arena);
+    try form.add("pid", pid);
+    try form.add("file_id", file_id);
+    try form.add("no_dupli", "1");
+    return form.slice();
+}
+
 fn headerValue(headers: []const model.Header, name: []const u8) ?[]const u8 {
     for (headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
@@ -1576,8 +1615,16 @@ const RateLimiter = struct {
 pub const factory = driver.Factory{
     .key = "115 Open",
     .label = "115 开放平台",
-    .secrets = &.{ "AccessToken", "RefreshToken" },
+    .secrets = &.{ "access_token", "refresh_token" },
     // 字段名与 Go 版 `Addition` 的 json tag 逐字一致。
+    //
+    // ⚠ 2026-10-22 真机抓到的 bug：这里原先写的是 `AccessToken`/`RefreshToken`
+    // （首字母大写，照抄 Go 的 **Go 字段名**而不是 **json tag**），而
+    // `Addition.parse` 读的是 `access_token`/`refresh_token`。前端按本 schema
+    // 渲染表单、提交同名字段 ⇒ parse 读不到 ⇒ `init` 恒 `NoToken`，
+    // **从管理页添加这个驱动永远失败**。单测当时没发现，因为测试直接手写了
+    // 小写键。现在有一致性测试（`addition_schema keys are exactly the ones
+    // parse() reads`）兜底。
     .addition_schema =
     \\{
     \\  "root_folder_id": {"type":"string","default":"0","help":"根目录 ID，115 的账号根是 0"},
@@ -1585,8 +1632,8 @@ pub const factory = driver.Factory{
     \\  "order_direction":{"type":"select","options":"asc,desc","default":"asc","help":"排序方向"},
     \\  "limit_rate":     {"type":"float","default":1,"help":"API 请求速率上限（次/秒）"},
     \\  "page_size":      {"type":"number","default":200,"min":1,"max":1150,"help":"列表每页条数"},
-    \\  "AccessToken":    {"type":"string","required":false,"secret":true,"help":"access_token；与 RefreshToken 至少填一个"},
-    \\  "RefreshToken":   {"type":"string","required":false,"secret":true,"help":"refresh_token，过期时自动续期并回写"}
+    \\  "access_token":   {"type":"string","required":false,"secret":true,"help":"access_token；与 RefreshToken 至少填一个"},
+    \\  "refresh_token":  {"type":"string","required":false,"secret":true,"help":"refresh_token，过期时自动续期并回写"}
     \\}
     ,
     .create = create,
@@ -2106,4 +2153,45 @@ test "createWithId builds a driver with the expected name" {
     d.client.deinit();
     a.destroy(d.jar);
     a.destroy(d);
+}
+
+test "copy is wired and its form body matches the SDK's CopyReq" {
+    // Go `drivers/115_open/driver.go:279-289` 调 `sdk.Copy(CopyReq{PID, FileID,
+    // NoDupli:"1"})`，SDK 把它摊成 form `pid` / `file_id` / `no_dupli`
+    // （115-sdk-go v0.2.6 `fs.go:274-282`）。这里逐字节钉住，防止哪天"顺手"
+    // 把 `no_dupli` 改成布尔或漏字段。
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try testing.expect(Open115.vtable.copy != null);
+    try testing.expectEqualStrings("pid=12&file_id=34&no_dupli=1", try copyForm(a, "12", "34"));
+}
+
+test "addition_schema keys are exactly the ones parse() reads" {
+    // 前端的真实路径：按 `addition_schema` 渲染表单 → 提交同名字段 → 落进
+    // `addition` → 驱动 `parse()` 读。两边键名一旦漂移，表单填了也不生效。
+    //
+    // 2026-10-22 真机就是踩这个：schema 写 `"AccessToken"`（Go 的**字段名**），
+    // parse 读 `"access_token"`（Go 的 **json tag**）⇒ init 恒 `NoToken`，
+    // 从管理页添加这个驱动 100% 失败。这条测试把整条链路钉死。
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const schema = try json.parse(a, factory.addition_schema);
+    const obj = schema.asObject().?;
+
+    var b = Buf.init(a);
+    try b.appendByte('{');
+    for (obj.keys, 0..) |k, i| {
+        if (i != 0) try b.appendByte(',');
+        try b.print("\"{s}\":\"probe\"", .{k});
+    }
+    try b.appendByte('}');
+
+    const v = try json.parse(a, b.slice());
+    const cfg = try Addition.parse(a, &v);
+    try testing.expectEqualStrings("probe", cfg.access_token);
+    try testing.expectEqualStrings("probe", cfg.refresh_token);
 }

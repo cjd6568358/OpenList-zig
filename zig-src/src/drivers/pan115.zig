@@ -1399,7 +1399,7 @@ pub const factory = driver.Factory{
     \\{
     \\  "cookie":        {"type":"string","required":true,"secret":true,"help":"浏览器里抓的 Cookie（UID/CID/SEID/KID）"},
     \\  "qrcode_token":  {"type":"string","help":"二维码登录 token（本工程未移植，留空即可）"},
-    \\  "qrcode_source": {"type":"select","default":"linux","options":["web","android","ios","tv","alipaymini","wechatmini","qandroid","linux"]},
+    \\  "qrcode_source": {"type":"select","default":"linux","options":"web,android,ios,tv,alipaymini,wechatmini,qandroid,linux"},
     \\  "page_size":     {"type":"number","default":1000,"help":"列表每页条数"},
     \\  "limit_rate":    {"type":"float","default":2,"help":"每秒请求数上限"},
     \\  "root_folder_id":{"type":"string","default":"0","help":"根目录 id，115 的根是 0"}
