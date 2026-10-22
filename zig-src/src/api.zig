@@ -6184,6 +6184,19 @@ fn findDriverItem(arr: []const json.Value, name: []const u8) ?*const json.Value 
     return null;
 }
 
+/// 测试用：拼一份 `{"root_folder_path":"<path>"}` 的 **Local addition**。
+///
+/// 不能写成 `allocPrint("...\"{s}\"", path)` —— Windows 路径带反斜杠，会被
+/// JSON 当成转义序列（`\U`、`\t`…）⇒ `InvalidEscape`。本机 `zig build test`
+/// 就是在这里红的；Linux 上因为路径是 `/tmp/...` 一直没暴露。
+fn localAdditionForTest(a: std.mem.Allocator, path: []const u8) ![]const u8 {
+    var b = Buf.init(a);
+    try b.append("{\"root_folder_path\":");
+    try json.writeString(&b, path);
+    try b.append("}");
+    return b.slice();
+}
+
 test "storage admin CRUD round trip persists to cfg.json and remounts live" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -6216,7 +6229,13 @@ test "storage admin CRUD round trip persists to cfg.json and remounts live" {
     hdrs[0] = .{ .name = "Authorization", .value = auth };
 
     // addition 是「JSON 字符串」—— 外层 body 里还得再转义一次。
-    const addition = try std.fmt.allocPrint(a, "{{\"root_folder_path\":\"{s}\"}}", .{data_dir});
+    // 内层也必须转义：`data_dir` 在 Windows 下带反斜杠，`"{s}"` 直接拼会得到
+    // 非法 JSON（本机 zig build test 就红在这里）。
+    var add_inner = Buf.init(a);
+    try add_inner.append("{\"root_folder_path\":");
+    try json.writeString(&add_inner, data_dir);
+    try add_inner.append("}");
+    const addition = add_inner.slice();
     var add_esc = Buf.init(a);
     try json.writeString(&add_esc, addition);
     const create_body = try std.fmt.allocPrint(
@@ -6401,7 +6420,7 @@ test "storage admin CRUD round trip persists to cfg.json and remounts live" {
     // 10) create init 失败路径：行保留 + error_msg 可见 + data.id 带回。
     {
         const bad_root = try std.fmt.allocPrint(a, "{s}/no-such-dir", .{root});
-        const bad_add = try std.fmt.allocPrint(a, "{{\"root_folder_path\":\"{s}\"}}", .{bad_root});
+        const bad_add = try localAdditionForTest(a, bad_root);
         var bad_esc = Buf.init(a);
         try json.writeString(&bad_esc, bad_add);
         const body = try std.fmt.allocPrint(
@@ -6635,8 +6654,9 @@ test "buildMountsFromConfig skips broken records but keeps them visible to the a
 
     // 手写 storages（load 之后直接改内存副本即可 —— 这正是 buildMountsFromConfig
     // 的输入）：#1 合法；#2 未知驱动；#3 与 #1 同路径；#4 根目录不存在（init 失败）。
-    const good_add = try std.fmt.allocPrint(a, "{{\"root_folder_path\":\"{s}\"}}", .{data_dir});
-    const bad_add = try std.fmt.allocPrint(a, "{{\"root_folder_path\":\"{s}/missing\"}}", .{root});
+    // 路径一律走 `json.writeString` 转义（Windows 反斜杠会让手拼的 JSON 非法）。
+    const good_add = try localAdditionForTest(a, data_dir);
+    const bad_add = try localAdditionForTest(a, try std.fmt.allocPrint(a, "{s}/missing", .{root}));
     const records = try a.alloc(model.Storage, 4);
     records[0] = .{ .id = 1, .mount_path = "/a", .driver = "Local", .addition = good_add };
     records[1] = .{ .id = 2, .mount_path = "/b", .driver = "NoSuchDriver", .addition = "{}" };
@@ -6878,7 +6898,7 @@ test "fs/list + fs/get 的 path 对齐 Go JoinBasePath（空串=根；.. → 403
     const hdrs = try a.alloc(Header, 1);
     hdrs[0] = .{ .name = "Authorization", .value = auth };
 
-    const addition = try std.fmt.allocPrint(a, "{{\"root_folder_path\":\"{s}\"}}", .{data_dir});
+    const addition = try localAdditionForTest(a, data_dir);
     var add_esc = Buf.init(a);
     try json.writeString(&add_esc, addition);
     const create_body = try std.fmt.allocPrint(

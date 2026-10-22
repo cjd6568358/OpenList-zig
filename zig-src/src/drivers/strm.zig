@@ -1120,11 +1120,13 @@ test "strm SaveStrmToLocal writes .strm files locally (insert/sync)" {
     defer driver.fs_bridge = prev_bridge;
 
     const save_dir = try std.fmt.allocPrint(a, "{s}/strm-out", .{root});
-    const addition = try std.fmt.allocPrint(
-        a,
-        "{{\"paths\":\"/media/movies\",\"SaveStrmToLocal\":true,\"SaveStrmLocalPath\":\"{s}\",\"SaveLocalMode\":\"sync\"}}",
-        .{save_dir},
-    );
+    // 路径必须走 JSON 转义：Windows 下 save_dir 带反斜杠，`"{s}"` 手拼出来是
+    // 非法转义序列（本机 zig build test 踩到：json.InvalidEscape）。
+    var add_buf = Buf.init(a);
+    try add_buf.append("{\"paths\":\"/media/movies\",\"SaveStrmToLocal\":true,\"SaveStrmLocalPath\":");
+    try json.writeString(&add_buf, save_dir);
+    try add_buf.append(",\"SaveLocalMode\":\"sync\"}");
+    const addition = add_buf.slice();
     var parsed = try json.parse(a, addition);
     const drv = try factory.create(a, 4, &parsed);
     var ctx = driver.Ctx{ .alloc = a, .tag = "/strm" };
