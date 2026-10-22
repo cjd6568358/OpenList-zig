@@ -13,14 +13,16 @@
 >   需要原文用 `git show 7356589e:<path>` 取回（见 §38.5）。
 > - **待办以 `TODO.md` 为准**；功能边界见 §22。
 >
-> **当前基线（2026-10-19 22:44，构建 `160a8731eeac3327…`；含 itvsh 改名 `Itvsh`）**
+> **当前基线（2026-10-22，构建 `c90dd73e9bd2dfe6…`；含三个编译期可选变体收尾）**
 >
 > | 项 | 值 |
 > |---|---|
-> | 单元测试（打包机 10.0.0.4，全量驱动） | **411 / 411 通过** |
-> | 交叉编译（aarch64-linux-musl，`-lc -fstrip`） | 通过，产物 **1,260,808 B** |
-> | 真机 e2e（光猫，13 挂载点） | **464 通过 / 0 失败 / 1 跳过**（跳过 = 坚果云根目录 403 服务商规则） |
-> | 注册驱动 | **12 个注册项 / 11 个实现**（Quark+UC 共用 quarkuc.zig），12/12 真机覆盖 |
+> | 单元测试（打包机 10.0.0.4，全量驱动） | **451 / 451 通过** |
+> | 交叉编译（aarch64-linux-musl，`-lc -fstrip`） | 通过，产物 **1,320,952 B** |
+> | 本机构建（Windows zig 0.17.0） | ✅ 与打包机**逐字节相同**（§54.1）；本机测试 448 pass + 3 skip（Linux-only） |
+> | 真机 e2e（光猫，13 挂载点） | **464 通过 / 0 失败 / 1 跳过**（跳过 = 坚果云根目录 403 服务商规则；2026-10-18 基线，本轮未重跑全量 e2e） |
+> | 真机无凭据回归（`driver_matrix.py`） | 默认产物 **27/27**；点名产物（+3 变体）**14/14** |
+> | 注册驱动 | **15 个注册项 / 12 个实现**（Quark+UC 共用 quarkuc.zig，thunder 出 3 个 factory），12/12 真机覆盖；**另 3 个变体（`123 Open`/`QuarkOpen`/`115 Open`）编译期可选**，见 §53 |
 > | 上游错误透传（`ctx.err_detail`） | **8 个驱动**（quarkuc/quark/itvsh/pan115/cloud189/cloud189pc/aliyundrive/wopan） |
 > | 下载签名密钥 | `zig.token`（对齐 Go 的 `token` 设置；`reset_token` 会作废旧链接） |
 | **光猫生产实例** | **Zig 版持久部署**（2026-10-19 起，15244）：`/opt/armbian/bin/openlist/openlist` + `config.zig.json`，开机自启走重写版 `openlist_start.sh`；Go sqfs 镜像已删（见 §47） |
@@ -31,10 +33,11 @@
 
 - 用 Zig 重写 OpenList 兼容服务，塞进中兴 F4610U 光猫（aarch64 / musl / squashfs）。
 - **验收标准**：驱动全部写完 + 编译 + 真机验证。
-- **当前状态**：**12 个注册驱动 / 11 个实现**，全部真机覆盖；单元测试
-  **411/411**、交叉编译通过；真机 e2e（13 挂载）**464/0/1**。详见顶部基线表。
+- **当前状态**：**15 个注册项 / 12 个实现**，全部真机覆盖；另 3 个变体
+  （`123 Open`/`QuarkOpen`/`115 Open`）为**编译期可选**（§53）；单元测试
+  **451/451**、交叉编译通过；真机 e2e（13 挂载）**464/0/1**。详见顶部基线表。
 
-## 2. 驱动清单（12 个注册项 / 11 个驱动实现）
+## 2. 驱动清单（15 个注册项 / 12 个驱动实现 + 3 个编译期可选变体）
 
 | 驱动 | 注册名（= Go `driver.Config.Name`） | Zig 文件 | 真机验证 |
 |---|---|---|---|
@@ -52,9 +55,17 @@
 | STRM（其他挂载→.strm） | `Strm`（paths 行） | `strm.zig` | ✅ 2026-10-14 真机验证（挂载/列表/详情/内容/OnlyProxy 全链路） |
 | 迅雷云盘 | `Thunder`（用户名+密码，参数硬编码） | `thunder.zig` | ✅ 2026-10-20 真机（e2e 62/63，唯一失败项与驱动无关；§48.6） |
 | 迅雷云盘（专家） | `ThunderExpert`（`login_type`/`sign_type` 全可配） | `thunder.zig`（共用实现） | ✅ 2026-10-20 真机登录+列目录（§48.6.6） |
+| **123 开放平台**（可选） | `123 Open`（开发者密钥 / renewapi） | `123open.zig` | ⚠️ **编译期可选**（`opted()`，默认不进产物）：2026-10-22 真机「注册表+表单+哑凭据闭环」通过；**无真实凭据**，见 §53 |
+| **夸克开放平台**（可选） | `QuarkOpen`（refresh_token + sign_key） | `quark.zig` | ⚠️ 同上（§53） |
+| **115 开放平台**（可选） | `115 Open`（access/refresh_token） | `115open.zig` | ⚠️ 同上（§53） |
+
+> **"编译期可选"= 只有 `-Ddrivers=` 显式点名才注册**（`driver.zig` 的 `opted()`），
+> 默认 `zig build` / `-Ddrivers=all` 里**一个字节都不进**，前端下拉框也不会多出
+> 与 `123Pan` / `Quark` / `115 Cloud` 语义相近的重复入口（用户 2026-10-12 的指示）。
+> 构建与验证方式见 §53.5。
 
 **铁律**：`factory.key` 必须逐字节等于 Go 的 `driver.Config.Name`（即写进 `Storage.driver` 的字符串）。**不提供别名、不忽略大小写**（`Factory.aliases` 已于 2026-10-15 删除，见 §13.9）——配置按最新驱动名重新添加即可。
-**故意不实现 copy**：itvsh / 123 / quark 上游 `Copy` 即 `NotSupport`，Zig 故意把 vtable `.copy` 置 `null`，并有显式测试钉住「别顺手补上」。
+**故意不实现 copy**：itvsh / 123Pan / Quark / UC 上游 `Copy` 即 `NotSupport`，Zig 故意把 vtable `.copy` 置 `null`，并有显式测试钉住「别顺手补上」。（`123 Open` 与 `115 Open` 上游**有** Copy，Zig 已实现，见 §53.2。）
 
 > ⚠️ 覆盖口径（2026-10-18 更新）：**挂载点 ≠ 驱动数**。当前 e2e 有 **13 个挂载点**
 > （`/itvsh /koofr /123_2763 /123_5137 /aliyun /quark /ecloud_self /ecloud_family
@@ -102,15 +113,32 @@
 
 ## 5. 工程约定（硬规则）
 
-- **⚠️ 本地需要打包 / 编译时，务必一律走打包编译机 `10.0.0.4`（工作目录 `/tmp`，即 `tools/build_remote.py` 用的 `/tmp/olz-build`）—— 这是唯一交付路径。** 原因：本地机器**性能不行、磁盘空间不够**。打包机 Debian 13 x86_64，root/（口令见 ~/.olz_root_pwd）；zig 0.17.0 在 `/root/.cache`（只读使用）。**本机产物只能自测，不能当交付。**
+- **★ 本机 Zig 工具链已可用（2026-10-22 起）：`C:\Program Files\zig-x86_64-windows-0.17.0\zig.exe`。**
+  `zig build test` 与 `zig build -Dtarget=aarch64-linux-musl -Doptimize=small` 都能在本机跑，
+  且**交叉编译产物与打包机逐字节相同**（1,320,952 B / `c90dd73e…`，见 §54.4）。本机跑法：
+  ```bash
+  cd zig-src
+  python tools/ziglib_patch.py "C:/Program Files/zig-x86_64-windows-0.17.0/lib" C:/zigcache/olz-ziglib
+  ZIG_LIB_DIR=C:/zigcache/olz-ziglib \
+  ZIG_GLOBAL_CACHE_DIR=C:/zigcache/olz ZIG_LOCAL_CACHE_DIR=C:/zigcache/olz \
+  "C:/Program Files/zig-x86_64-windows-0.17.0/zig.exe" build test --summary all
+  ```
+  ⚠ 三个坑：① `--zig-lib-dir` **不是** `zig build` 的参数（0.17 报 unrecognized），要用
+  `ZIG_LIB_DIR` 环境变量；② 缓存目录必须显式给，否则会写进 `%APPDATA%`；
+  ③ 本机测试有 **3 条 Linux-only 用例跳过**（448 pass + 3 skip = 451），打包机是 451 pass。
+- **打包编译机 `10.0.0.4` 仍是可选路径**（`tools/build_remote.py`，工作目录 `/tmp/olz-build`）：
+  CI 式一条命令跑完 test + 交叉编译 + 取回，适合"本机没装工具链/想复现 Linux 侧结果"的场景。
+  打包机 Debian 13 x86_64，root/（口令见 ~/.olz_root_pwd）；zig 0.17.0 在 `/root/.cache`（只读使用）。
 - **★ 写盘边界（2026-10-21 与 `server` 仓库对齐的硬规则）：构建/调试只许写 `/tmp`，`/tmp` 以外一个字节都不落（除非显式指定）。**
   - 工具链本体**只读**：`/root/.cache/zig/zig`（0.17.0）只被 exec，不许往里写缓存。
   - zig 必须显式给缓存目录：`ZIG_GLOBAL_CACHE_DIR` **和** `ZIG_LOCAL_CACHE_DIR` 都指 `/tmp/olz-build/zigcache`（`build_remote.py` 已设）。**裸调 `/root/.cache/zig/zig` 而不设这两个变量，zig 会把缓存写进工具链目录 `/root/.cache/zig/{o,h,z}`**（实测一次 `zig cc` 就 +60 MB）。
   - 若以后还要编 Go（如 `wrapper/` 那套），一律先 `. /root/build-env.sh`：它把 `GOCACHE/GOMODCACHE/GOPATH/zig 缓存/npm 缓存` 全收进 `BUILD_ENV_STATE`（默认 `/tmp/.build-state`），`/root` 不落盘。
   - 编译机侧自检：`sh /root/check-layout.sh`（第 6 项直接打印写盘边界）。
   - 规则全文见 `D:\workspace\server 806\BUILD-ENV.md` §0.5.3。
-- **Zig 0.17.0 硬下界**。**本机当前没有 Zig 工具链**（`~/.workbuddy-ai/binaries/` 下只有 git/go/node/python），`zig test` 与交叉编译都只能在打包机跑 —— 一条命令走 `tools/build_remote.py`（打包源码 → 打包机 test → 交叉编译 → 取回，全包）。
-- **本机 D 盘不能 `zig build`**（maker.exe 无法在 D 盘建子进程）→ 一律 `zig build-exe`/`zig test` 直接调用 + 独立 `ZIG_GLOBAL_CACHE_DIR` + 非沙箱执行。
+- **Zig 0.17.0 硬下界**。本机与打包机都是 0.17.0（版本必须一致，否则产物不可比）。
+- **~~本机 D 盘不能 `zig build`~~（2026-10-22 已失效）**：装上正式工具链后 `zig build`
+  在本机（含 D 盘工作区）正常，maker.exe 不再报错 —— 前提是缓存目录指到 C 盘
+  （`ZIG_GLOBAL_CACHE_DIR`/`ZIG_LOCAL_CACHE_DIR=C:/zigcache/olz`），D 盘只剩 1.9 GB。
 - **每个驱动必须有单元测试**（`std.testing.allocator` 抓泄漏）。提交前 `zig test` 与交叉编译都要过。
 - **D 盘满 → 测试假报 NoSpaceLeft/泄漏**：先看磁盘，清理大头是 `openlist-zig/.zig-cache`（用 `cmd //c "rd /s /q"`，别用 Git Bash `rm -rf`）。
 - **单测全绿 ≠ 能编出二进制**（Zig 按函数惰性分析，未触发的路径不实例化）—— 流程必须 test → build 都过。
@@ -4077,3 +4105,233 @@ init_failed: InitFailure,
 
 新增三条：`device_id` 的 `!= 32` 阈值、`Link` 空直链、S3 MPU 未转义；
 并把头部 factory 表从「两个」改成「三个」。
+
+## 53. 三个"待验证"变体驱动收尾（123 Open / QuarkOpen / 115 Open，2026-10-22）
+
+**背景**：这三个驱动 2026-10-12 就写完了（含单测、能过 `zig build test`），
+但按当时的指示"代码保留但不注册"，之后一直停在"编译得过、单测能跑、没人真机
+碰过"的状态 —— 也就是**改造到一半搁置**。本轮把它们收尾成
+「编译期可选 + 可验证」，并在这个过程中抓出两个真 bug。
+
+### 53.1 注册机制：`opted()` —— 编译期可选，默认不进产物
+
+用户 2026-10-22 的指示是**只做编译期可选**（不要进默认构建、不要出现在前端
+驱动列表里），所以不能简单地把 `has()` 分支打开。做法：
+
+* `driver.zig`：把 `has()` 里的分词逻辑抽成 `nameInList()`，新增 `opted()`：
+  **只认显式点名**，`drivers_all`（默认全量构建）一律返回 false。
+  * `has()` = "全量构建里应该有我"（12 个主驱动）；
+  * `opted()` = "只有我名字出现在 `-Ddrivers=` 里才有我"（3 个变体）。
+* 三个变体改用 `opted("123open"/"quark"/"115open")` 注册；
+  `build.zig` 的 `DRIVERS` 表补三行（key 与 Go `Config.Name` 逐字节一致：
+  `123 Open` / `QuarkOpen` / `115 Open`）。
+* 结果：默认 `zig build` 仍是 **15 注册项 / 12 实现**，前端下拉框不变；
+  `-Ddrivers=local,123open,quark,115open` 点名时变成 18 项。
+* 单测：`nameInList` 纯函数 7 条断言（子串不算命中、空格容忍、`all` 不算名字）；
+  `opt-in variants stay out of the default (drivers_all) build` 在全量构建断言
+  三个 key 查不到、在点名构建 `SkipZigTest`；`find` 那条老测试里
+  `QuarkOpen` 从"无条件查不到"改成"跟随白名单"。
+
+### 53.2 补齐 `copy` 槽位（vtable 后来才加的可选项）
+
+三个文件头原本写着"`Copy` 不提供，vtable 里本来就没有 copy 槽位" —— 这句话
+在 `copy` 变成可选槽位（`driver.zig:128`）之后就过期了。逐条对齐 Go：
+
+| 驱动 | Go 实现 | Zig |
+|---|---|---|
+| `123 Open` | `driver.go:151-169`：用**源文件 etag** 调 `create`（duplicate=2）撞 MD5 秒传，命中即成功，否则 `NotSupport` | ✅ 同构。源是目录或列表记录无 `etag` 时直接 `NotSupported`（Go 那边也会失败，这里省掉一次必然失败的请求，**不清理半成品记录**也与 Go 一致） |
+| `115 Open` | `driver.go:279-289`：`sdk.Copy{CopyReq{PID, FileID, NoDupli:"1"}}` | ✅ `POST /open/ufile/copy`，form `pid`/`file_id`/`no_dupli=1`（端点取自 115-sdk-go v0.2.6 `const.go:30` + `fs.go:274-282`） |
+| `QuarkOpen` | `driver.go:129-131`：`return errs.NotSupport` | ✅ 槽位留空 + 单测钉住（与 pan123/quarkuc 同款） |
+
+顺带：`123open.zig` 的 `create()` 现在**内部**统一把 etag 降成小写
+（Go `upload.go:35` 的 `strings.ToLower`），因为 `copy()` 传进来的是列表记录里
+的原始 etag（可能大写），而上传路径传的是本地算好的小写 MD5。
+
+### 53.3 真机抓出的两个契约 bug（这轮最大的收获）
+
+**① `115 Open` 的 `addition_schema` 用了 Go 的字段名，而不是 json tag**
+
+schema 写的是 `AccessToken` / `RefreshToken`（照抄 Go **结构体字段名**），
+而 `Addition.parse()` 读的是 `access_token` / `refresh_token`（Go 的 **json tag**）。
+前端按 schema 渲染表单、提交同名字段 ⇒ parse 读不到 ⇒ `init` 恒 `NoToken`
+⇒ **从管理页添加这个驱动 100% 失败**，而这个驱动在代码层面"完全正确"。
+
+为什么单测没抓到：测试直接手写了小写键，绕过了 schema。
+修复后新增一致性测试（三个变体各一条）：把 `addition_schema` 的**每个键**
+填成 `"probe"` 拼成 addition 再交给 `parse()`，断言 token 字段真的读到了。
+真机对照：修前 `error_msg=NoToken`，修后 `error_msg=AuthFailed`（哑 token
+真的发到 115 的 `/open/user/info` 了）。
+
+**② `select` 的 `options` 写成 JSON 数组 ⇒ 前端下拉框是空的**
+
+Go 的 `driver.Item.Options` 是 **string**（`internal/driver/item.go:11`，
+值来自 struct tag `options:"a,b,c"`），前端按逗号 split。`api.zig` 的
+`writeAdditionalItems` 也只认字符串：数组会被静默写成 `"options":""`。
+
+真机实测（修前）：`QuarkOpen` / `Quark` / `UC` / `115 Cloud` / `AliyundriveOpen` /
+`189CloudPC` 的 select 全是空串 —— **5 个驱动 16 处**，其中 aliyun 与 189pc 是
+用户正在用的生产挂载（表现是排序方式/盘类型等下拉框只能用它自己填的默认值）。
+全部改成逗号串，并加通用单测
+`every addition_schema writes select options as a comma string`（遍历 `builtin`，
+出现 `"options":[` 直接红）。修后真机复查 17 个驱动：**0 个空 options**。
+
+### 53.4 验证
+
+| 项 | 结果 |
+|---|---|
+| 单测（全量构建） | **451 / 451** |
+| 单测（点名构建） | 450 pass + **1 skip**（skip 的就是"默认构建不含变体"那条，符合预期） |
+| 默认产物 | 1,320,952 B / `c90dd73e…` —— 比上一版小 80 B，原因是 16 处 options 从 `["a","b"]` 改成 `"a,b"`；**注册驱动集合未变（15 项）** |
+| 点名产物 | 1,407,936 B / `8edc4519…`（18 注册项，多 86,984 B = 三个变体的代码） |
+| 真机·默认产物 | `driver_matrix` **27/27**：15 注册项、12 驱动表单全渲染、**无 opt-in 泄漏**、4 个无凭据驱动添加闭环全绿 |
+| 真机·点名产物 | 18 注册项；三变体表单全渲染；哑凭据「添加 → errored → 删除」**14/14** |
+| 真机·options 复查 | 17 个驱动逐个查 `driver/info`，**空 options = 0** |
+
+⚠ **部署脚本坑（新）**：`deploy_device.py start` 是「先 SFTP 上传、再杀旧进程」，
+所以**覆盖正在运行的二进制**会报 `OSError: Failure`（ETXTBSY）。
+换二进制前必须先 `deploy_device.py stop`。
+
+### 53.5 怎么用
+
+```bash
+# 本机/打包机点名构建
+python tools/build_remote.py dist/openlist-aarch64-optin \
+    --drivers "local,webdav,itvsh,aliyundrive,cloud189,cloud189pc,pan123,quarkuc,pan115,wopan,strm,thunder,123open,quark,115open"
+
+# 真机验证三个变体（只跑它们，注册表仍按 expect 全量核对）
+python tools/driver_matrix.py http://192.168.1.1:15399 \
+    --user admin --password ... \
+    --expect "123 Open,QuarkOpen,115 Open" --only "123 Open,QuarkOpen,115 Open"
+```
+
+⚠ `-Ddrivers=` 的解析按 `,` **和空格**分词 ⇒ 只能传 Zig 文件名
+（`123open` / `quark` / `115open`），不能传带空格的 key（`123 Open` / `115 Cloud`）。
+`build.zig` 的 DRIVERS 表两种拼写都收，但带空格的那种在分词阶段就被拆碎了。
+
+**仍未做的**：三个变体都**没有真实凭据**（123 开放平台要开发者 ClientID/Secret
+或 renewtoken、QuarkOpen/115 Open 要 refresh_token），所以真机只到"注册表 +
+表单 + 哑凭据闭环"这一层。拿到凭据后按 `--only` 挂一个真实存储即可补全
+list/下载/上传/删除矩阵（与 §36 的流程一致）。
+
+## 54. 本机 Zig 工具链落地 + 用 10-16 备份重建测试实例（2026-10-22 下午）
+
+### 54.1 本机有工具链了，且产物与打包机逐字节相同
+
+用户装好了 `C:\Program Files\zig-x86_64-windows-0.17.0`。三条命令都验过：
+
+| 命令 | 结果 |
+|---|---|
+| `zig build test` | **448 pass + 3 skip**（3 条 Linux-only 用例在 Windows 跳过；总数 451 与打包机一致） |
+| `zig build -Dtarget=aarch64-linux-musl -Doptimize=small` | 成功，**1,320,952 B / `c90dd73e…`** |
+| 与打包机产物比对 | **sha256 完全相同** ⇒ 本机可产出交付件，构建可复现 |
+
+三个必须记住的点：
+
+1. `--zig-lib-dir` **不是** `zig build` 的参数（0.17 直接报 `unrecognized argument`），
+   要用环境变量 `ZIG_LIB_DIR`；
+2. 必须先跑 `tools/ziglib_patch.py <toolchain>/lib <dst>` 生成打过 TLS 补丁的 std 副本
+   （否则夸克那条 ECDSA 路径在产物里就没了），脚本本机可直接跑（argv 收 src/dst）；
+3. 缓存目录必须显式给（`ZIG_GLOBAL_CACHE_DIR` + `ZIG_LOCAL_CACHE_DIR` 同指
+   `C:/zigcache/olz`），D 盘只剩 1.9 GB。
+
+### 54.2 本机跑测试抓出 4 处"手拼 JSON 塞 Windows 路径"的测试缺陷
+
+第一次本机 `zig build test` 红在 3 个用例（2 fail + 1 crash），全是同一类：
+
+```
+[ERROR] storage #1 Local: addition is not valid JSON
+json.InvalidEscape ← strm.zig:1128  json.parse(a, addition)
+```
+
+根因：测试用 `allocPrint("{{\"root_folder_path\":\"{s}\"}}", .{tmp_dir})` 手拼
+addition，Linux 下 `tmp_dir` 是 `/tmp/xxx`（安全），Windows 下是 `D:\...` ——
+`\U`、`\t` 被当成转义序列 ⇒ 非法 JSON。这正是项目"手拼 JSON"那条老教训的又一次
+现形，只不过以前只在 Linux 跑所以一直潜伏。
+
+修法：统一走 `json.writeString` 转义。`api.zig` 新增测试辅助
+`localAdditionForTest()`（4 处调用点），`strm.zig` 的 fixture 改成 `Buf` + `writeString`。
+修完本机 448 pass + 3 skip，打包机 451 pass。
+
+### 54.3 用 `openlist_backup_2026_10_16` 重建测试实例：9/10 挂载还活着
+
+`merge_import.py` 合并 10 个存储（`/itvsh` 因 10-19 改名被跳过，手工把 driver 改成
+`Itvsh` 补回），`--keep-config` 重启后逐个查：
+
+| 挂载 | 驱动 | 状态 | 列表 |
+|---|---|---|---|
+| /123_2763 /123_5137 | 123Pan | work | 200，真实目录 |
+| /aliyun | AliyundriveOpen | work | 200（token 自动刷新成功） |
+| /ecloud_self /ecloud_family | 189CloudPC | work | 200，13 / 6 条 |
+| /hikvision | Local | work | 200（`/media/camera/hikvision`） |
+| /jianguo /koofr | WebDav | work | 200，37 / 7 条 |
+| /quark | Quark | work | 200，16 条 |
+| **/itvsh** | Itvsh | **errored** | `ConfiguredTokenExpired` |
+
+**`/itvsh` 这条不是 bug，也不需要改源码**：Go `drivers/itvsh/driver.go:106-131`
+同构 —— `AccessToken` 非空时**不登录**，直接 `refreshUserInfo`；失败就报
+"token 过期请手动更新"。10-16 备份里的那枚 token 早已过期。
+
+**修法 = 改配置，不是改代码**：把 addition 里的 `access_token` 清空（`""`），
+驱动就走手机号+密码登录。改完真机验证：`/itvsh` **work**，列表 7 项真实目录
+（家庭共享 / Music / 智能相册 / backup / 天翼看家 …），
+`e2e_test.py --mounts itvsh --write-cloud` **71 通过 / 0 失败 / 0 跳过**。
+
+> 曾试过在驱动里加"token 失效时降级到账密登录"的自愈逻辑（`shouldFallbackToPassword`），
+> 写完单测后**已撤销** —— 那是对 Go 的行为分歧，而项目铁律是"核心行为对齐 Go，不得自创"；
+> 配置层一行 `access_token: ""` 就解决了，没必要为它引入分歧。教训：先问"这是配置问题还是代码问题"。
+
+> ⚠ 改设备 `cfg.json` **必须先停实例**：运行中的实例会把自己的内存副本回写覆盖
+> （本轮踩了一次，改了配置重启后 token 又回来了）。另：改完记得**把改后的对象写回文件再上传**，
+> 别"改了内存字典、上传了原始文件"（同轮踩的第二个低级错）。
+
+> 结论更正：`MEMORY`/`TODO` 里"凭据都过期了"的预期过于悲观 —— **10-16 的 cookie/token
+> 有 9 个至今有效**（Quark 的 `__puus`、123Pan 的账密、aliyun 的 refresh_token 都在自动续期）。
+
+### 54.4 回归结果（默认产物，本机交叉编译 + 设备部署）
+
+| 项 | 结果 |
+|---|---|
+| e2e（**11 个**真实挂载 + `--write-cloud`） | **389 通过 / 0 失败 / 2 跳过**（跳过 = ① `ecloud_self` 的 mkdir 上游最终一致性；② 坚果云根级目录 403 服务商规则。日志已覆盖 WebDAV 全协议、Range/416、条件请求、sign、边界与稳定性） |
+| UI smoke（前端钉 4.2.6，与生产一致） | **11/11** |
+| driver_matrix（同实例，11 存储） | **27/27**：注册表 15 项、表单 12/12、无 opt-in 泄漏、4 个无凭据驱动添加闭环 |
+| 单测（本机 Windows） | **448 pass + 3 skip**（3 条 Linux-only）；打包机 **451/451** |
+| 产物一致性 | 本机 / 打包机 / 设备部署三份**同为** 1,320,952 B / `c90dd73e…` |
+
+### 54.5 `@latest` 前端已经是 4.2.7，UI 脚本改成版本无关
+
+测试实例原先用 `cdn=@latest` + `web_version=rolling`，拉到的是 **4.2.7**，UI smoke
+有两处假失败：
+
+1. `未登录跳转到 /@login` —— 4.2.7 的登录页停在 `/`（SPA 内部路由），4.2.6 才是 `/@login?redirect=%2F`；
+2. `首页渲染挂载点 quark` —— 4.2.7 首页列表渲染更慢，固定等 3 s 不够。
+
+两处都不是本构建的回归（登录表单在、点击挂载点照常 200）。已把 `tools/ui_smoke.js`
+改成版本无关：登录判据 = `URL 命中 @login` **或** 登录表单已渲染；首页列表改成
+**最多 12 s 轮询**。改完 4.2.6 下 11/11；把 cdn 钉回 4.2.6 后与生产完全同构。
+
+> ⚠ 生产仍是**内嵌 4.2.6 外壳 + 4.2.6 资源**（`zig-src/docs/STATUS.md` §47/§53）。
+> 升 4.2.7 要同时换外壳（`tools/fetch_frontend_shell.py 4.2.7`）与 cdn 版本，别只改一个。
+
+### 54.6 清掉历史配置里的死 token（2026-10-22 17:15）
+
+**问题**：`/itvsh` 每次从 `openlist_backup_2026_10_16 13_53_16.json` 重建都会
+`ConfiguredTokenExpired` —— 那份备份的 storage #1 里躺着一枚 **32 位 hex 的
+`access_token`**（与上游 login 响应里的会话 token 同形），早已作废。它在配置里
+就"永远优先、永远失效"，每导入一次就污染一个新实例。
+
+**处理**：把备份里 `\"access_token\":\"d673b44e…\"` 就地清成 `\"\"`
+（`mobile`/`password` 保留，导入后走账密登录）。文件是 `.gitignore` 里的
+`*.json` 本地件，无需提交；改完复核整份备份仍是合法 JSON、12 个存储可解析。
+
+**同时核对了生产配置**（`/opt/armbian/bin/openlist/config.zig.json`，只读）：
+
+| 存储 | `access_token` | 结论 |
+|---|---|---|
+| `/itvsh` | 长度 0 | ✅ 早已干净（走账密） |
+| `/ecloud_self`、`/ecloud_family` | 32 | ✅ 正常：189pc 刷新后自己落盘，是**驱动管理的凭据**，不是污染 |
+| `/wo` | 36 | ✅ 正常：WoPan 刷新后落盘（同 §36B.3 的 `save()`） |
+
+**结论**：`access_token` 落盘本身不是问题（Go 同款，见 §54.3）；问题只在
+「**已作废的会话 token 被当成配置字段长期留着**」。判断标准：如果它是用户
+手填/历史遗留且已失效 → 清掉；如果是驱动刷新产物（189pc / WoPan / aliyun 等
+有 refresh 能力的）→ 必须留，否则每次重启都要重新刷新甚至丢令牌。

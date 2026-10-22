@@ -1,6 +1,9 @@
 # TODO — openlist-zig 待办清单
 
-> 最后更新：2026-10-18（审计修复两轮全部收官：§37.4 剩余项 + P3 + N1 落地，
+> 最后更新：2026-10-22（三个变体驱动收尾：`123 Open` / `QuarkOpen` / `115 Open`
+> 改成**编译期可选**并真机验证，过程中修掉 2 个契约 bug，见 STATUS.md §53）
+>
+> 上一版：2026-10-18（审计修复两轮全部收官：§37.4 剩余项 + P3 + N1 落地，
 > 构建 400/400、真机 e2e 92/92，审计文档整合进 docs/，见 STATUS.md §38）
 > **完成度**：P0 端点已补、功能边界已定案、驱动名/操作集对齐已复查、Go 配置导入工具已重写、
 > Quark 下载 502 真根因已修（`Link.header` 悬垂栈指针，见 STATUS.md §30）、
@@ -49,6 +52,7 @@
 | 重写 `tools/import_go_config.py` | ✅ 无损版 | 见 §4 |
 | Playwright 前端自动化 | ✅ 跑通（playwright-core + 系统 Chrome） | 见 §6 |
 | 迅雷云盘驱动（`Thunder` + `ThunderExpert`） | ✅ 2026-10-20 移植 + **真机**（e2e 62/63，分片上传通；431/431 单测） | STATUS.md §48 |
+| 三个"待验证"变体收尾（`123 Open` / `QuarkOpen` / `115 Open`） | ✅ 2026-10-22 编译期可选注册（`opted()`）+ 补 copy 槽位 + **真机抓出 2 个契约 bug**（115 Open 的 schema 键名、5 驱动 16 处 select options 写错）；451/451 单测、真机 27/27 + 14/14 | STATUS.md §53 |
 
 ---
 
@@ -237,6 +241,11 @@ python tools/import_go_config.py <backup.json> <out_config.json> \
   * `tasks`：**刻意不建模** —— 本构建无任务系统（离线下载/转存 worker 池），
     读了无处用；`root` 保留原始文档，save 时其余键原样带回，字段不会丢
     （已在 config.zig 写注释说明，属合理子集）。
+- **三个编译期可选变体缺真实凭据（2026-10-22 记）**：`123 Open`（开发者
+  ClientID/Secret 或 renewapi token）、`QuarkOpen`（refresh_token + sign_key）、
+  `115 Open`（access/refresh_token）。当前真机只到「注册表 + 表单 + 哑凭据
+  闭环」；拿到凭据后按 `driver_matrix.py --only ...` 挂真实存储补全
+  list/下载/上传/删除矩阵（流程同 §36）。构建方式见 STATUS.md §53.5。
 - ✅ **审计修复两轮全部收官（2026-10-18，见 STATUS §37/§38）**：
   §37.4 的未做项（M2 115 link header / M3 189pc 并发上传 / M4 UC 转码判据 /
   M6 itvsh 分片重试 / M13–M15/M17 api 四项 / P3 全部 / N1 匿名浏览）
@@ -261,7 +270,16 @@ python tools/import_go_config.py <backup.json> <out_config.json> \
   ⚠ **绝不能碰**（2026-10-15 误杀过一次，见 STATUS.md 事故记录）
 
 **本机**
-- 编译走打包机：`python tools/build_remote.py`（10.0.0.4，约 3–4.5 分钟）
+- **本机有 Zig 0.17.0 了（2026-10-22 起）**：`C:\Program Files\zig-x86_64-windows-0.17.0\zig.exe`，
+  产物与打包机**逐字节相同**（见 STATUS §54.1）。跑法：
+  ```bash
+  cd zig-src
+  python tools/ziglib_patch.py "C:/Program Files/zig-x86_64-windows-0.17.0/lib" C:/zigcache/olz-ziglib
+  ZIG_LIB_DIR=C:/zigcache/olz-ziglib ZIG_GLOBAL_CACHE_DIR=C:/zigcache/olz \
+  ZIG_LOCAL_CACHE_DIR=C:/zigcache/olz "C:/Program Files/zig-x86_64-windows-0.17.0/zig.exe" build test --summary all
+  ```
+  ⚠ `--zig-lib-dir` 不是 `zig build` 的参数（用 `ZIG_LIB_DIR`）；本机 3 条 Linux-only 用例会 skip
+- 也可以走打包机：`python tools/build_remote.py`（10.0.0.4，约 3–4.5 分钟，test+交叉编译+取回一条龙）
   ⚠ `zig build` 会吞掉 "All N tests passed."，判成功看 `--summary all` 里的 `test success`
 - 部署：`python tools/deploy_device.py start|status|stop|restart [--port 15399]`
   ⚠⚠ **`start`/`restart` 默认会用内置模板重写 `/tmp/olz/cfg.json`（storages 清空）**！
