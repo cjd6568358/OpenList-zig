@@ -602,15 +602,15 @@ const USAGE =
 
 const testing = std.testing;
 
-test "normalizeMountPath" {
+test "fixAndCleanPath" {
     // 实现已迁到 api.zig（挂载构建器需要它）；这里继续钉住行为。
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expectEqualStrings("/", try api.normalizeMountPath(a, ""));
-    try testing.expectEqualStrings("/", try api.normalizeMountPath(a, "/"));
-    try testing.expectEqualStrings("/nas", try api.normalizeMountPath(a, "/nas/"));
-    try testing.expectEqualStrings("/a/b", try api.normalizeMountPath(a, "//a//b"));
+    try testing.expectEqualStrings("/", try api.fixAndCleanPath(a, ""));
+    try testing.expectEqualStrings("/", try api.fixAndCleanPath(a, "/"));
+    try testing.expectEqualStrings("/nas", try api.fixAndCleanPath(a, "/nas/"));
+    try testing.expectEqualStrings("/a/b", try api.fixAndCleanPath(a, "//a//b"));
 }
 
 test "version string is non-empty" {

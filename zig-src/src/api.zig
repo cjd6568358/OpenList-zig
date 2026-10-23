@@ -323,14 +323,22 @@ pub const App = struct {
 // 挂载构建（启动 worker 与管理面增改删共用的唯一实现）
 // ---------------------------------------------------------------------------
 
-/// 归一挂载路径：cleanPath + 兜底 `/`。从 main.zig 迁来，两个调用方共用。
-pub fn normalizeMountPath(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
-    // 对齐 Go `utils.FixAndCleanPath`（pkg/utils/path.go:19-25），三步：
-    //   1. 反斜杠转正斜杠（Windows 风格写法）
-    //   2. 补前导 "/"
-    //   3. Clean
-    // 第 2 步由 `cleanPath` 保证（它恒以前导 / 输出，根为 "/" 而非 ""），
-    // 所以这里只需补第 1 步。
+/// Go `utils.FixAndCleanPath`（pkg/utils/path.go:19-25）的等价实现，三步：
+///   1. 反斜杠转正斜杠（Windows 风格写法）
+///   2. 补前导 "/"
+///   3. Clean（`.` / `..` / 重复斜杠）
+/// 第 2 步由 `cleanPath` 保证（它恒以前导 / 输出，根为 "/" 而非 ""），
+/// 所以这里只需补第 1 步。
+///
+/// 上游在同一个函数上做两类事，本工程也照用，不另起炉灶：
+///   * 挂载路径归一（存储增删改 / import）
+///   * **请求路径归一** —— `middlewares.PathParse`
+///     （server/middlewares/down.go:18-22）在 `Down` 验签**之前**就把它套在
+///     `/d/*path`、`/p/*path` 上，所以下载签名是对**清洗后**的路径计算的。
+///     顺序不能反：先清洗再验签。
+/// 名字沿用上游（`fixAndCleanPath`）；`drivers/strm.zig` 里另有一份同名的
+/// 私有副本，两者行为一致。
+pub fn fixAndCleanPath(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
     const folded = try a.dupe(u8, raw);
     for (folded) |*ch| {
         if (ch.* == '\\') ch.* = '/';
@@ -433,7 +441,7 @@ pub fn buildMountFromStorage(alloc: std.mem.Allocator, s: *const model.Storage) 
     return .{ .ok = .{
         .storage = s.*,
         .driver = drv,
-        .mount_path = try normalizeMountPath(alloc, s.mount_path),
+        .mount_path = try fixAndCleanPath(alloc, s.mount_path),
         .label = f.label,
     } };
 }
@@ -1435,11 +1443,14 @@ fn handleFsList(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const v = try parseBodyJson(a, req, res) orelse return;
     const raw_path = v.strAt("path") orelse "/";
-    // 对齐 Go `JoinBasePath`（pkg/utils/path.go:81-87）：
+    // 对齐 Go `JoinBasePath`（pkg/utils/path.go:81-87）—— fsread.go:81 的
+    // `user.JoinPath(req.Path)` 走的就是它，内部对 reqPath 做
+    // `FixAndCleanPath`：
     //   * 空串与 "/" 都表示根（cleanPath("") == "/"）；
     //   * 原始路径含 ".." 而规范化后不再含 → `errs.RelativePath`（403），
-    //     而不是让它一路走到 resolve 变成 404 —— 差的就是这个状态码。
-    const path = urlmod.cleanPath(a, raw_path) catch raw_path;
+    //     而不是让它一路走到 resolve 变成 404 —— 差的就是这个状态码；
+    //   * 第 1 步的反斜杠归一步骤此前漏了，用 `fixAndCleanPath` 补全。
+    const path = fixAndCleanPath(a, raw_path) catch raw_path;
     if (std.mem.indexOf(u8, raw_path, "..") != null and
         std.mem.indexOf(u8, path, "..") == null)
     {
@@ -1541,9 +1552,10 @@ fn handleFsGet(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const v = try parseBodyJson(a, req, res) orelse return;
     const raw_path = v.strAt("path") orelse "/";
-    // 同 `handleFsList`：对齐 Go `JoinBasePath`（空串=根；含 ".." 且规范化后
-    // 消失 → 403 RelativePath）。
-    const path = urlmod.cleanPath(a, raw_path) catch raw_path;
+    // 同 `handleFsList`：对齐 Go `JoinBasePath`（fsread.go:284 的
+    // `user.JoinPath`）—— 空串=根；含 ".." 且规范化后消失 → 403 RelativePath；
+    // 反斜杠同样要归一（此前只做 cleanPath，漏了第 1 步）。
+    const path = fixAndCleanPath(a, raw_path) catch raw_path;
     if (std.mem.indexOf(u8, raw_path, "..") != null and
         std.mem.indexOf(u8, path, "..") == null)
     {
@@ -2322,7 +2334,7 @@ fn handleAdminStorageCreate(app: *App, req: *http.Request, res: *http.Response) 
     const addition = (try additionStringFrom(a, v.getPath("addition"))) orelse
         return res.jsonError(400, "addition must be a JSON string or object");
     _ = json.parse(a, addition) catch return res.jsonError(400, "addition is not valid JSON");
-    const mount_path = try normalizeMountPath(a, raw_path);
+    const mount_path = try fixAndCleanPath(a, raw_path);
     const disabled = boolAt(&v, "disabled");
     const web_proxy = boolAt(&v, "web_proxy");
     const webdav_policy = normalizeWebdavPolicy(v.strAt("webdav_policy") orelse "");
@@ -2452,7 +2464,7 @@ fn handleAdminStorageUpdate(app: *App, req: *http.Request, res: *http.Response) 
             return res.jsonError(500, try std.fmt.allocPrint(a, "no driver named: {s}", .{elem.driver}));
         const raw_path = v.strAt("mount_path") orelse "";
         if (raw_path.len == 0) return res.jsonError(400, "mount_path is required");
-        const mount_path = try normalizeMountPath(a, raw_path);
+        const mount_path = try fixAndCleanPath(a, raw_path);
         for (cfg.storages) |*s| {
             if (s.id == id) continue;
             const existing = urlmod.cleanPath(a, s.mount_path) catch s.mount_path;
@@ -3253,7 +3265,7 @@ fn handleConfigImport(app: *App, req: *http.Request, res: *http.Response) !void 
                     try fails.append(try std.fmt.allocPrint(a, "{s}: addition is not valid JSON", .{raw_path}));
                     continue;
                 };
-                const mount_path = try normalizeMountPath(a, raw_path);
+                const mount_path = try fixAndCleanPath(a, raw_path);
                 // 文件内去重：同一路径取后出现的行。
                 var dup = false;
                 for (plan.slice()) |*p| {
@@ -3821,7 +3833,12 @@ fn handleDownload(app: *App, req: *http.Request, res: *http.Response, force_prox
     const a = req.arena;
     const prefix: usize = 3; // "/d/" or "/p/"
     const raw = req.path[prefix..];
-    const path = std.fmt.allocPrint(a, "/{s}", .{raw}) catch return res.errorPage(500, "out of memory");
+    // Go 的路由是 `g.GET("/d/*path", middlewares.PathParse, signCheck, ...)`
+    // （server/router.go:49-52）—— `PathParse` 先跑，`Down` 后跑。也就是
+    // rawPath 是 `utils.FixAndCleanPath(c.Param("path"))` 的结果，
+    // **签名是对清洗后的路径计算的**（server/common/sign.go 签的也是同一串）。
+    // 此前这里只做了 `"/" + raw`，漏了反斜杠归一与 Clean，与上游不同形。
+    const path = fixAndCleanPath(a, raw) catch return res.errorPage(500, "out of memory");
 
     // 鉴权（Go `middlewares.Down`）：`needSign` 时验签，四类失败 → 401
     // **HTML**（Go ErrorPage 真状态码语义）。无 sign 且无需签 → 直接放行
@@ -6211,6 +6228,52 @@ test "sign: /d/ is reachable without a token when the sign is valid" {
     };
     const res2 = try doRequestRaw(&app, a, &req2);
     try testing.expectEqual(@as(u16, 401), res2.status);
+}
+
+test "download: /d/ 先 FixAndCleanPath 再验签（对齐 PathParse → Down 的顺序）" {
+    // server/router.go:49 的中间件顺序是 `PathParse, signCheck, Down`，
+    // 所以 rawPath 是 `utils.FixAndCleanPath(c.Param("path"))` 的结果，
+    // **签名也是对清洗后的路径计算的**。此前这里只做 `"/" + raw`：
+    // 请求 `/d/local/./a.txt` 会拿 `/local/./a.txt` 去验签，与上游不同形
+    // （上游签的是 `/local/a.txt`）。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fe = try frontend_mod.initFromHtml(a, .{}, "");
+    defer fe.deinit();
+    var app = routingApp(a, fe);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const cfg_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{dir});
+    defer testing.allocator.free(cfg_path);
+    const prev = config.getOpt();
+    const tcfg = try config.load(testing.allocator, cfg_path);
+    defer tcfg.deinit();
+    config.setForTest(tcfg);
+    defer config.setForTest(prev);
+    tcfg.sign_all = true;
+
+    // 签名按**清洗后**的路径签 —— 这就是上游 `common.Sign` 签的那串。
+    const good = try signValue(a, app.jwt_secret, "/local/a.txt", 0);
+    var req = http.Request{
+        .arena = a,
+        .method = "GET",
+        .path = "/d/local/./a.txt",
+        .target = "/d/local/./a.txt",
+        .headers = try a.dupe(Header, &.{}),
+        .query = try std.fmt.allocPrint(a, "sign={s}", .{good}),
+    };
+    // 放行 ⇒ 一路走到 `fs.GetStorage` 失败 ⇒ 500 + "storage not found;
+    // rawPath: ..."。这条消息里的路径就是判据。
+    const res = try doRequestRaw(&app, a, &req);
+    try testing.expectEqual(@as(u16, 500), res.status);
+    const body = res.buf.slice();
+    try testing.expect(std.mem.indexOf(u8, body, "rawPath: /local/a.txt") != null);
+    // 未清洗的形态不该出现（说明真的过了 FixAndCleanPath，而不是原样透传）。
+    try testing.expect(std.mem.indexOf(u8, body, "/local/./a.txt") == null);
 }
 
 /// 直接驱动 `handle()`（含路由分发），返回响应。
