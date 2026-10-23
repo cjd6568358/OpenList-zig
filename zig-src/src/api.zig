@@ -6016,6 +6016,55 @@ test "sign: fs/get and fs/list fill a usable sign when sign_all is on" {
     try verifySign(&app, a, "/local/a.txt", s);
 }
 
+test "sign: a '+' in the path survives /d/ verification (regression)" {
+    // 线上实锤（2026-10-24，/ecloud_self）：文件名带 `+` 的 /d/ 直链恒被
+    // **自己签的名**拒绝（`sign invalid`）。根因是请求路径解码用了 form 语义
+    // （`+` → 空格），而签名是对**真实**路径（带 `+`）算的 —— 两侧 data 不同，
+    // HMAC 自然不等。`sign_all` 关掉后同一处错位再往下走一层，变成
+    // `object not found`（500）。修复见 `http.decodeRequestPath`。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fe = try frontend_mod.initFromHtml(a, .{}, "");
+    defer fe.deinit();
+    var app = routingApp(a, fe);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const cfg_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{dir});
+    defer testing.allocator.free(cfg_path);
+    const prev = config.getOpt();
+    const tcfg = try config.load(testing.allocator, cfg_path);
+    defer tcfg.deinit();
+    config.setForTest(tcfg);
+    defer config.setForTest(prev);
+    tcfg.sign_all = true;
+    tcfg.link_expiration = 0;
+
+    const path = "/ecloud_self/我的音乐/Trouble+Is+A+Friend.mp3";
+    // 这就是服务端签出来的值（`signForObj` 在 link_expiration=0 下的形态）。
+    const good = try signForObj(&app, a, false, path);
+    try testing.expect(std.mem.endsWith(u8, good, ":0"));
+    try verifySign(&app, a, path, good);
+
+    // 旧行为（把 '+' 折成空格）拿到的路径必须验不过 —— 这条断言就是 bug 本身。
+    const folded = "/ecloud_self/我的音乐/Trouble Is A Friend.mp3";
+    try testing.expectError(SignError.SignInvalid, verifySign(&app, a, folded, good));
+
+    // 走 `downloadAuthError` 这道真正的门：解码后的路径（保留 `+`）+ 查询里
+    // 的 sign ⇒ 放行。
+    var req_ok = http.Request{
+        .arena = a,
+        .method = "GET",
+        .path = path,
+        .target = "/d/ecloud_self/%E6%88%91%E7%9A%84%E9%9F%B3%E4%B9%90/Trouble+Is+A+Friend.mp3",
+        .headers = try a.dupe(Header, &.{}),
+        .query = try std.fmt.allocPrint(a, "sign={s}", .{good}),
+    };
+    try testing.expectEqual(@as(?DownloadAuthError, null), downloadAuthError(&app, &req_ok, path));
+}
+
 test "sign: /d/ rejects a bad sign and accepts a good one" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

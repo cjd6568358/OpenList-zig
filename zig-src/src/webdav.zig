@@ -772,7 +772,8 @@ fn destVpath(a: std.mem.Allocator, dest: []const u8) !?[]u8 {
     }
     if (eql(u8, path, "/dav")) return try a.dupe(u8, "/");
     if (std.mem.startsWith(u8, path, "/dav/")) path = path[4..];
-    return urlmod.decode(a, path) catch null;
+    // 路径语义：`+` 是字面加号（同 `http.zig` 的请求路径解码）。
+    return urlmod.decodePath(a, path) catch null;
 }
 
 /// Go `parseDepth`（webdav.go:881-891）：只认 "0" / "1" / "infinity"，

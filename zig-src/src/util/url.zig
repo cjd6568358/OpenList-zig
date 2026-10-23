@@ -68,7 +68,39 @@ pub fn encodeInto(b: *Buf, s: []const u8, set: EncodeSet) !void {
     }
 }
 
+/// Decode an `application/x-www-form-urlencoded` string: `+` means space.
+///
+/// Correct for **query values** (that is the only place the `+`-for-space
+/// convention exists, `Query.add` writes it for `.form`), and for the
+/// `sign=` query parameter on `/d/` / `/p/`.
 pub fn decode(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
+    return decodeWith(alloc, s, true);
+}
+
+/// Percent-decode a **URL path**. `+` is a literal plus.
+///
+/// RFC 3986 gives `+` no special meaning in a path — it is a sub-delim that
+/// stands for itself, and a plus is written `%2B` only when the producer
+/// chooses to escape it. The `+`-means-space rule belongs exclusively to
+/// `application/x-www-form-urlencoded` bodies, i.e. queries.
+///
+/// Go gets this right without thinking about it: `net/url` decodes
+/// `URL.Path` with `unescape(p, encodePath)` (no `+` handling) and only
+/// `URL.Query()` uses the `+`-aware `QueryUnescape`. So a file really named
+/// `Trouble+Is+A+Friend.mp3` keeps its pluses through `gin`'s `c.Param` and
+/// into `middlewares.Down`'s `rawPath`.
+///
+/// ⚠️ The distinction is load-bearing, not cosmetic: the download signature is
+/// computed over the *decoded* path (`server/common/sign.go`). Folding `+` to
+/// a space only on the verifying side makes the two disagree, and the server
+/// then answers `sign invalid` to a signature it produced itself — with
+/// `sign_all` off the same mismatch shows up one layer later as
+/// `object not found`. (Observed on the /ecloud_self mount, 2026-10-24.)
+pub fn decodePath(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
+    return decodeWith(alloc, s, false);
+}
+
+fn decodeWith(alloc: std.mem.Allocator, s: []const u8, plus_as_space: bool) ![]u8 {
     var b = Buf.init(alloc);
     defer b.deinit();
     var i: usize = 0;
@@ -87,8 +119,7 @@ pub fn decode(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
             };
             try b.appendByte(hi << 4 | lo);
             i += 3;
-        } else if (c == '+') {
-            // application/x-www-form-urlencoded: '+' means space.
+        } else if (c == '+' and plus_as_space) {
             try b.appendByte(' ');
             i += 1;
         } else {
@@ -323,6 +354,31 @@ test "encode/decode roundtrip" {
     const dec = try decode(a, enc);
     defer a.free(dec);
     try std.testing.expectEqualStrings("/a b/中文?x=1", dec);
+}
+
+test "decodePath keeps a literal '+' (regression: server rejected its own sign)" {
+    const a = std.testing.allocator;
+    // 路径语义：`+` 原样保留；`%2B` 才是加号、`%20` 才是空格。
+    const p = try decodePath(a, "/x/Trouble+Is+A+Friend.mp3");
+    defer a.free(p);
+    try std.testing.expectEqualStrings("/x/Trouble+Is+A+Friend.mp3", p);
+
+    const p2 = try decodePath(a, "/x/a%2Bb/%E6%88%91.mp3");
+    defer a.free(p2);
+    try std.testing.expectEqualStrings("/x/a+b/我.mp3", p2);
+
+    // `decode`（查询语义）仍然把 `+` 当空格 —— 两者不能合并。
+    const q = try decode(a, "sign=ab+cd");
+    defer a.free(q);
+    try std.testing.expectEqualStrings("sign=ab cd", q);
+
+    // 编码侧 `.path` 不转义 `+`，与 decodePath 真正互为逆运算。
+    const enc = try encode(a, "/x/Trouble+Is+A+Friend.mp3", .path);
+    defer a.free(enc);
+    try std.testing.expectEqualStrings("/x/Trouble+Is+A+Friend.mp3", enc);
+    const rt = try decodePath(a, enc);
+    defer a.free(rt);
+    try std.testing.expectEqualStrings("/x/Trouble+Is+A+Friend.mp3", rt);
 }
 
 test "path encode keeps separators" {

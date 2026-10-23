@@ -393,7 +393,8 @@ fn okProp(a: std.mem.Allocator, resp: *xml.Node) !?*xml.Node {
     /// the PROPFIND was issued against, used to derive the child's name.
     fn responseToObj(a: std.mem.Allocator, resp: *xml.Node, base_virt: []const u8, skip_hidden: bool) !?model.Obj {
         const href = resp.textOf("href") orelse return null;
-        const decoded = try urlmod.decode(a, href);
+        // `<href>` 是 URL 路径：`+` 是字面加号，不是空格。
+        const decoded = try urlmod.decodePath(a, href);
         // Strip a trailing slash so collection and file paths compare alike.
         const trimmed = std.mem.trimEnd(u8, decoded, "/");
         const name = urlmod.baseName(trimmed);

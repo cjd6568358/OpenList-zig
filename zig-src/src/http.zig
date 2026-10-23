@@ -497,6 +497,22 @@ fn appendHtmlEscaped(b: *Buf, s: []const u8) !void {
 // Server
 // ---------------------------------------------------------------------------
 
+/// Percent-decode the path component of a request target.
+///
+/// ⚠ Path semantics, **not** form semantics: `+` is a literal plus. `url.decode`
+/// folds `+` to a space, which is only correct for query values — and the
+/// download signature (`server/common/sign.go`) is computed over the *decoded*
+/// path, so folding `+` on the verifying side made the server answer
+/// `sign invalid` to signatures it had produced itself. Files literally named
+/// `Trouble+Is+A+Friend.mp3` were unreachable through `/d/` and `/p/`
+/// (observed on the /ecloud_self mount, 2026-10-24).
+///
+/// Exposed as a free function so the behaviour is pinned by a test without
+/// having to bind a socket and run a request through `Server.readRequest`.
+pub fn decodeRequestPath(a: std.mem.Allocator, raw_path: []const u8) ![]u8 {
+    return url.decodePath(a, raw_path);
+}
+
 /// `ctx` is whatever the embedder passed to `Server.init` — for this project,
 /// the `api.App`. Passing it explicitly rather than through a global keeps the
 /// server usable in tests without touching process state.
@@ -756,7 +772,7 @@ pub const Server = struct {
                 raw_path = "/";
             }
         }
-        req.path = try url.decode(a, raw_path);
+        req.path = try decodeRequestPath(a, raw_path);
 
         // --- headers ---
         var hs = List(Header).init(a);
@@ -1446,4 +1462,21 @@ fn burnStack() void {
     var junk: [16 * 1024]u8 = undefined;
     for (&junk) |*b| b.* = 0xAB;
     if (junk[0] == 0) burnStack(); // 防优化掉
+}
+
+test "request path decoding keeps a literal '+' (regression: sign invalid)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `/d/` 与 `/p/` 的路径都走这里。名字里带 '+' 的文件必须原样解出，
+    // 否则签名（对解码后的路径计算）必然对不上。
+    const p = try decodeRequestPath(a, "/d/ecloud_self/Trouble+Is+A+Friend.mp3");
+    try testing.expectEqualStrings("/d/ecloud_self/Trouble+Is+A+Friend.mp3", p);
+    // 真正的空格仍是 %20；%2B 才是加号。
+    const q = try decodeRequestPath(a, "/d/x/a%20b%2Bc.mp3");
+    try testing.expectEqualStrings("/d/x/a b+c.mp3", q);
+    // 中文（UTF-8 百分号转义）不受影响。
+    const r = try decodeRequestPath(a, "/d/%E6%88%91%E7%9A%84%E9%9F%B3%E4%B9%90/a.mp3");
+    try testing.expectEqualStrings("/d/我的音乐/a.mp3", r);
 }
