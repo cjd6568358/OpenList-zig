@@ -1563,7 +1563,7 @@ fn mustProxyForStorage(driver_key: []const u8) bool {
 /// Go `common.GenerateDownProxyURL`（server/common/proxy.go:151-163）。
 /// 没配 `down_proxy_url` 时返回**空串** —— 与上游一致（fsread.go:319 判
 /// `if rawURL == ""` 再回落本站 `/p`）。
-fn generateDownProxyURL(
+pub fn generateDownProxyURL(
     app: *App,
     a: std.mem.Allocator,
     storage: *const model.Storage,
@@ -1602,9 +1602,17 @@ fn apiUrlFor(app: *App, a: std.mem.Allocator, req: *http.Request) ![]const u8 {
         }
     }
     if (host.len == 0) return "";
-    const base = try std.fmt.allocPrint(a, "{s}://{s}", .{ if (proto.len > 0) proto else "http", host });
+    // Go base.go:19-22：`protocol := "http"; if r.TLS != nil ||
+    // r.Header.Get("X-Forwarded-Proto") == "https" { protocol = "https" }`
+    // —— 严格等值，不是"非空即用"：反代发 `HTTPS` / `h2` / `h2c` 时上游
+    // 恒产 `http://host`，Zig 若照抄头值会产出 `HTTPS://host` 这种怪 scheme。
+    const scheme: []const u8 = if (std.mem.eql(u8, proto, "https")) "https" else "http";
+    const base = try std.fmt.allocPrint(a, "{s}://{s}", .{ scheme, host });
     if (site.len == 0) return trimOneSlash(base);
-    return trimOneSlash(try urlmod.joinPath(a, base, site));
+    // Go 是 `stdpath.Join(host, api)` —— Join **自带 Clean**。host 里没有
+    // `.`/`..`，所以等价先把 site 自己 Clean 一遍再拼。
+    const site_clean = urlmod.cleanPath(a, site) catch site;
+    return trimOneSlash(try urlmod.joinPath(a, base, site_clean));
 }
 
 /// Go `strings.TrimSuffix(api, "/")` —— 只去**一个**尾部斜杠。
@@ -6401,6 +6409,15 @@ test "fs/get raw_url: GenerateDownProxyURL 逐字节对齐上游" {
     const sig = with_sign["http://down.example.com/local/a.txt?sign=".len..];
     try verifySign(&app, a, "/local/a.txt", sig);
 
+    // 钉住密钥：签名必须走 `signKey()`（`zig.token` 优先），不能是
+    // `app.jwt_secret` —— 否则 `/p/` 验签（`verifySign` 也走 signKey）
+    // 必然 SignInvalid。此前 webdav 的旧副本正是签错了钥匙。
+    app.sign_secret = "proxy-secret";
+    const signed2 = try generateDownProxyURL(&app, a, &st, "/local/a.txt");
+    const pfx = "http://down.example.com/local/a.txt?sign=";
+    try verifySign(&app, a, "/local/a.txt", signed2[pfx.len..]);
+    app.sign_secret = "";
+
     // DisableProxySign ⇒ 不带 sign。
     st.disable_proxy_sign = true;
     try testing.expectEqualStrings(
@@ -6452,6 +6469,40 @@ test "fs/get raw_url: 本站 URL 是绝对的（GetApiUrl）" {
         .query = "",
     };
     try testing.expectEqualStrings("https://wan.example.com", try apiUrlFor(&app, a, &req2));
+
+    // base.go:20 是**严格等值** `== "https"`：大写 / h2 / h2c 都落回 http。
+    var req3 = http.Request{
+        .arena = a,
+        .method = "GET",
+        .path = "/api/fs/get",
+        .target = "/api/fs/get",
+        .headers = try a.dupe(Header, &.{
+            .{ .name = "X-Forwarded-Proto", .value = "HTTPS" },
+            .{ .name = "Host", .value = "h.example.com" },
+        }),
+        .query = "",
+    };
+    try testing.expectEqualStrings("http://h.example.com", try apiUrlFor(&app, a, &req3));
+    req3.headers[0].value = "h2";
+    try testing.expectEqualStrings("http://h.example.com", try apiUrlFor(&app, a, &req3));
+
+    // site_url 非空但不以 http 开头 ⇒ `stdpath.Join(host, api)`（Join 自带
+    // Clean）。真机 site_url 为空，这条分支此前从没被执行过。
+    app.site_url = "/olz/";
+    var req4 = http.Request{
+        .arena = a,
+        .method = "GET",
+        .path = "/api/fs/get",
+        .target = "/api/fs/get",
+        .headers = try a.dupe(Header, &.{ .{ .name = "Host", .value = "192.168.1.1:15244" } }),
+        .query = "",
+    };
+    try testing.expectEqualStrings("http://192.168.1.1:15244/olz", try apiUrlFor(&app, a, &req4));
+    // Join 自带 Clean —— `..` 段要被吃掉。
+    app.site_url = "/a/../olz";
+    try testing.expectEqualStrings("http://192.168.1.1:15244/olz", try apiUrlFor(&app, a, &req4));
+    app.site_url = "";
+
     // 无 Host ⇒ 空串（上游 GetApiUrl 同形）。
     try testing.expectEqualStrings("", try apiUrlFor(&app, a, &req));
 }

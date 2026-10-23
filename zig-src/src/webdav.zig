@@ -315,26 +315,25 @@ fn getOrHead(app: *App, req: *http.Request, res: *http.Response, is_head: bool) 
             return webdavStatus(res, 500);
         };
         target = lk.url;
-    } else if (api.isWebdavPolicy(policy, "use_proxy_url") and
-        r.mount.storage.down_proxy_url.len > 0)
-    {
-        // 302 到存储配置的 `down_proxy_url`（编码后的路径，默认带签名）。
-        // Go `common.GenerateDownProxyURL`（server/common/proxy.go:146-159）。
-        // 上游在 URL 为空时会**退回 native 转发**，这里同样靠上面的条件
-        // 表达式落到 native 分支，不做 500。
-        var u = Buf.init(a);
-        // Go 取 `strings.Split(DownProxyURL, "\n")[0]` —— 配置里常写多行做
-        // 负载分担，只用第一行。
-        const base = r.mount.storage.down_proxy_url;
-        const nl = std.mem.indexOfScalar(u8, base, '\n');
-        try u.append(if (nl) |i| base[0..i] else base);
-        try u.append(try urlmod.encode(a, vpath, .path));
-        if (!r.mount.storage.disable_proxy_sign) {
-            try u.append("?sign=");
-            try u.append(try api.signValue(a, app.jwt_secret, vpath, 0));
+    } else if (api.isWebdavPolicy(policy, "use_proxy_url")) {
+        // 302 到存储配置的 `down_proxy_url`。
+        // Go `server/webdav/webdav.go:266-272`：
+        //   if storage.GetStorage().WebdavProxyURL() {
+        //     if url := common.GenerateDownProxyURL(...); url != "" {
+        //       w.Header().Set("Cache-Control", "max-age=0, no-cache, no-store, must-revalidate")
+        //       http.Redirect(w, r, url, 302); return } }
+        // —— 空串（没配 down_proxy_url）就**落到下面的 native 转发**，不 500。
+        //
+        // ⚠ 必须调 api 层那一份忠实实现，不能在这里另拼：此前这份副本有
+        // 三处与上游不符 —— ① 用 `app.jwt_secret` 签名，而 `/p/`、`/d/` 的
+        // 验签走 `signKey()`（`zig.token` 优先）⇒ 两把钥匙不同，302 出去的
+        // `?sign=` 必然 SignInvalid 401；② expire 硬编码 0，上游读
+        // `link_expiration`；③ 编码用 `.path` 宽集，上游是 `EncodePath(true)`。
+        const u = try api.generateDownProxyURL(app, a, &r.mount.storage, vpath);
+        if (u.len > 0) {
+            try res.set("Cache-Control", "max-age=0, no-cache, no-store, must-revalidate");
+            target = u;
         }
-        try res.set("Cache-Control", "max-age=0, no-cache, no-store, must-revalidate");
-        target = try u.toOwned();
     }
     if (target) |t| {
         try res.redirect(t, 302);
