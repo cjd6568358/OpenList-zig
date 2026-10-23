@@ -885,6 +885,9 @@ pub const factory = driver.Factory{
 /// 只注册 `Quark` 时，用户配置里 `driver:"UC"` 的存储会报"驱动不存在"。
 pub const uc_factory = driver.Factory{
     .key = "UC",
+    // Go drivers/quark_uc/meta.go:45 —— 只有 UC 变体 OnlyProxy，
+    // Quark 变体（meta.go:36）不设 ⇒ MustProxy=false。
+    .only_proxy = true,
     .label = "UC网盘",
     .secrets = &.{"cookie"},
     .addition_schema = addition_schema,

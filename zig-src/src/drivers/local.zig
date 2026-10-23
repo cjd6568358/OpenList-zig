@@ -775,6 +775,9 @@ pub const factory = driver.Factory{
     .key = "Local",
     .label = "本地存储",
     .secrets = &.{},
+    // Go drivers/local/meta.go:24,27 —— OnlyProxy + NoLinkURL ⇒ MustProxy。
+    .only_proxy = true,
+    .no_link_url = true,
     // 表单 schema：键名与 Go `drivers/local/meta.go` 的 json tag 一致
     // （`root_folder_path` 来自内嵌的 `driver.RootPath`）。
     // `follow_symlinks` 是本工程的安全扩展字段，Go 的 Addition 里没有。

@@ -300,6 +300,18 @@ pub const Factory = struct {
     addition_schema: []const u8,
     /// Config keys that must be redacted before echoing config back.
     secrets: []const []const u8,
+    /// Go `driver.Config.OnlyProxy`（internal/driver/config.go:6）。
+    ///
+    /// 与 `no_link_url` 合起来决定 `Config.MustProxy()`，后者是
+    /// `fs/get` 的 raw_url 走 `/p` 还是走直链的第一判据
+    /// （server/handles/fsread.go:314）。上游置 true 的：Local、Strm、
+    /// Itvsh、UC、QuarkOpen、Virtual、Weiyun、Mega、ProtonDrive、SFTP、
+    /// SMB、FTP、Crypt、Chunk、Chaoxing、GoogleDrive/Photo、HalalCloud。
+    only_proxy: bool = false,
+    /// Go `driver.Config.NoLinkURL`（internal/driver/config.go:25，"驱动返回的
+    /// Link 不带 URL"）。上游置 true 的：Local、Strm、Virtual、Chunk、Crypt、
+    /// FTP、HalalCloud、Mega、ProtonDrive、SFTP、SMB。
+    no_link_url: bool = false,
     /// `storage_id` is the real id of the `Storage` row being constructed.
     ///
     /// 驱动用它把刷新后的 token / cookie / forwardUrl 写回配置文件（见
@@ -310,6 +322,11 @@ pub const Factory = struct {
     /// `cfg` is the parsed `addition` object, or null when the storage has an
     /// empty/missing `addition` — drivers must tolerate both.
     create: *const fn (alloc: std.mem.Allocator, storage_id: i64, cfg: ?*const json.Value) anyerror!Driver,
+
+    /// Go `Config.MustProxy()`（internal/driver/config.go:42-44）。
+    pub fn mustProxy(self: Factory) bool {
+        return self.only_proxy or self.no_link_url;
+    }
 };
 
 /// Built-in driver table. Explicit rather than self-registering: Zig has no

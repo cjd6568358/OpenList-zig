@@ -450,7 +450,7 @@ pub const Strm = struct {
         req_headers: []const model.Header,
     ) ![]const u8 {
         var final: []const u8 = orig_path;
-        if (self.a.encode_path) final = try pathEscape(a, orig_path);
+        if (self.a.encode_path) final = try urlmod.pathEscape(a, orig_path);
         if (self.a.with_sign) {
             const sig = if (driver.fs_bridge) |b|
                 try b.sign(b.ctx, a, orig_path)
@@ -823,24 +823,6 @@ fn dirnameOf(path: []const u8) []const u8 {
 /// 的逐段调用保留。保留：unreserved（含 `-_.~`）与 `$ & + : = @`；
 /// 其余（空格、`!'()*`、`%;?#/,`）转义。注意与 `urlmod.encode(.path)` 不同
 /// —— 那个还保留 `!'()*;,`。
-fn pathEscape(a: std.mem.Allocator, path: []const u8) ![]const u8 {
-    var b = Buf.init(a);
-    const hex = "0123456789ABCDEF";
-    for (path) |c| {
-        const keep = c == '/' or std.ascii.isAlphanumeric(c) or switch (c) {
-            '-', '_', '.', '~', '$', '&', '+', ':', '=', '@' => true,
-            else => false,
-        };
-        if (keep) {
-            try b.appendByte(c);
-        } else {
-            try b.appendByte('%');
-            try b.appendByte(hex[c >> 4]);
-            try b.appendByte(hex[c & 0x0F]);
-        }
-    }
-    return b.toOwned();
-}
 
 // ---------------------------------------------------------------------------
 // Factory
@@ -850,6 +832,9 @@ pub const factory = driver.Factory{
     .key = "Strm",
     .label = "STRM",
     .secrets = &.{},
+    // Go drivers/strm/meta.go:33,37 —— OnlyProxy + NoLinkURL ⇒ MustProxy。
+    .only_proxy = true,
+    .no_link_url = true,
     // 表单 schema：键名与 Go meta.go:14-28 的 json tag 逐字节一致
     //（包括大写开头的 PathPrefix / SaveStrmToLocal / SaveStrmLocalPath /
     // SaveLocalMode / Version —— Go 的 tag 就这么写）。
@@ -976,12 +961,12 @@ test "strm pathEscape mirrors Go url.PathEscape (segment mode)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expectEqualStrings("a%20b+c.mp4", try pathEscape(a, "a b+c.mp4"));
-    try testing.expectEqualStrings("x%281%29.mp4", try pathEscape(a, "x(1).mp4"));
-    try testing.expectEqualStrings("note%21.mp4", try pathEscape(a, "note!.mp4"));
+    try testing.expectEqualStrings("a%20b+c.mp4", try urlmod.pathEscape(a, "a b+c.mp4"));
+    try testing.expectEqualStrings("x%281%29.mp4", try urlmod.pathEscape(a, "x(1).mp4"));
+    try testing.expectEqualStrings("note%21.mp4", try urlmod.pathEscape(a, "note!.mp4"));
     // 保留字符：$ & + : = @ 与分隔符 / 原样。
-    try testing.expectEqualStrings("a$b&c+d:e=f@g.mp4", try pathEscape(a, "a$b&c+d:e=f@g.mp4"));
-    try testing.expectEqualStrings("/media/movies/Movie%20One.mp4", try pathEscape(a, "/media/movies/Movie One.mp4"));
+    try testing.expectEqualStrings("a$b&c+d:e=f@g.mp4", try urlmod.pathEscape(a, "a$b&c+d:e=f@g.mp4"));
+    try testing.expectEqualStrings("/media/movies/Movie%20One.mp4", try urlmod.pathEscape(a, "/media/movies/Movie One.mp4"));
 }
 
 test "strm full chain: list root, list dir, .strm conversion, details, link text" {

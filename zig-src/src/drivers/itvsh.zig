@@ -1558,6 +1558,8 @@ pub const factory = driver.Factory{
     // "Itvsh"（原中文名「上海电信智家硬盘」），两侧同步、逐字节一致。
     .key = "Itvsh",
     .label = "上海电信智家硬盘",
+    // Go drivers/itvsh/meta.go:43 —— OnlyProxy ⇒ MustProxy。
+    .only_proxy = true,
     // secrets 同时收两种拼写：Go 无 tag 字段以字段名为键（`Cookies`），
     // 本工程早期版本写的是 snake_case（`cookies`）—— 回显脱敏两种都要挡。
     .secrets = &.{ "password", "access_token", "Cookies", "cookies" },

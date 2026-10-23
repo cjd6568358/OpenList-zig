@@ -130,6 +130,38 @@ fn decodeWith(alloc: std.mem.Allocator, s: []const u8, plus_as_space: bool) ![]u
     return b.toOwned();
 }
 
+/// Go `utils.EncodePath(path, true)`（pkg/utils/path.go:58-79）：按 `/` 切段，
+/// 每段交给 `url.PathEscape`，再用 `/` 拼回去。
+///
+/// `url.PathEscape` 的放过集合（Go `net/url.shouldEscape` 的
+/// `encodePathSegment` 分支）只有：字母数字、`-` `_` `.` `~` 和
+/// `$ & + : = @`。注意 `! ' ( ) * , ;` 在 Go 里**是会被转义的** ——
+/// `EncodeSet.path` 比它宽，不要混用（本工程的 `.path` 编码集为了兼容驱动侧
+/// 历史写法保留了这些字符，`fs/get` 的 raw_url 与 Strm 的 `.strm` 内容必须
+/// 用这一个，与上游逐字节一致）。
+///
+/// `+` 在路径段里不被转义 —— 与 `decodePath` 真正互为逆运算。
+pub fn pathEscape(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
+    var b = Buf.init(alloc);
+    defer b.deinit();
+    const hex = "0123456789ABCDEF";
+    // 逐字符与「切段再拼」等价：`/` 是分段符，两边都原样保留。
+    for (s) |c| {
+        const keep = c == '/' or std.ascii.isAlphanumeric(c) or switch (c) {
+            '-', '_', '.', '~', '$', '&', '+', ':', '=', '@' => true,
+            else => false,
+        };
+        if (keep) {
+            try b.appendByte(c);
+        } else {
+            try b.appendByte('%');
+            try b.appendByte(hex[c >> 4]);
+            try b.appendByte(hex[c & 0x0F]);
+        }
+    }
+    return b.toOwned();
+}
+
 fn hexVal(c: u8) ?u8 {
     return switch (c) {
         '0'...'9' => c - '0',

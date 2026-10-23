@@ -1078,6 +1078,8 @@ fn hashSource(arena: std.mem.Allocator, src: model.Source) !struct { md5: [16]u8
 pub const factory = driver.Factory{
     .key = "QuarkOpen",
     .label = "夸克网盘开放平台",
+    // Go drivers/quark_open/meta.go:31 —— OnlyProxy ⇒ MustProxy。
+    .only_proxy = true,
     .secrets = &.{ "access_token", "refresh_token", "app_id", "sign_key" },
     .addition_schema =
     \\{

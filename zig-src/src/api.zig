@@ -579,8 +579,10 @@ fn bridgeLink(ctx: *anyopaque, alloc: std.mem.Allocator, path: []const u8, args:
 
 fn bridgeSign(ctx: *anyopaque, alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
     const app = bridgeCtx(ctx);
-    // Go `sign.Sign(path)` = SignWithExpire(path, 0)（永不过期）。
-    return signValue(alloc, signKey(app), path, 0);
+    // Go `internal/sign.Sign`（sign.go:12-19）—— **会**读 `link_expiration`，
+    // 不是"永不过期"。Strm 的 `withSign`（util.go:114-116）走的就是它，
+    // 所以 `link_expiration != 0` 时 .strm 里的链接也会过期，与上游同形。
+    return signPath(app, alloc, path);
 }
 
 /// 下载签名密钥：`zig.token`（Go 的 `token` 设置），空串时回退 jwt_secret。
@@ -1548,6 +1550,68 @@ fn listRoot(app: *App, res: *http.Response, page: i64, per_page: i64) !void {
     try res.jsonOkRaw(b.slice());
 }
 
+/// Go `storage.Config().MustProxy()`（server/handles/fsread.go:314 的第一判据，
+/// 定义见 internal/driver/config.go:42-44）。
+///
+/// 判据是**驱动声明**（`OnlyProxy || NoLinkURL`），不是某次 `link` 的结果 ——
+/// 上游在这里不看 Link 上的任何标志。
+fn mustProxyForStorage(driver_key: []const u8) bool {
+    const f = driver.find(driver_key) orelse return false;
+    return f.mustProxy();
+}
+
+/// Go `common.GenerateDownProxyURL`（server/common/proxy.go:151-163）。
+/// 没配 `down_proxy_url` 时返回**空串** —— 与上游一致（fsread.go:319 判
+/// `if rawURL == ""` 再回落本站 `/p`）。
+fn generateDownProxyURL(
+    app: *App,
+    a: std.mem.Allocator,
+    storage: *const model.Storage,
+    path: []const u8,
+) ![]const u8 {
+    if (storage.down_proxy_url.len == 0) return "";
+    // Go `strings.Split(s, "\n")[0]` —— 多行只取第一行。
+    const base = if (std.mem.indexOfScalar(u8, storage.down_proxy_url, '\n')) |i|
+        storage.down_proxy_url[0..i]
+    else
+        storage.down_proxy_url;
+    const enc = try urlmod.pathEscape(a, path);
+    if (storage.disable_proxy_sign) return std.fmt.allocPrint(a, "{s}{s}", .{ base, enc });
+    // `?sign=` + `sign.Sign(reqPath)`（**不看 sign_all**）。
+    return std.fmt.allocPrint(a, "{s}{s}?sign={s}", .{ base, enc, try signPath(app, a, path) });
+}
+
+/// Go `common.GetApiUrl(c)`（值由中间件按 `GetApiUrlFromRequest` 算出，
+/// server/common/base.go:13-31）：SiteURL 以 http 开头就直接用；否则取请求的
+/// scheme://Host（优先 X-Forwarded-Proto / X-Forwarded-Host）再拼上 SiteURL。
+/// 取不到 Host 时上游返回空串，这里同形。
+fn apiUrlFor(app: *App, a: std.mem.Allocator, req: *http.Request) ![]const u8 {
+    const site = app.site_url;
+    if (std.mem.startsWith(u8, site, "http://") or std.mem.startsWith(u8, site, "https://")) {
+        return trimOneSlash(site);
+    }
+    var host: []const u8 = "";
+    var proto: []const u8 = "";
+    for (req.headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "X-Forwarded-Host")) {
+            host = h.value;
+        } else if (std.ascii.eqlIgnoreCase(h.name, "Host") and host.len == 0) {
+            host = h.value;
+        } else if (std.ascii.eqlIgnoreCase(h.name, "X-Forwarded-Proto")) {
+            proto = h.value;
+        }
+    }
+    if (host.len == 0) return "";
+    const base = try std.fmt.allocPrint(a, "{s}://{s}", .{ if (proto.len > 0) proto else "http", host });
+    if (site.len == 0) return trimOneSlash(base);
+    return trimOneSlash(try urlmod.joinPath(a, base, site));
+}
+
+/// Go `strings.TrimSuffix(api, "/")` —— 只去**一个**尾部斜杠。
+fn trimOneSlash(s: []const u8) []const u8 {
+    return if (std.mem.endsWith(u8, s, "/")) s[0 .. s.len - 1] else s;
+}
+
 fn handleFsGet(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const v = try parseBodyJson(a, req, res) orelse return;
@@ -1582,27 +1646,38 @@ fn handleFsGet(app: *App, req: *http.Request, res: *http.Response) !void {
     // raw_url，不带 sign 的 `/p` 在 sign_all 部署下会被 401（实测踩过）。
     const sign_val = try signForObj(app, a, f.is_dir, path);
 
+    // Go `server/handles/fsread.go:314-341` 逐分支对齐：
+    //   * 判据是**存储/驱动级**的 `storage.Config().MustProxy() ||
+    //     storage.WebProxy`，不是 Link 上的标志 —— 前者是驱动声明
+    //     （internal/driver/config.go:42：`OnlyProxy || NoLinkURL`），
+    //     后者是"这次 link 好不好直连"；上游在这里只看前者。
+    //   * MustProxy/WebProxy 成立时先试 `GenerateDownProxyURL`（配置的
+    //     down_proxy_url），拿不到才回本站 `/p`。
+    //   * 本站 URL 是**绝对**的（`common.GetApiUrl(c)` + "/p" + ...）。
+    //   * 否则走 `model.GetUrl(obj)`，再否则 `fs.Link(Redirect:true).URL`。
+    //     本工程没有驱动实现 `model.Obj` 的 URL 接口（上游只有 url_tree/
+    //     chunk 这类"只存索引"的驱动会），所以只剩 Link 一支。
+    //   * 路径编码是 `utils.EncodePath(reqPath, true)`，不是 `.path` 宽集。
     var raw_url: []const u8 = "";
     if (!f.is_dir) {
-        // A05：把调用方的请求头交给驱动。115 按 User-Agent 下发下载链接，部分
-        // 网盘要求 Referer —— 空 LinkArgs 拿到的 URL 前端直接用不了。
-        const lk = r.mount.driver.link(&ctx, r.rel, .{ .headers = req.headers }) catch |e| {
-            log.warn("api: link {s} failed: {s}", .{ path, @errorName(e) });
-            return mapDriverError(res, e, &ctx);
-        };
-        // 与 Go `server/handles/fsread.go:318-339` 一致：需要服务端代理的
-        // （或本地文件）给出本站 `/p` 可鉴权 URL，不能把带 Cookie 才能用的
-        // CDN 地址直接丢给浏览器；只有真正可直链的才回上游 URL。
-        // 带 sign 的方式对齐 Go `common.GenerateDownProxyURL`
-        // （server/common/proxy.go:31-33：`?sign=` + `sign.Sign(reqPath)`）；
-        // 路径编码对齐 `utils.EncodePath(reqPath, true)`（`.path` 保留 `/`）。
-        if (lk.proxy or lk.local_path != null) {
-            const enc = try urlmod.encode(a, path, .path);
-            raw_url = if (sign_val.len == 0)
-                try std.fmt.allocPrint(a, "/p{s}", .{enc})
-            else
-                try std.fmt.allocPrint(a, "/p{s}?sign={s}", .{ enc, sign_val });
+        if (mustProxyForStorage(r.mount.storage.driver) or r.mount.storage.web_proxy) {
+            const down = try generateDownProxyURL(app, a, &r.mount.storage, path);
+            raw_url = if (down.len > 0) down else blk: {
+                const api = try apiUrlFor(app, a, req);
+                const enc = try urlmod.pathEscape(a, path);
+                break :blk if (sign_val.len == 0)
+                    try std.fmt.allocPrint(a, "{s}/p{s}", .{ api, enc })
+                else
+                    try std.fmt.allocPrint(a, "{s}/p{s}?sign={s}", .{ api, enc, sign_val });
+            };
         } else {
+            // A05：把调用方的请求头交给驱动。115 按 User-Agent 下发下载链接，
+            // 部分网盘要求 Referer —— 空 LinkArgs 拿到的 URL 前端直接用不了。
+            // Go 在这一支传的是 `Redirect: true`（fsread.go:333-336）。
+            const lk = r.mount.driver.link(&ctx, r.rel, .{ .headers = req.headers, .redirect = true }) catch |e| {
+                log.warn("api: link {s} failed: {s}", .{ path, @errorName(e) });
+                return mapDriverError(res, e, &ctx);
+            };
             raw_url = lk.url;
         }
     }
@@ -4367,6 +4442,27 @@ pub fn signValue(a: std.mem.Allocator, secret: []const u8, data: []const u8, exp
     return std.fmt.allocPrint(a, "{s}:{s}", .{ b64.encode(raw, &mac), expire_str });
 }
 
+/// Go `internal/sign.Sign(data)`（internal/sign/sign.go:12-19）。
+///
+/// ⚠️ 它**不看 `sign_all`** —— 上游的 `sign.Sign` 是无条件签，用不用由调用方
+/// 决定（`common.Sign` 看 `sign_all`，`GenerateDownProxyURL` 与 Strm 的
+/// `withSign` 不看）。读 `link_expiration`（小时）：0 ⇒ 永不过期（`expire=0`），
+/// 否则 `now + N*3600`。
+fn signPath(app: *App, a: std.mem.Allocator, path: []const u8) ![]const u8 {
+    // 没有加载配置（单元测试 / 极早期启动）时按「不过期」处理 —— 与 Go 的
+    // `setting.GetInt` 在 settings 表未初始化时返回零值同形。
+    const cfg = config.getOpt() orelse return signValue(a, signKey(app), path, 0);
+    const expire_hours = cfg.link_expiration;
+    if (expire_hours == 0) return signValue(a, signKey(app), path, 0);
+    // 溢出防护：`link_expiration` 是用户可配的，配个巨大值不能让服务崩在
+    // 一次列目录上。算不出来就按「不过期」处理。
+    const expire = std.math.mul(i64, expire_hours, 3600) catch {
+        log.warn("[api] link_expiration={d} overflows; signing without expiry", .{expire_hours});
+        return signValue(a, signKey(app), path, 0);
+    };
+    return signValue(a, signKey(app), path, rt.nowSeconds() + expire);
+}
+
 /// 给 `fs/list` / `fs/get` 的对象签一个下载签名。
 ///
 /// 对齐 Go `server/common/sign.go:13-18`：目录不签；非目录时
@@ -4377,15 +4473,7 @@ fn signForObj(app: *App, a: std.mem.Allocator, is_dir: bool, path: []const u8) !
     // `setting.GetBool` 在 settings 表未初始化时返回零值同形。
     const cfg = config.getOpt() orelse return "";
     if (!cfg.sign_all) return "";
-    const expire_hours = cfg.link_expiration;
-    if (expire_hours == 0) return signValue(a, signKey(app), path, 0);
-    // 溢出防护：`link_expiration` 是用户可配的，配个巨大值不能让服务崩在
-    // 一次列目录上。算不出来就按「不过期」处理。
-    const expire = std.math.mul(i64, expire_hours, 3600) catch {
-        log.warn("[api] link_expiration={d} overflows; signing without expiry", .{expire_hours});
-        return signValue(a, signKey(app), path, 0);
-    };
-    return signValue(a, signKey(app), path, rt.nowSeconds() + expire);
+    return signPath(app, a, path);
 }
 
 /// `Verify(data, sign)` —— 逐条对齐 Go `pkg/sign/hmac.go:34-56`。
@@ -6274,6 +6362,134 @@ test "download: /d/ 先 FixAndCleanPath 再验签（对齐 PathParse → Down �
     try testing.expect(std.mem.indexOf(u8, body, "rawPath: /local/a.txt") != null);
     // 未清洗的形态不该出现（说明真的过了 FixAndCleanPath，而不是原样透传）。
     try testing.expect(std.mem.indexOf(u8, body, "/local/./a.txt") == null);
+}
+
+test "fs/get raw_url: 判据是驱动级 MustProxy||WebProxy，不是 Link 标志" {
+    // internal/driver/config.go:42-44 —— MustProxy = OnlyProxy || NoLinkURL。
+    // 上游置 true 的（本工程已移植的部分）：Local、Strm、Itvsh、UC、QuarkOpen。
+    try testing.expect(mustProxyForStorage("Local"));
+    try testing.expect(mustProxyForStorage("Strm"));
+    try testing.expect(mustProxyForStorage("Itvsh"));
+    try testing.expect(mustProxyForStorage("UC"));
+    // QuarkOpen 是 `-Ddrivers=quark` 的 opt-in 变体（默认构建里没有），
+    // 只在它被编进来时断言 —— 同 driver.zig:506-511 的写法。
+    if (driver.find("QuarkOpen") != null) try testing.expect(mustProxyForStorage("QuarkOpen"));
+    // Quark 变体（quark_uc/meta.go:36 不设 OnlyProxy）与其它的都是 false。
+    try testing.expect(!mustProxyForStorage("Quark"));
+    try testing.expect(!mustProxyForStorage("WebDav"));
+    try testing.expect(!mustProxyForStorage("189CloudPC"));
+    try testing.expect(!mustProxyForStorage("AliyundriveOpen"));
+    try testing.expect(!mustProxyForStorage("不存在的驱动"));
+}
+
+test "fs/get raw_url: GenerateDownProxyURL 逐字节对齐上游" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fe = try frontend_mod.initFromHtml(a, .{}, "");
+    defer fe.deinit();
+    var app = routingApp(a, fe);
+
+    var st = model.Storage{ .id = 1, .driver = "Local", .mount_path = "/local" };
+    // 未配 down_proxy_url ⇒ 空串（fsread.go:319 据此回落本站 /p）。
+    try testing.expectEqualStrings("", try generateDownProxyURL(&app, a, &st, "/local/a.txt"));
+
+    st.down_proxy_url = "http://down.example.com";
+    const with_sign = try generateDownProxyURL(&app, a, &st, "/local/a.txt");
+    // `?sign=` + sign.Sign(reqPath)（不看 sign_all）；路径用 EncodePath(true)。
+    try testing.expect(std.mem.startsWith(u8, with_sign, "http://down.example.com/local/a.txt?sign="));
+    const sig = with_sign["http://down.example.com/local/a.txt?sign=".len..];
+    try verifySign(&app, a, "/local/a.txt", sig);
+
+    // DisableProxySign ⇒ 不带 sign。
+    st.disable_proxy_sign = true;
+    try testing.expectEqualStrings(
+        "http://down.example.com/local/a.txt",
+        try generateDownProxyURL(&app, a, &st, "/local/a.txt"),
+    );
+    // 多行只取第一行（strings.Split(s, "\n")[0]）。
+    st.disable_proxy_sign = false;
+    st.down_proxy_url = "http://a.example.com\nhttp://b.example.com";
+    try testing.expect(std.mem.startsWith(
+        u8,
+        try generateDownProxyURL(&app, a, &st, "/x.mp3"),
+        "http://a.example.com/x.mp3?sign=",
+    ));
+}
+
+test "fs/get raw_url: 本站 URL 是绝对的（GetApiUrl）" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fe = try frontend_mod.initFromHtml(a, .{}, "");
+    defer fe.deinit();
+    var app = routingApp(a, fe);
+
+    // SiteURL 以 http 开头 ⇒ 直接用（去一个尾部斜杠）。
+    app.site_url = "http://olz.example.com/";
+    var req = http.Request{
+        .arena = a,
+        .method = "GET",
+        .path = "/api/fs/get",
+        .target = "/api/fs/get",
+        .headers = try a.dupe(Header, &.{}),
+        .query = "",
+    };
+    try testing.expectEqualStrings("http://olz.example.com", try apiUrlFor(&app, a, &req));
+
+    // 否则按请求 Host（X-Forwarded-Proto / X-Forwarded-Host 优先）。
+    app.site_url = "";
+    var req2 = http.Request{
+        .arena = a,
+        .method = "GET",
+        .path = "/api/fs/get",
+        .target = "/api/fs/get",
+        .headers = try a.dupe(Header, &.{
+            .{ .name = "X-Forwarded-Proto", .value = "https" },
+            .{ .name = "X-Forwarded-Host", .value = "wan.example.com" },
+            .{ .name = "Host", .value = "192.168.1.1:15244" },
+        }),
+        .query = "",
+    };
+    try testing.expectEqualStrings("https://wan.example.com", try apiUrlFor(&app, a, &req2));
+    // 无 Host ⇒ 空串（上游 GetApiUrl 同形）。
+    try testing.expectEqualStrings("", try apiUrlFor(&app, a, &req));
+}
+
+test "sign: signPath 读 link_expiration（Strm withSign 与上游同形）" {
+    // internal/sign/sign.go:12-19：expire=0 ⇒ 永不过期；否则 now + N*3600。
+    // 此前 `bridgeSign` 硬编码 0，link_expiration != 0 时 .strm 里的链接
+    // 永不过期，与上游不同。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fe = try frontend_mod.initFromHtml(a, .{}, "");
+    defer fe.deinit();
+    var app = routingApp(a, fe);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const cfg_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{dir});
+    defer testing.allocator.free(cfg_path);
+    const prev = config.getOpt();
+    const tcfg = try config.load(testing.allocator, cfg_path);
+    defer tcfg.deinit();
+    config.setForTest(tcfg);
+    defer config.setForTest(prev);
+
+    tcfg.link_expiration = 0;
+    try testing.expect(std.mem.endsWith(u8, try signPath(&app, a, "/x.mp3"), ":0"));
+
+    tcfg.link_expiration = 2;
+    const s = try signPath(&app, a, "/x.mp3");
+    try testing.expect(!std.mem.endsWith(u8, s, ":0"));
+    // 签出来的必须能验过（now + 2h 未过期）。
+    try verifySign(&app, a, "/x.mp3", s);
+    // sign_all 关闭时 signForObj 仍返回空串 —— 开关只在 common.Sign 那一层。
+    tcfg.sign_all = false;
+    try testing.expectEqualStrings("", try signForObj(&app, a, false, "/x.mp3"));
 }
 
 /// 直接驱动 `handle()`（含路由分发），返回响应。
