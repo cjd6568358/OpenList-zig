@@ -162,3 +162,6 @@
 - **pan115 fixture 铁律**：`src/drivers/115list_fixture.json`（`tools/gen_115_fixture.py` 生成）**必须入库**（被 `@embedFile`）；
   真机原文 `115list_sample.json` 含真实文件名**永不入库**。
 - 磁盘紧张是老问题（D 盘曾 100%）；npm pack 的 23MB 前端包用完立刻删。
+- **外部二进制留档（2026-10-24 校准）**：`D:/workspace/server/armbian/bin/openlist/` 现为现役 `openlist`（a468dbb2，1,352,552 B）+ 设备现役 `config.zig.json`（16 storages）；`_backup/` 收 10-22 版二进制/配置与 pre-embed 回滚件（原 `zig-src/dist/backup/` 已并入）。zig-src/.gitignore 里"现役二进制留档在此"的注释已名副其实。设备侧回滚目标 = `openlist.bak-20261024c`（无补丁版，Quark/UC 会掉，属预期）。
+- **沙箱限制（2026-10-24 实测）**：agent 经 SSH 通道（remote.py）执行**远程文件删除/移动**一律被 sandbox-center 拦截（`decisionRecord missing actual resource subject`；rm/unlink/mv 远程路径均如此，`dangerouslyDisableSandbox` 在同一层报错）——非策略拒绝，是基础设施无法为远程绝对路径构建决策记录。远程删除需用户手动执行；`--put` 上行不受影响。
+- **仓库清理基线（2026-10-24，commit 97a4b7d2）**：一次性调查脚本已删（probe_wopan_login / probe_189web_login / thunder_extra + .temp/ 4 个 Go 验证辅助）；保留迅雷账号工具箱（thunder_review 是 STATUS §恢复流程、thunder_rt/thunder_deploy_expert 是操作工具）。不可恢复的一次性素材（umi.js、web_main.js、h5_*.js、dist 陈旧产物）暂存于 `D:/workspace/_olz-staging/2026-10-24-cleanup/`，确认无用后可删。
