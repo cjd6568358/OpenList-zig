@@ -297,6 +297,11 @@ Go meta.go:11 漏了 default 值本身）。
 
 ### 3.10 wopan（drivers/wopan ↔ wopan.zig；SDK=v0.1.5）
 
+> SDK 源码快照（`wopan-sdk-*.go`，v0.1.5 部分拷贝）曾留档于 `zig-src/`，移植完成
+> 后已于 2026-10-24 删除。下文的 `wopan-sdk-*.go:行号` 引用可经 git 历史恢复
+> （删除前最后位于 `zig-src/reference/wopan-sdk-go/`），或
+> `go mod download github.com/OpenListTeam/wopan-sdk-go@v0.1.5` 取完整模块。
+
 **A 类**：core 直传 model.Obj.ID → findEntry/childByName 逐级列表（:809-863）；
 密文判定按 json.Value string tag（:485-488，SDK 按 raw 首尾引号 request.go:53，
 等效）；9999 重试重新加密不重放（:380-381、466-470，对齐 SDK）；
