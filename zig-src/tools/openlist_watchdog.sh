@@ -86,7 +86,10 @@ if [ -f "$PIDF" ]; then
     fi
 fi
 echo $$ > "$PIDF"
-trap 'rm -f "$PIDF"' EXIT INT TERM
+# INT/TERM 必须显式 exit：ash 跑完 trap handler 会**从中断处继续循环**，
+# 2026-10-24 实测普通 kill 只删掉了 pidfile、看门狗还活着，单实例锁随之
+# 失效（新实例检测不到它）。exit 会再触发一次 EXIT trap，rm 重复执行无害。
+trap 'rm -f "$PIDF"; exit 0' EXIT INT TERM
 
 say() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
 
@@ -113,7 +116,8 @@ record() {
     echo "--- dmesg tail ---" >> "$LOG" 2>&1
     dmesg 2>/dev/null | tail -n 12 | cut -c1-140 >> "$LOG" 2>&1
     echo "--- openlist.log tail ---" >> "$LOG" 2>&1
-    tail -n 15 /tmp/openlist.log >> "$LOG" 2>&1
+    # 2026-10-24：日志行加了时间戳与 import 面包屑，单行信息量变大，取 30 行。
+    tail -n 30 /tmp/openlist.log >> "$LOG" 2>&1
     say "--- 现场结束 ---"
 }
 

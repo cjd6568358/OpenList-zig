@@ -90,8 +90,42 @@ pub fn sleepMillis(ms: i64) void {
 }
 
 // ---------------------------------------------------------------------------
+// Memory footprint
+// ---------------------------------------------------------------------------
+
+/// 当前进程 RSS（KB）。读 `/proc/self/statm` 第二个字段（resident pages），
+/// 页大小按 4 KiB 计 —— 部署目标（aarch64 Linux）一律 4K 页。
+///
+/// 纯观测用途：`config/import`、驱动 init 这类重操作前后各记一笔。2026-10-24
+/// 那次静默死亡，内存是不是元凶只能事后猜（`free -m` 是重启后的读数，对不上）。
+/// ⚠ 失败一律返回 0：日志帮助函数绝不能影响主流程。
+pub fn rssKb() u64 {
+    if (comptime builtin.os.tag != .linux) return 0;
+    var file = std.Io.Dir.cwd().openFile(io(), "/proc/self/statm", .{}) catch return 0;
+    defer file.close(io());
+    // statm 是一行 5 个数字（~35 字节），一次定长读足够；procfs 的
+    // endPos 是 0，所以用 readPositionalAll 而不是按 size 读。
+    var buf: [64]u8 = undefined;
+    const n = file.readPositionalAll(io(), &buf, 0) catch return 0;
+    if (n == 0) return 0;
+    var it = std.mem.tokenizeAny(u8, buf[0..n], " \t\n");
+    _ = it.next() orelse return 0; // size：虚拟内存页数，不要
+    const resident = it.next() orelse return 0; // resident：常驻内存页数
+    const pages = std.fmt.parseInt(u64, resident, 10) catch return 0;
+    return pages * 4; // 4 KiB/页 → KB
+}
+
+// ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "rssKb is a safe observation call" {
+    // 不崩、不泄漏是硬断言；数值只做 sanity 检查（Linux 上 >0，
+    // Windows 上恒 0 —— 无 /proc）。allocRemaining 的首轮分配可能大于
+    // 64B 固定缓冲，那时静默返回 0，同样可接受。
+    const kb = rssKb();
+    try testing.expect(kb < 1 << 40); // 1 TiB，防 parseInt 失控的哨兵
+}
 
 test "io() is usable under the test runner" {
     // The point of the fallback: no `main`, no `set`, still a working handle.

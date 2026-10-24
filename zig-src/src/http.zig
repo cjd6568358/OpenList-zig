@@ -1091,6 +1091,10 @@ pub const Server = struct {
         }
 
         try w.flush();
+        // 2026-10-24 面包屑（debug 级，默认 info 下不输出）：响应已完整
+        // 写完。与 handler 侧最后一行日志合起来，能把"死在哪"缩小到连接
+        // 收尾路径 —— 需要时把 OPENLIST_LOG_LEVEL=debug 打开即可见全链。
+        log.debug("http: responded {d} to {s} {s}", .{ res.status, req.method, req.path });
     }
 };
 

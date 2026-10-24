@@ -343,6 +343,61 @@ fn installSignalHandlers(server: *http.Server) void {
     };
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+
+    installFatalSignalHandlers();
+}
+
+// ---------------------------------------------------------------------------
+// 致命信号：留下痕迹再死（2026-10-24 复盘加）
+//
+// 背景：生产实例在 `config/import` 后静默死亡——日志没有 panic、没有优雅
+// 退出行，`ulimit -c = 0` 连 core 都没有，只剩 dmesg 里一条无时间戳的
+// `translation fault (esr 0x92000007)`。ReleaseSmall 关掉了运行时安全
+// 检查（越界/解空表现为 SIGSEGV 而不是 Zig panic），所以"不留痕迹"是
+// 这类死亡的特征。
+//
+// 做法：给五个硬件级信号（SEGV/BUS/ABRT/ILL/FPE）装 SA_SIGINFO handler，
+// 只做一件事——用 write(2) 往 stderr 写一行现场（start.sh 是
+// `>> /tmp/openlist.log 2>&1`，必进日志），然后**恢复默认处置再 return**，
+// 让内核按原样终结进程（core/terminate 行为不变，dmesg 照旧记录）。
+//
+// ⚠ handler 里只允许 async-signal-safe 操作：write、sigaction、栈上
+// bufPrint（纯计算）。**不能**调 log.*（mutex + 时钟 + 格式化，信号上下文
+// 里可能死锁），也不能 _exit（会跳过内核的 core 逻辑）。
+// ---------------------------------------------------------------------------
+
+fn installFatalSignalHandlers() void {
+    if (comptime builtin.os.tag == .windows) return;
+    const sigs = [_]std.posix.SIG{ .SEGV, .BUS, .ABRT, .ILL, .FPE };
+    const act = std.posix.Sigaction{
+        .handler = .{ .sigaction = onFatalSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.SIGINFO,
+    };
+    for (sigs) |sig| std.posix.sigaction(sig, &act, null);
+}
+
+fn onFatalSignal(sig: std.posix.SIG, info: *const std.posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
+    var buf: [192]u8 = undefined;
+    const addr: usize = @intFromPtr(info.fields.sigfault.addr);
+    const msg = std.fmt.bufPrint(&buf, "[FATAL] signal {d} ({s}) si_code={d} fault_addr=0x{x} pid={d} — restoring default disposition, process will now die\n", .{
+        @intFromEnum(sig),
+        @tagName(sig),
+        info.code,
+        addr,
+        std.os.linux.getpid(),
+    }) catch "[FATAL] fatal signal received, details unavailable — process will now die\n";
+    // 直接走 Linux 原始系统调用：signal handler 里不能碰 libc 的锁，
+    // 也不能走 std.posix 的错误联合（0.17 的 posix 层没有裸 write）。
+    _ = std.os.linux.write(2, msg.ptr, msg.len);
+    // 恢复默认处置：handler return 后故障指令会重放，再次触发同一信号时
+    // 内核按默认动作终止（SEGV → core dump 或 terminate，取决于 ulimit -c）。
+    const dfl = std.posix.Sigaction{
+        .handler = .{ .handler = std.posix.SIG.DFL },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(sig, &dfl, null);
 }
 
 // 0.17 types the handler's argument as the `SIG` enum rather than a bare

@@ -421,6 +421,11 @@ pub fn buildMountFromStorage(alloc: std.mem.Allocator, s: *const model.Storage) 
 
     const drv = try f.create(alloc, s.id, &add_val);
     var init_ctx = driver.Ctx{ .alloc = alloc, .tag = s.mount_path };
+    // 2026-10-24 面包屑：init 是整条链路里最重的一步（每个存储都要 TLS +
+    // 上游登录，几十秒级），崩溃复盘时"死在哪个驱动的 init"只能靠最后一行
+    // 日志推断。这里补一行"开始"，与调用方已有的成功/失败行构成完整链条。
+    // RSS 一并记下：静默死亡时内存是不是元凶，从此不用猜。
+    log.info("storage #{d} {s}: initializing (rss {d}KB)", .{ s.id, s.driver, rt.rssKb() });
     drv.init(&init_ctx) catch |e| {
         // S03：init 失败的驱动要释放，否则每次重载都漏一个（jar/client 都在 alloc 上）。
         drv.deinit(&init_ctx);
@@ -3249,6 +3254,11 @@ fn handleConfigImport(app: *App, req: *http.Request, res: *http.Response) !void 
     const mode = (try req.queryGetDecoded("mode")) orelse "merge";
     const overwrite = std.mem.eql(u8, mode, "overwrite");
 
+    // 2026-10-24 面包屑：import 是服务最重的管理操作（依次 解析 → settings
+    // → 落表 → 每存储重建挂载），2026-10-24 的静默死亡就发生在它之后。
+    // 下面每个阶段一行 info，下次再崩时最后一行直接指出死在哪一步。
+    log.info("config/import: begin mode={s} body={d}B rss={d}KB", .{ mode, req.body.len(), rt.rssKb() });
+
     // ---- 格式识别：顶层 settings 是数组 ⇒ OpenList 备份；否则按 cfg.json 读 ----
     var backup_settings: ?[]json.Value = null;
     if (root.getPath("settings")) |sn| {
@@ -3310,6 +3320,7 @@ fn handleConfigImport(app: *App, req: *http.Request, res: *http.Response) !void 
     mirrorFrontendSettings(app, cfg) catch |e| {
         log.warn("config/import: mirror frontend settings: {s}", .{@errorName(e)});
     };
+    log.info("config/import: settings applied={d} ignored={d}", .{ settings_applied, settings_ignored });
 
     // ---- storages：先校验出计划，再统一落表（避免边遍历边增删）----
     const Plan = struct {
@@ -3374,6 +3385,7 @@ fn handleConfigImport(app: *App, req: *http.Request, res: *http.Response) !void 
             }
         }
     }
+    log.info("config/import: plan built: {d} storage(s), {d} rejected", .{ plan.slice().len, fails.slice().len });
 
     {
         config.lockStorages();
@@ -3453,8 +3465,10 @@ fn handleConfigImport(app: *App, req: *http.Request, res: *http.Response) !void 
         log.warn("config/import: could not persist: {s}", .{@errorName(e)});
         return res.jsonError(500, "could not save config");
     };
+    log.info("config/import: config persisted (created={d} updated={d} unmounted={d})", .{ created, updated, unmounted.slice().len });
 
     // ---- 重挂载 ----
+    log.info("config/import: remount begin: {d} storage(s)", .{touched.slice().len});
     for (unmounted.slice()) |id| try republishWithEdit(app, app.alloc, id, null);
     for (touched.slice()) |id| {
         const snap = blk: {
@@ -3463,6 +3477,7 @@ fn handleConfigImport(app: *App, req: *http.Request, res: *http.Response) !void 
             const s = cfg.storageById(id) orelse continue;
             break :blk try dupeStorage(app.alloc, s);
         };
+        log.info("config/import: rebuilding storage #{d} {s}", .{ id, snap.driver });
         switch (try buildMountFromStorage(app.alloc, &snap)) {
             .ok => |m| {
                 try republishWithEdit(app, app.alloc, id, m);
@@ -3477,6 +3492,7 @@ fn handleConfigImport(app: *App, req: *http.Request, res: *http.Response) !void 
             .invalid_addition => try fails.append(try std.fmt.allocPrint(a, "{s}: addition is not valid JSON", .{snap.mount_path})),
         }
     }
+    log.info("config/import: remount done (rss {d}KB)", .{rt.rssKb()});
 
     // ---- 汇总 ----
     try b.append("{\"created\":");
@@ -3516,6 +3532,9 @@ fn handleConfigImport(app: *App, req: *http.Request, res: *http.Response) !void 
     log.info("config/import: mode={s} created={d} updated={d} settings={d} failed={d}", .{ mode, created, updated, settings_applied, fails.slice().len });
     // 管理端点的响应要走 Go 信封（{code,message,data}），前端 axios 才认。
     try res.jsonOk(b.slice());
+    // 最后一行面包屑：到这里 handler 已完工，之后再死就是在 http.zig 的
+    // 写响应/连接收尾路径（2026-10-24 的死亡点就在这块）。
+    log.info("config/import: response queued, handler done", .{});
 }
 
 /// This binary has no background task manager (and deliberately does not add

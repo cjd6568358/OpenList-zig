@@ -57,9 +57,9 @@ pub fn daysInMonth(y: i64, m: i64) i64 {
 }
 
 /// 把一天内的秒数拆成 (时, 分, 秒)。
-const Hms = struct { h: i64, m: i64, s: i64 };
+pub const Hms = struct { h: i64, m: i64, s: i64 };
 
-fn splitSeconds(secs_in_day: i64) Hms {
+pub fn splitSeconds(secs_in_day: i64) Hms {
     return .{
         .h = @divTrunc(secs_in_day, 3600),
         .m = @divTrunc(@mod(secs_in_day, 3600), 60),
