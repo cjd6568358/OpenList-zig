@@ -53,8 +53,7 @@
 ## 构建约定（2026-10-22 起：本机有工具链）
 
 - **★ 本机 Zig 0.17.0 已装好**：`C:\Program Files\zig-x86_64-windows-0.17.0\zig.exe`。
-  `zig build test`（448 pass + 3 skip，3 条 Linux-only）与交叉编译都能本机跑，
-  **aarch64 产物与打包机逐字节相同**（1,320,952 B / `c90dd73e…`）。
+  `zig build test`（459 pass + 3 skip）与交叉编译都能本机跑。
   必须：① 先 `tools/ziglib_patch.py "<toolchain>/lib" C:/zigcache/olz-ziglib`；
   ② 用 **`ZIG_LIB_DIR`** 环境变量（`--zig-lib-dir` 不是 `zig build` 的参数，0.17 会报 unrecognized）；
   ③ `ZIG_GLOBAL_CACHE_DIR`/`ZIG_LOCAL_CACHE_DIR` 都指 `C:/zigcache/olz`（D 盘只剩 1.9G）。
@@ -154,7 +153,8 @@
 - **权威待办 = `zig-src/TODO.md`**；审计结论 = `zig-src/docs/STATUS.md`（§22/§23 边界与凭据）；驱动维度审计 = `zig-src/docs/AUDIT_2026-10-18-drivers.md`（权威）。
   更早六份审计（10-11 / 10-17 v1v2 / REVIEW / REVIEW-v1 / DS）已清理，原文 `git show 7356589e:<path>`。
 - 已知欠项：全驱动真实 API+UI 回归（凭据 `zig-src/openlist_backup_2026_10_16 13_53_16.json`）、`model.Storage` 无 `modified`、配置项 `delayed_start`/`cors`/`tasks`。
-- 验证基线：**438 单测全过**（打包机 `zig build test`，含 115 fixture），aarch64 ~1.21MB；真机 e2e 32/32。
+- 验证基线：**459 单测全过 + 3 skip**（本机 `zig build test`，含 115 fixture；带补丁 std 复跑过），
+  当前生产 aarch64 1,352,552 B / `a468dbb2…`（2026-10-24）；真机 e2e 32/32。
 - **remote.py 调用坑**：main() 把 argv 用空格拼接 ⇒ 远端命令必须作为**单个带引号参数**传；内联命令用**绝对路径**（cwd=/root）；
   `--put` 的远端路径**去掉前导斜杠**（MSYS 会改写 `/tmp/...`）。别设 `MSYS_NO_PATHCONV=1`。
 - **根目录整洁铁律**：仓库根只允许 openlist 上游文件 + `zig-src/ .github/ .workbuddy/ .workbuddy-ai/`；Zig 脚本一律 `zig-src/tools/`，
