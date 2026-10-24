@@ -37,7 +37,7 @@
   空串 ⇒ 前端下拉框没有选项。2026-10-22 修了 5 个驱动 16 处，有遍历 `builtin` 的防复发单测。
 - 迅雷硬知识：① S3 上传必须 **virtual-hosted**（`https://<bucket>.<trimLeft(endpoint)>/<key>`），path-style 直接 403/DNS 失败；
   ② 上游登录限频（`shield_reject: Operation too frequent`）⇒ 回归别在循环里重建存储（每次重建=一次登录）。
-- `115`/`WoPan` 依赖外部 SDK（Go 源码已 vendor 到 `zig-src/wopan-sdk-*.go` 供对照）⇒ 只能真实 API 回归。
+- `115`/`WoPan` 依赖外部 SDK（Go 源码快照在 `zig-src/reference/wopan-sdk-go/` 供对照，唯一本地副本）⇒ 只能真实 API 回归。
 - **★ WoPan refresh_token 是一次性轮换**：刷一次即换发新令牌，旧令牌立刻作废。
   **只能用驱动去刷**（刷新成功会立刻 `save()` 落盘，wopan.zig:273）；外部探针/变体矩阵刷一次
   就消费掉、新令牌只在响应里 ⇒ 必丢。令牌保存位置：`zig-src/tools/creds.local.json`（gitignored，0600）。

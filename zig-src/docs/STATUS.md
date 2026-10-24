@@ -2628,7 +2628,7 @@ refresh_token**，取完别再登网页端；拿到后用管理页「编辑存�
 
 ### 36B.1 三个真 bug（对照 SDK 源码逐个挖出）
 
-SDK 源码已存档 `zig-src/wopan-sdk-*.go`（OpenListTeam/wopan-sdk-go v0.1.5）。
+SDK 源码已存档 `zig-src/reference/wopan-sdk-go/`（OpenListTeam/wopan-sdk-go v0.1.5，部分快照）。
 
 1. **api-user body 缺 `clientId`**（§36A.3，已修）：body = `other` + param
    （req_body.go 的 NewBody），api-user 通道的 other 是
