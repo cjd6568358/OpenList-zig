@@ -58,6 +58,10 @@
   必须：① 先 `tools/ziglib_patch.py "<toolchain>/lib" C:/zigcache/olz-ziglib`；
   ② 用 **`ZIG_LIB_DIR`** 环境变量（`--zig-lib-dir` 不是 `zig build` 的参数，0.17 会报 unrecognized）；
   ③ `ZIG_GLOBAL_CACHE_DIR`/`ZIG_LOCAL_CACHE_DIR` 都指 `C:/zigcache/olz`（D 盘只剩 1.9G）。
+  **🔴 2026-10-24 事故：裸调 `zig build`（忘了 export ZIG_LIB_DIR）= 静默丢补丁**——编译不报错，
+  部署后 Quark/UC 两个挂载消失（14→12），只有看启动日志才发现。判据：带补丁产物
+  `a468dbb2…`（1,352,552 B）vs 裸构建 `af22fd5f…`（1,352,624 B）。**部署后必须 grep
+  `mount(s) published` 的条数**（当前应为 14）。
 - 打包机 `10.0.0.4` 仍是可选路径（`zig-src/tools/build_remote.py`，`/tmp/olz-build`，zig 0.17.0）：
 - **下载 GitHub 产物走 `https://ghfast.top/<原始URL>`**（release 资产域名直连卡死）；api.github.com JSON 可直连（共享 IP 60 次/小时）。
 - `build.zig` 的 `-Ddrivers=` 白名单：收 Go 名或 Zig 源文件名，**必须 comptime 分支**（收进数组会强制生成全部驱动）。
@@ -110,7 +114,11 @@
 ## ★ 前端一律走 CDN，绝不在设备上养前端副本（用户强烈要求，已犯过一次）
 
 设备上放 dist 副本 = 把要消除的东西装回去，且掩盖"CDN 为什么取不到"。正确做法：**先在沙箱（打包机）诊断再动设备**。
-- 设备 CA 库无 GlobalSign 根 ⇒ `drive.quark.cn` TLS 握手失败（`TlsInitializationFailed`，非代码问题；189 用 WoTrus 所以成功）。
+- **drive.quark.cn / UC 的 TLS 失败 = 缺 ECDSA 套件补丁，不是 CA 库问题**（2026-10-16 定案，旧记录"设备 CA 无
+  GlobalSign"是错的，grep PEM 证明不了任何事）：Zig 0.17.0 std 只 offer ECDHE-RSA，而 quark 的 ECDHE-RSA 路径
+  服务端有缺陷（ServerKeyExchange 处 internal_error）⇒ 客户端必须 offer ECDSA（c02b/c02c/cca9），
+  补丁 = `tools/ziglib_patch.py`（改 std 的 `crypto/tls/Client.zig` 四处：两个 comptime 分支的 offer 列表 +
+  两个 ServerHello switch）。**症状是静默的**：init 时 `TlsInitializationFailed`，挂载数 14→12，服务照常 200。
 - **Zig 0.17 std resolv.conf bug**：`HostName.zig` `takeSentinel('\n')` 遇文末无换行报 `EndOfStream` ⇒ 全部外网请求
   `ResolvConfParseFailed`。部署确保 `/etc/resolv.conf` 末尾有 `\n`。
 - CDN fallback：`zig.cdn_fallbacks`（逐个重试 2 次）。`RawIndex` 要带出**实际生效**的 cdn 覆盖 `site.cdn`，否则 `/assets` 全 302 到死域名。
@@ -131,6 +139,9 @@
 10. 路由白名单：`handle()` 只放行已知前缀进 `handleAuthed`，加端点必须同时改白名单（曾漏 `/api/me` 前缀 ⇒ 404）。
 11. **架构事实**：每请求一个 ArenaAllocator（`http.zig:622`），arena `free` 只在最近一次分配时回退；`Client` 每实例一把全局锁
     （`client.zig:159`），并发靠每 worker 一个 Client；`model.Obj` 无 ID（Go 有）⇒ 189/189pc 靠路径逐段翻页找 ID。
+12. **busybox ash 的 `trap 'cmd' INT TERM` 跑完 cmd 会从中断处继续循环，不会退出**（2026-10-24 实测：
+    看门狗被普通 kill 后只删了 pidfile、进程还活着，单实例锁失效）。信号 trap 里必须显式 `exit`
+    （`trap 'rm -f "$PIDF"; exit 0' EXIT INT TERM`）；TERM 要等当前 `sleep` 跑完才处理，验证要等一个周期。
 
 ## 功能边界（STATUS.md §22）
 
