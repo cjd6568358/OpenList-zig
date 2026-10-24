@@ -1,0 +1,5 @@
+# Shell scripts must stay LF: they are executed by busybox ash on the ONT
+# (192.168.1.1). core.autocrlf=true on Windows checkouts would rewrite them
+# to CRLF, which makes busybox ash fail with syntax errors (hit on
+# 2026-10-24 while deploying openlist_watchdog.sh).
+*.sh text eol=lf
