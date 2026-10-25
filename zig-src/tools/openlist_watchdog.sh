@@ -14,7 +14,8 @@
 #
 #  ⚠ 熔断是必需的，不是可选
 #  ------------------------
-#  绝不能"无限重启"——每次拉起都要把 14 个存储重新 init 一遍，而其中：
+#  绝不能"无限重启"——每次拉起都要把所有存储重新 init 一遍（见 config.zig.json
+#  的 storages，2026-10-25 是 15 个），而其中：
 #    * WoPan 的 refresh_token **一次性轮换**（刷一次旧的即作废，见
 #      zig-src/tools/creds.local.json 的说明）；
 #    * 迅雷登录有上游限频（`shield_reject: Operation too frequent`）。
