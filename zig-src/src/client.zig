@@ -406,7 +406,12 @@ pub fn send(self: *Client, arena: std.mem.Allocator, req: Request) !Response {
         if (http_req.connection) |c| applySocketTimeout(c, self.opts.timeout_s);
         // 诊断：夸克 CDN 上 zig std.http.Client 的 GET 1 秒内 WriteFailed，
         // 而裸 std.crypto.tls.Client 同请求是 25s 静默。逐阶段打点定位。
-        log.info("client: {s} {s} connected (conn={s})", .{
+        //
+        // 2026-10-26：定位任务早已结束（根因是 TLS 套件缺失，见 ziglib_patch.py），
+        // 这四行**降级为 debug**。它们每个请求固定 4 行、带完整 URL，INFO 下
+        // 生产 9 小时就刷出 10 MB（≈100% 的日志行都是它们）。要看时用
+        // `--log-level debug` 或 `OPENLIST_LOG_LEVEL=debug` 打开。
+        log.debug("client: {s} {s} connected (conn={s})", .{
             method, raw_url, if (http_req.connection) |_| "yes" else "pooled",
         });
 
@@ -445,12 +450,12 @@ pub fn send(self: *Client, arena: std.mem.Allocator, req: Request) !Response {
             var bw = try http_req.sendBody(&send_buf);
             try bw.end();
         } else {
-            log.info("client: {s} {s} sending bodiless request", .{ method, raw_url });
+            log.debug("client: {s} {s} sending bodiless request", .{ method, raw_url });
             http_req.sendBodiless() catch |e| {
                 log.warn("client: {s} {s} sendBodiless failed: {s}", .{ method, raw_url, @errorName(e) });
                 return e;
             };
-            log.info("client: {s} {s} request sent, awaiting head", .{ method, raw_url });
+            log.debug("client: {s} {s} request sent, awaiting head", .{ method, raw_url });
         }
 
         var redirect_buf: [8 * 1024]u8 = undefined;
@@ -458,7 +463,7 @@ pub fn send(self: *Client, arena: std.mem.Allocator, req: Request) !Response {
             log.warn("client: {s} {s} receiveHead failed: {s}", .{ method, raw_url, @errorName(e) });
             return e;
         };
-        log.info("client: {s} {s} got head, status={d}", .{ method, raw_url, @intFromEnum(resp.head.status) });
+        log.debug("client: {s} {s} got head, status={d}", .{ method, raw_url, @intFromEnum(resp.head.status) });
 
         const status: u16 = @intFromEnum(resp.head.status);
 
