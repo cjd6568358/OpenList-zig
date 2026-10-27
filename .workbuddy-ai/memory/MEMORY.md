@@ -61,6 +61,7 @@
 
 - **绝不碰** `/opt/sq/openlist`、Go 的 `config.json`/`data.db`。**绝不用命令行子串筛进程**（10-15 误杀过生产）：只按 pidfile / `--port <n>` 匹配。
 - **生产实例**：`/opt/armbian/bin/openlist/openlist server --config /opt/armbian/bin/openlist/config.zig.json`，日志 `/tmp/openlist.log`，端口仅 **15244**；启停 `/opt/script/openlist_start.sh [stop]`（幂等 + 重试），崩溃后重跑它。
+  - **无看门狗**（2026-10-27 用户要求移除，仓库+设备已删）：崩溃后不会自动拉起，只能手工跑 `/opt/script/openlist_start.sh`。
   - **日志口径（2026-10-26 起）**：`client.zig` 那 4 行请求打点（10-18 加的诊断）已降级 `log.debug`
     ⇒ 稳态 **≈0–1 行/分钟**（只剩 189 的 `HttpConnectionClosing` WARN）。要复现旧行为用
     `--log-level debug` / `OPENLIST_LOG_LEVEL=debug`。默认 info，`config` 里无级别字段（同 Go）。
