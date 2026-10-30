@@ -100,7 +100,8 @@
 
 ## 功能边界（STATUS.md §22）
 
-- **刻意不做**：分享 / SSH 公钥 / webauthn / 2FA / LDAP / 多用户·SQLite·SSO / 搜索索引 / 离线下载 / 分片上传 / S3·FTP·SFTP·MCP 服务。中心思想：单管理员管整个存储。
+- **刻意不做**：分享 / SSH 公钥 / webauthn / 2FA / LDAP / 多用户·SQLite·SSO / 搜索索引 / 离线下载 / S3·FTP·SFTP·MCP 服务。中心思想：单管理员管整个存储。
+- **分片上传已实现**（2026-10-30，STATUS §57）：网页端 >10MiB 默认走 /api/fs/multipart/*；189pc 直传零落盘无上限，其余驱动落盘回退（上限 ≈ min(tmpfs 剩余, RAM 可用)，当前 ~130MB 浮动）。
 - **Zig 特有**：itvsh 驱动、CDN fallback、`@zig-setup`、`zig.*` 配置块、编译期驱动白名单、内置页首装面板。
 - 用户 Go 备份实况：`/baidu`、`/onedrive` 在用但暂不移植。
 

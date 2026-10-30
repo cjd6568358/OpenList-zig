@@ -1,9 +1,9 @@
 # TODO — openlist-zig 待办清单
 
-> 最后更新：2026-10-30（网页端上传 network error 根因 = `multipart_enabled` 撒谎，
-> 已改 false 并部署；新增请求体安全阀 `zig.max_upload_mb`（默认 64 MiB）与
-> `/api/*` 未注册路径 501 JSON 兜底，见 STATUS §55/§56。
-> **下一轮主项 = §5.5 分片直传**）
+> 最后更新：2026-10-30（**分片直传落地**：`/api/fs/multipart/*` 全实现、189pc 直传 + 
+> 全驱动回退、`multipart_enabled` 翻回 true，见 STATUS §57 / §5.5 ✅；
+> 同日早些时候：请求体安全阀 `zig.max_upload_mb`（默认 64 MiB）与
+> `/api/*` 未注册路径 501 JSON 兜底，见 STATUS §55/§56）
 >
 > 上一版：2026-10-18（审计修复两轮全部收官：§37.4 剩余项 + P3 + N1 落地，
 > 构建 400/400、真机 e2e 92/92，审计文档整合进 docs/，见 STATUS.md §38）

@@ -1457,7 +1457,7 @@ Chromium 装起来**（约 500 MB）。
 | 索引管理 `admin/index/*`、`admin/scan/*` | `handles.BuildIndex` 等 | 无索引，自然无索引管理 |
 | **离线下载** `fs/add_offline_download`、`admin/setting/set_aria2/set_qbit/set_transmission/set_115*/set_123*/set_pikpak/set_thunder*/set_guangyapan` | `handles.AddOfflineDownload` 等 | 需要外部下载工具/账号体系 |
 | **Torrent** `fs/torrent/{parse,upload_parse,rapid_upload,generate}` | `handles.ParseTorrent` 等 | 同上，且体量大 |
-| **分片上传** `fs/multipart/{init,chunk,complete,status,abort}` | `multipartPkg` | 只有 `fs/put` / `fs/form` 两条直传路径。⚠️ 4.2.6 前端把 Multipart 排在 `available()` 首位，**只要 `/api/public/settings` 报 `multipart_enabled=true`，>10 MiB 的文件就会走这条不存在的路由**（noRoute 回 200+HTML ⇒ 前端重试 3 次 ⇒ 报 `multipart init failed: network error`）。故该 setting 必须为 `false`，见 2026-10-30 条目 |
+| ~~**分片上传**~~ ✅ **已实现** `fs/multipart/{init,chunk,complete,status,abort}` | `multipartPkg` | **2026-10-30 晚落地**（STATUS §57）：189pc 直传（本地零落盘）+ 其余驱动落盘回退；`multipart_enabled` 已翻回 `true`。早期"必须为 false"的条目见 §55（当日白天的事故记录） |
 | Meta 元数据 `admin/meta/*`（5 个） | `handles.ListMetas` 等 | 需要 meta 表 |
 | 消息中心 `admin/message/{get,send}` | `message.HttpInstance` | 需要消息总线 |
 | S3 / FTP / SFTP / MCP 服务 | `S3()` / `_ftp()` / `MCP()` | 只保留 WebDAV（SFTP 已存档，见 `docs/FEASIBILITY.md` §5.3） |
@@ -1490,9 +1490,9 @@ Chromium 装起来**（约 500 MB）。
 |---|---|
 | `POST /api/me/update` ✅ 已补 | Profile 页改密码/改用户名（Go `handles.UpdateCurrent`）。2026-10-16 补 |
 | `GET /api/auth/logout` ✅ 已补 | 管理页登出（Go `handles.LogOut`）。2026-10-16 补 |
-| `PUT /api/fs/form` | multipart 表单直传。上一行自称"只有 fs/put / fs/form 两条直传路径"，实际无此路由；**前端只在用户手工把上传方式切到 "Form" 时才会调它**（默认不是它，见下方 2026-10-30 条目），故不阻塞 |
+| `PUT /api/fs/form` | multipart 表单直传（与分片上传是两条独立协议）。**前端只在用户手工把上传方式切到 "Form" 时才会调它**（默认走分片/Stream），故不阻塞；理由见 §45.3 |
 | `GET/POST /api/fs/archive/meta` | 压缩包元信息（Go `handles.FsArchiveMetaSplit`，`router.go:199`）。**不在上面任何删减行**，2026-10-17 复核报告 §3.3 补列。`archive/list` 已实现，meta 未实现 |
-| `POST /api/admin/setting/reset_token` | 轮换 admin token。落点 = `/api/admin/setting/` 前缀白名单 ⇒ `handleSettingRoute` 无匹配分支 ⇒ **JSON 404 信封**（非 NoRoute），症状为前端静默失败 |
+| `POST /api/admin/setting/reset_token` ✅ 已补 | 轮换 admin token（2026-10-18，STATUS §44；签名密钥对齐 Go `token` 设置而非 jwt_secret） |
 
 ---
 
@@ -2349,7 +2349,8 @@ HTTP 状态永远是 200。而对账前的本实现按 REST 惯例回真状态�
   `ServeHTTP`，回的是**真状态码 + HTML/纯文本**。两套各自保持原样。
 - 单测新增 `expectApiCode(res, code)`：同时钉住 HTTP 200 与 body 里的 `code`
   （只断言其中一个都会放过真实偏离），并把 32 处旧断言换算过来。
-- `NoRoute`（`server/static/static.go:213-227`）逐条对齐：未注册路径（**含
+- `NoRoute`（`server/static/static.go:213-227`）逐条对齐（⚠️ 2026-10-30 起
+  `/api/*` 未注册路径**刻意偏差**为 501 JSON，见 §56.2；`/api/` 之外仍逐条对齐）：未注册路径（**含
   `/api/*`**）GET/POST ⇒ 200 + SPA HTML；其它方法 ⇒ **405**。早先的注释凭
   一次"PUT 也是 200"的实测把它判成未对齐，实际是当时没走到那条分支。
 
@@ -4371,7 +4372,8 @@ addition，Linux 下 `tmp_dir` 是 `/tmp/xxx`（安全），Windows 下是 `D:\.
 `"false"`（`api.zig`）。此时 `available()` 的第一个是 Stream ⇒ 所有大小都走
 `PUT /api/fs/put`。附带一条单测把该值钉死，并断言
 `POST /api/fs/multipart/init` 仍落到 NoRoute —— 将来真做分片上传的人必须
-同时改这两处。
+同时改这两处。**【2026-10-30 晚更新：已实现，见 STATUS §57；上面的钉死
+单测与 setting 都已按预告同步翻转。】**
 
 **边界**：`PUT /api/fs/form` 仍未实现（`PUT` 未注册路径 ⇒ 405）。用户若在
 上传方式下拉框里手工选 "Form" 才会踩到；默认不会。

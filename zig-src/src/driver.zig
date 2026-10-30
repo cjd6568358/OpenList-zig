@@ -11,8 +11,11 @@
 //! Quark+UC / 115 Cloud / WoPan / Strm` + `Thunder` / `ThunderExpert` /
 //! `ThunderWeb`，全量 15 个注册名 / 12 个实现文件，见下面 `builtin`).
 //! `copy` is **optional**
-//! (`null` = the upstream driver's `Copy` is `NotSupport`), and `space` is
-//! optional too (null = no quota). Still absent: `putURL`, `getArchive`,
+//! (`null` = the upstream driver's `Copy` is `NotSupport`), `space` is
+//! optional too (null = no quota), and the `mp_*` chunked-direct-upload
+//! quartet is optional as a whole (2026-10-30; implemented by 189pc —
+//! other drivers fall back to the generic spool path, see api.zig
+//! `handleMultipart` / STATUS §57). Still absent: `putURL`, `getArchive`,
 //! `extractArchive`, `mkdir`-with-recursion, and every optional capability
 //! interface (`ObjThumb`, `ObjUpload`, `ObjReader`, `ArchiveReader`, `Other`,
 //! `DirectUploader`, ...). Each of those is a documented, budgeted extension
