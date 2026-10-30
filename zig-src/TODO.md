@@ -264,7 +264,11 @@ python tools/import_go_config.py <backup.json> <out_config.json> \
 
 ---
 
-## 5.5 【下一轮，用户 2026-10-30 拍板】分片直传（网页端大文件上传的正解）
+## 5.5 【✅ 已完成 2026-10-30 晚】分片直传（网页端大文件上传的正解）
+
+> **已实现并部署真机**（STATUS §57）：189pc 直传（本地零落盘）+ 全驱动通用回退
+> （分片落 temp_dir 稀疏文件）。真机 25 MiB 乱序 3 片 + 11 MiB 下载回源 MD5 一致。
+> 单测 466 pass + 3 skip。`multipart_enabled` 已翻回 `true`。
 
 **背景**：`multipart_enabled` 已关（STATUS §55），网页端上传全走 `PUT /api/fs/put`，
 受 `zig.max_upload_mb`（默认 64 MiB，2026-10-30 新增的安全阀）限制。光猫 tmpfs

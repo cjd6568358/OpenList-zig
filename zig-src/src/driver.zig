@@ -131,6 +131,27 @@ pub const Driver = struct {
         /// zeroes rather than an error, matching OpenList's behaviour for
         /// drivers that do not implement `GetDetails`.
         space: ?*const fn (ptr: *anyopaque, ctx: *Ctx) anyerror!DiskUsage = null,
+
+        // -------------------------------------------------------------------
+        // 分片直传（`/api/fs/multipart/*`，2026-10-30）。四个槽位**全或无**：
+        // 实现了 `mp_begin` 的驱动必须把另外三个一起实现。语义（对齐
+        // 189pc 的 initMultiUpload / getMultiUploadUrls+PUT / commit）：
+        //
+        //   * `mp_begin` 打开一个上游分片会话，返回驱动不透明句柄；
+        //   * `mp_put_chunk` 把一个分片（字节 + 该片 MD5 的 base64）推给上游，
+        //     片号从 1 开始、片内字节必须完整；
+        //   * `mp_commit` 带整文件 MD5 与「各片 MD5 大写 hex 用 \n 连接后再
+        //     MD5」的 slice MD5 收尾；
+        //   * `mp_abort` 释放句柄（上游侧的孤儿会话由上游自己过期回收）。
+        //
+        // MD5 的累计在 API 层（分片按序喂 Md5Stream），驱动只管搬运 —— 这让
+        // 189pc 的实现几乎全部复用现有 upload 链路。未实现的驱动由 API 层
+        // 回落到「分片落盘 + complete 时一次 put」的通用路径（api.zig）。
+        // -------------------------------------------------------------------
+        mp_begin: ?*const fn (ptr: *anyopaque, ctx: *Ctx, dir: []const u8, name: []const u8, size: i64, chunk_size_in: i64, chunk_size_out: *i64) anyerror!*anyopaque = null,
+        mp_put_chunk: ?*const fn (ptr: *anyopaque, ctx: *Ctx, session: *anyopaque, part: i64, md5_b64: []const u8, bytes: []const u8) anyerror!void = null,
+        mp_commit: ?*const fn (ptr: *anyopaque, ctx: *Ctx, session: *anyopaque, file_md5: []const u8, slice_md5: []const u8) anyerror!void = null,
+        mp_abort: ?*const fn (ptr: *anyopaque, ctx: *Ctx, session: *anyopaque) void = null,
     };
 
     pub fn name(self: Driver) []const u8 {
@@ -176,6 +197,27 @@ pub const Driver = struct {
     pub fn space(self: Driver, ctx: *Ctx) DiskUsage {
         const f = self.vtable.space orelse return .{};
         return f(self.ptr, ctx) catch .{};
+    }
+    /// 分片直传四件套是否可用（判断要整体一致，别只看一个槽位）。
+    pub fn supportsMultipart(self: Driver) bool {
+        return self.vtable.mp_begin != null and self.vtable.mp_put_chunk != null and
+            self.vtable.mp_commit != null and self.vtable.mp_abort != null;
+    }
+    pub fn mpBegin(self: Driver, ctx: *Ctx, dir: []const u8, file_name: []const u8, size: i64, chunk_size_in: i64, chunk_size_out: *i64) !*anyopaque {
+        const f = self.vtable.mp_begin orelse return Error.NotSupported;
+        return f(self.ptr, ctx, dir, file_name, size, chunk_size_in, chunk_size_out);
+    }
+    pub fn mpPutChunk(self: Driver, ctx: *Ctx, session: *anyopaque, part: i64, md5_b64: []const u8, bytes: []const u8) !void {
+        const f = self.vtable.mp_put_chunk orelse return Error.NotSupported;
+        return f(self.ptr, ctx, session, part, md5_b64, bytes);
+    }
+    pub fn mpCommit(self: Driver, ctx: *Ctx, session: *anyopaque, file_md5: []const u8, slice_md5: []const u8) !void {
+        const f = self.vtable.mp_commit orelse return Error.NotSupported;
+        return f(self.ptr, ctx, session, file_md5, slice_md5);
+    }
+    pub fn mpAbort(self: Driver, ctx: *Ctx, session: *anyopaque) void {
+        const f = self.vtable.mp_abort orelse return;
+        f(self.ptr, ctx, session);
     }
 };
 

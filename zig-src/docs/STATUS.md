@@ -4432,3 +4432,71 @@ HTTP/1.1 501
 70 MiB 上传 → 413 JSON；10 MiB 上传 → 200；14 mounts published。
 
 **下一轮**：分片直传（设计已写进 TODO §5.5）。
+
+---
+
+## 57. 分片直传落地（2026-10-30 晚，TODO §5.5 → ✅）
+
+`/api/fs/multipart/{init,chunk,complete,status,abort}` 全部实现并真机验证，
+`multipart_enabled` 翻回 `true` —— 网页端 >10 MiB 的文件默认走分片通道。
+
+### 57.1 两条路径（驱动能力协商）
+
+| 路径 | 触发条件 | 本地磁盘 | 适用 |
+|---|---|---|---|
+| **直传** | 驱动实现了 `mp_*` 四槽位（目前 = 189pc） | **0**（分片直推上游会话） | 任意大小 |
+| **回退** | 其余所有驱动 | 稀疏 spool 文件 = 文件大小（≤ temp_dir 容量） | 光猫 tmpfs 上限 220 MB |
+
+通用性：回退路径对**任何驱动**生效（零驱动改动）；`mp_*` 槽位是可选加速器，
+其他网盘（123/quark/115 上游同样是分片会话）可照 189pc 的四个函数逐个补。
+
+### 57.2 协议（对齐 4.2.6 前端 + Go `SessionSnapshot` 逐字段）
+
+* `POST init`（头：`File-Path`/`X-File-Size`/`X-Chunk-Size`/`Last-Modified`/
+  `Overwrite`/`Content-Type`）→ `data{upload_id, state, path, size, chunk_size,
+  total_chunks, received[], received_bytes, frontier, storage_progress, error}`
+  + `resumed`（仅 init）。同 key（path|size|mtime）的 receiving 会话自动续传。
+* `PUT chunk`（`X-Upload-Id`/`X-Chunk-Index`，body=分片）→ 幂等；片长不符 400。
+* `POST complete` → 阻塞至驱动收尾（与 `/fs/put` 同语义），成功 `state=completed`。
+* `GET status?upload_id=` / `POST abort`。
+* 错误一律 **HTTP 200 + `{code,message}` 信封**（Go `ErrorResp` 同形）：404 =
+  会话不存在（前端视为 completed）、429 = 片被拒（前端原片重试）、500 = 判死。
+
+### 57.3 关键实现点
+
+* **MD5 按序累计**：前端 3 worker 并发、到达顺序不定；早到的片挂在
+  `pending`（App 内存，≤ 并发数 × 片），攒齐前驱后按序喂 `Md5Stream`。
+  commit 时 `fileMd5`（整文件）与 `sliceMd5`（各片大写 hex `\n` 连接再 MD5）
+  同时就绪，无需再读文件。
+* **`mp_begin` 回写生效片大小**：189 的分片阶梯（`partSize`）不接受任意值 ——
+  8 MiB 片被 initMultiUpload 以 `"invalid part Size"` 拒绝（真机实测）。
+  驱动把 `partSize(size)` 回写，API 层据此重算 `total` 并告知前端。
+* **189pc 复用现有上传链**：`initMultiUpload`（无 MD5，永不秒传）→
+  `getMultiUploadUrls`（`mp_mu` 串行，防 session 刷新竞争）+ `putPartRaw`
+  （每请求独立 client，不吃全局锁）→ `commitMultiUploadFile`。
+* 会话表 = `App.mp_sessions`（内存，30 min TTL，init 时顺手 sweep）；
+  进程重启即丢，前端重新 init。挂载重建（存储编辑）后驱动指针变化 ⇒
+  会话判死并要求重传。
+* 回退路径的 spool 文件以 **`.read_write`** 打开（`openFile` 默认只读，
+  `writePositionalAll` 会 AccessDenied —— 测试抓出来的）。
+* WebDAV `PUT` 与 `fs/put` 仍受 `zig.max_upload_mb`（64 MiB）限制 ——
+  网页端大文件现在走分片，不受影响。
+
+### 57.4 验证
+
+* `zig build test`：**466 pass + 3 skip**（新增 4 个 multipart 测试：
+  fallback 经 Local 驱动的完整 round-trip、直传路径**乱序分片**的 MD5
+  累计断言、chunk 大小 clamp 的 Go ceiling 语义、快照/区间/尾片纯逻辑）。
+* 真机（/ecloud_self）：
+  - 25 MiB / 3 片**乱序并发**（1→2→0）→ complete → 网盘文件 size 一致；
+  - 11 MiB / 2 片 → 下载回源 **MD5 逐字节一致**；
+  - 客户端请求 8 MiB 片 ⇒ 服务端回写 10 MiB（189 阶梯）；
+  - 14 mounts published、无新增 ERROR。
+* 产物 aarch64 **1,375,832 B / `f6e49942`**。
+
+### 57.5 顺带
+
+* `max_body_memory` 4 → 16 MiB（chunk 正文驻留内存，免二次落盘）。
+* Zig 测试在 Windows 上 `DebugAllocator` 的泄漏报告路径会挂死 —— 分片测试
+  的会话分配改用 arena 批量回收（生产仍走 gpa，成对 free 由 mpFreeSession
+  结构保证，真机 RSS 观察）。

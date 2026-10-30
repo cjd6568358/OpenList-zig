@@ -160,11 +160,23 @@ pub fn main(init: std.process.Init) !void {
     const port: u16 = opts.port_override orelse @intCast(@max(cfg.http_port, 0));
     const spool_dir = if (cfg.temp_dir.len > 0) cfg.temp_dir else "data/temp";
 
+    // 分片上传（/api/fs/multipart/*）的会话 spool 根目录。会话只存内存，
+    // 上次进程留下的残片是垃圾（Go StartGC 同款逻辑）：启动先清空再建。
+    const mp_dir = try std.fmt.allocPrint(gpa, "{s}/multipart", .{spool_dir});
+    std.Io.Dir.cwd().deleteTree(rt.io(), mp_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(rt.io(), mp_dir) catch |e| {
+        log.warn("main: cannot create {s}: {s} — multipart fallback uploads will fail", .{ mp_dir, @errorName(e) });
+    };
+    app.mp_dir = mp_dir;
+
     var server = try http.Server.init(gpa, .{
         .address = cfg.address,
         .port = port,
         .spool_dir = spool_dir,
-        .max_body_memory = 4 * 1024 * 1024,
+        // 从 4 MiB 提到 16 MiB：分片上传的 chunk 正文（默认 10 MiB）直接
+        // 驻留内存，不再二次落盘（直传路径要整片连续字节算 MD5 + PUT）。
+        // 3 个并发片 ≈ 30 MiB RAM，光猫可承受。
+        .max_body_memory = 16 * 1024 * 1024,
         // 请求体安全阀（`zig.max_upload_mb`，默认 64 MiB）。旧的 8 GiB 上限
         // 在光猫上是纸面的：>4 MiB 的正文会整份落进 `temp_dir` —— 生产配置里
         // 是 tmpfs（220 MB，占的是 RAM）。放行 150-220 MB 的上传轻则

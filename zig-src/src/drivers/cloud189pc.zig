@@ -781,6 +781,17 @@ pub const Cloud189PC = struct {
     login_mu: std.Io.Mutex = .init,
     last_saved: []const u8 = "",
 
+    /// 分片直传：`getMultiUploadUrls` 换分片地址必须**串行**（并发会互相把
+    /// session 刷没，与 streamUpload 把换 URL 刻意留在主线程同理）。真正的
+    /// WAN 消耗在 putPartRaw 的 PUT 上 —— 那里用每请求独立的 client，不排队
+    /// 在 self.client 的全局锁上。
+    mp_mu: std.Io.Mutex = .init,
+
+    /// 分片直传的上游会话句柄（`mp_begin` 返回给 API 层的不透明指针）。
+    const MpUpload = struct {
+        upload_file_id: []u8,
+    };
+
     pub const vtable = driver.Driver.VTable{
         .name = drvName,
         .init = init,
@@ -795,6 +806,10 @@ pub const Cloud189PC = struct {
         .put = put,
         .copy = copy,
         .space = space,
+        .mp_begin = mpBegin,
+        .mp_put_chunk = mpPutChunk,
+        .mp_commit = mpCommit,
+        .mp_abort = mpAbort,
     };
 
     fn drvName(_: *anyopaque) []const u8 {
@@ -2326,6 +2341,123 @@ pub const Cloud189PC = struct {
             return self.fastUpload(a, dir, name, src, ctx);
         }
         return self.streamUpload(a, dir, name, src, ctx);
+    }
+
+    // -----------------------------------------------------------------------
+    // 分片直传（/api/fs/multipart/*，driver.zig 的 mp_* 槽位）。
+    //
+    // 与 streamUpload 共用同一条上游链路（initMultiUpload →
+    // getMultiUploadUrls+PUT → commitMultiUploadFile），差别只在驱动权：
+    // 分片的**读取与 MD5 累计**在 API 层 —— 字节由前端逐片送来，服务端不落
+    // 整份文件（光猫 tmpfs 220MB 放不下）。参数与头逐字段对齐 Go
+    // `drivers/189pc/utils.go` 的 upload 链。
+    // -----------------------------------------------------------------------
+
+    fn mpBegin(ptr: *anyopaque, ctx: *driver.Ctx, dir: []const u8, name: []const u8, size: i64, chunk_size_in: i64, chunk_size_out: *i64) anyerror!*anyopaque {
+                _ = chunk_size_in;
+const self = as(ptr);
+        const a = ctx.alloc;
+
+        const entry = try self.resolve(a, dir, &ctx.err_detail);
+        if (!entry.is_dir) return Error.InvalidPath;
+
+        // 189 的分片大小必须走自己的阶梯（partSize），不接受任意值 ——
+        // 8 MiB 的片会被 initMultiUpload 以 "invalid part Size" 拒绝
+        // （2026-10-30 真机实测）。生效值回写给 API 层，由它告知前端。
+
+        // 不带 fileMd5/sliceMd5（API 层此刻还算不出整文件 MD5）⇒ 永不秒传，
+        // 与 streamUpload 的 init 完全同形（lazyCheck=1）。
+        var params = List([2][]const u8).init(a);
+        try params.append(.{ "parentFolderId", entry.id });
+        try params.append(.{ "fileName", try urlmod.encode(a, name, .form) });
+        try params.append(.{ "fileSize", try numStr(a, size) });
+        const slice: i64 = partSize(size);
+        chunk_size_out.* = slice;
+        try params.append(.{ "sliceSize", try numStr(a, slice) });
+        try params.append(.{ "lazyCheck", "1" });
+        if (self.isFamily()) try params.append(.{ "familyId", self.cfg.family_id });
+
+        const body = (try self.request(
+            a,
+            try std.fmt.allocPrint(a, "{s}/initMultiUpload", .{self.uploadBase()}),
+            "GET",
+            params.slice(),
+            &.{},
+            self.isFamily(),
+            false,
+            &ctx.err_detail,
+        )).body;
+        const v = json.parse(a, body) catch return Error.UpstreamNotJson;
+        const data = v.getPath("data") orelse return Error.InvalidResponse;
+        const upload_file_id = data.strAt("uploadFileId") orelse return Error.InvalidResponse;
+
+        const h = try self.alloc.create(MpUpload);
+        errdefer self.alloc.destroy(h);
+        h.* = .{ .upload_file_id = try self.alloc.dupe(u8, upload_file_id) };
+        return h;
+    }
+
+    fn mpPutChunk(ptr: *anyopaque, ctx: *driver.Ctx, session: *anyopaque, part: i64, md5_b64: []const u8, bytes: []const u8) anyerror!void {
+        const self = as(ptr);
+        const h: *MpUpload = @ptrCast(@alignCast(session));
+        const a = ctx.alloc;
+
+        // 换分片 URL 串行（见 mp_mu 注释）；PUT 用独立 client，不吃全局锁。
+        self.mp_mu.lockUncancelable(rt.io());
+        const target = self.getMultiUploadUrls(
+            a,
+            h.upload_file_id,
+            try std.fmt.allocPrint(a, "{d}-{s}", .{ part, md5_b64 }),
+        ) catch |e| {
+            self.mp_mu.unlock(rt.io());
+            return e;
+        };
+        self.mp_mu.unlock(rt.io());
+
+        var client = httpclient.Client.init(self.alloc, .{
+            .timeout_s = 0, // 10 MiB 单片的 PUT 可能超过默认 60s
+            .insecure_skip_verify = self.client.opts.insecure_skip_verify,
+            .ca_bundle_path = self.client.opts.ca_bundle_path,
+        }, self.client.jar);
+        defer client.deinit();
+        return putPartRaw(&client, a, target, part, bytes);
+    }
+
+    fn mpCommit(ptr: *anyopaque, ctx: *driver.Ctx, session: *anyopaque, file_md5: []const u8, slice_md5: []const u8) anyerror!void {
+        const self = as(ptr);
+        const h: *MpUpload = @ptrCast(@alignCast(session));
+        const a = ctx.alloc;
+        // 句柄在此移交生命周期：成功/失败都不再复用（重传 = 重新 begin）。
+        defer {
+            self.alloc.free(h.upload_file_id);
+            self.alloc.destroy(h);
+        }
+
+        var commit = List([2][]const u8).init(a);
+        try commit.append(.{ "uploadFileId", h.upload_file_id });
+        try commit.append(.{ "fileMd5", file_md5 });
+        try commit.append(.{ "sliceMd5", slice_md5 });
+        try commit.append(.{ "lazyCheck", "1" });
+        try commit.append(.{ "isLog", "0" });
+        try commit.append(.{ "opertype", "3" });
+        _ = try self.request(
+            a,
+            try std.fmt.allocPrint(a, "{s}/commitMultiUploadFile", .{self.uploadBase()}),
+            "GET",
+            commit.slice(),
+            &.{},
+            self.isFamily(),
+            false,
+            &ctx.err_detail,
+        );
+    }
+
+    fn mpAbort(ptr: *anyopaque, ctx: *driver.Ctx, session: *anyopaque) void {
+        _ = ctx;
+        const self = as(ptr);
+        const h: *MpUpload = @ptrCast(@alignCast(session));
+        self.alloc.free(h.upload_file_id);
+        self.alloc.destroy(h);
     }
 };
 

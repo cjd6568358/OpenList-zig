@@ -115,8 +115,10 @@
 - **`/api/*` 未注册路径 = 真实 501 JSON**（`not implemented: <METHOD> <PATH>`，刻意偏差 Go 的 200+HTML 外壳）；
   `/api/` 之外仍是 200+shell / 405。**不能用 `res.jsonError`**（它对齐 Go `c.JSON(200,…) ` 恒回 HTTP 200）。
   前端 4.2.6 无条件调用的未实现端点只有 archive_extensions / offline_download_tools，已在 handle() 先行放行（200 空列表）。
-- **下一轮主项 = 分片直传**（设计已写 TODO §5.5：服务端不落盘、驱动加 beginUpload/putChunk/commitUpload 槽位、
-  session 内存 map、MD5 增量算、`multipart_enabled` 要翻回 true）。
+- **分片直传已落地**（2026-10-30 晚，TODO §5.5 / STATUS §57）：/api/fs/multipart/* 全实现，
+  multipart_enabled=true。驱动 mp_* 四槽位（189pc 直传=本地零落盘）；其余驱动通用回退
+  （分片落 temp_dir 稀疏文件）。mp_begin 驱动回写生效片大小（189 partSize 阶梯）。
+  会话内存表 30min TTL。真机 25MiB 乱序 3 片 + 11MiB MD5 一致。
 - **网页端上传只有 `PUT /api/fs/put` 一条路**：`/api/fs/form` 与 `/api/fs/multipart/*` 都没实现
   ⇒ `/api/public/settings` 的 `multipart_enabled` **必须 `false`**（否则前端 4.2.6 默认选 Multipart，
   >10MiB 走不存在的 `/fs/multipart/init`，落 noRoute 回 HTML ⇒ 报 `multipart init failed: network error`）。
