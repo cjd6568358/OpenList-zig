@@ -36,10 +36,10 @@
 
 ## 构建约定（本机有工具链）
 
-- 本机 Zig 0.17.0：`C:\Program Files\zig-x86_64-windows-0.17.0\zig.exe`；`zig build test` = **459 pass + 3 skip**。
+- 本机 Zig 0.17.0：`C:\Program Files\zig-x86_64-windows-0.17.0\zig.exe`；`zig build test` = **460 pass + 3 skip**。
   必须：① 先 `tools/ziglib_patch.py "<toolchain>/lib" C:/zigcache/olz-ziglib`；② 用 **`ZIG_LIB_DIR`** 环境变量（`--zig-lib-dir` 0.17 不认）；③ `ZIG_GLOBAL_CACHE_DIR`/`ZIG_LOCAL_CACHE_DIR` 都指 `C:/zigcache/olz`。
 - **🔴 裸调 `zig build`（漏 export ZIG_LIB_DIR）= 静默丢 TLS 补丁**：编译不报错，部署后 Quark/UC 挂载消失（14→12）。
-  判据：带补丁 **1,352,536 B / `52d38eea`**（2026-10-26 版）、1,352,552 B / `47648f5c`（10-24 版）；裸构建 1,352,624 B / `af22fd5f`。
+  判据：带补丁 **1,352,536 B / `dc815b20`**（2026-10-30 版，现役）、`52d38eea`（10-26 版）、1,352,552 B / `47648f5c`（10-24 版）；裸构建 1,352,624 B / `af22fd5f`。
   **部署后必须 grep `mount(s) published`，应为 14**。
 - 打包机 `10.0.0.4` 可选（`tools/build_remote.py`，`/tmp/olz-build`）。`-Ddrivers=` 白名单必须 comptime 分支。`build_remote.py` 必须走 `zig build test`。
 - ⚠ `zig build` 吞 "All tests passed" 且末尾打误导性 `failed command`（退出码 0）；判成功看 `--summary all` 的 `test success`。
@@ -107,9 +107,13 @@
 
 - **权威待办 = `zig-src/TODO.md`**；审计 = `zig-src/docs/STATUS.md`（§22/§23）、驱动审计 = `docs/AUDIT_2026-10-18-drivers.md`。
 - 已知欠项：全驱动真实 API+UI 回归、`model.Storage` 无 `modified`、配置项 `delayed_start`/`cors`/`tasks`。
-- 验证基线：459 单测 + 3 skip；生产 aarch64 **1,352,536 B / `52d38eea`**（2026-10-26）；真机 e2e 32/32。
+- 验证基线：460 单测 + 3 skip；生产 aarch64 **1,352,536 B / `dc815b20`**（2026-10-30）；真机 e2e 32/32。
+- **网页端上传只有 `PUT /api/fs/put` 一条路**：`/api/fs/form` 与 `/api/fs/multipart/*` 都没实现
+  ⇒ `/api/public/settings` 的 `multipart_enabled` **必须 `false`**（否则前端 4.2.6 默认选 Multipart，
+  >10MiB 走不存在的 `/fs/multipart/init`，落 noRoute 回 HTML ⇒ 报 `multipart init failed: network error`）。
+  详见 STATUS §55，有单测钉住。调试真机可拿 `config.zig.json` 的 `zig.token` 直接当 `Authorization`。
 - **根目录整洁铁律**：仓库根只允许上游文件 + `zig-src/ .github/ .workbuddy/ .workbuddy-ai/`；Zig 脚本一律 `zig-src/tools/`，新脚本用 `Path(__file__).resolve().parents[2]` 定位仓库根。
 - **pan115 fixture 铁律**：`src/drivers/115list_fixture.json`（`tools/gen_115_fixture.py` 生成）**必须入库**；真机原文 `115list_sample.json` 含真实文件名**永不入库**。
-- **外部二进制留档**：`D:/workspace/server/armbian/bin/openlist/` = 现役 openlist（1,352,536 B / `52d38eea`）+ 设备现役 `config.zig.json`；`_backup/` 收旧版（10-24 版 1,352,552 B 与 10-22/10-21 版）。设备侧 `.bak` 按规矩只留切换当次一份，现为 `openlist.bak-20261026`（=10-24 版，带补丁，可直接回滚）。
+- **外部二进制留档**：`D:/workspace/server/armbian/bin/openlist/` = 现役 openlist（1,352,536 B / `dc815b20`，10-30 版）+ 设备现役 `config.zig.json`；`_backup/` 收旧版（`openlist-20261026-52d38eea`、10-24 版、10-22/10-21 版）。设备侧 `.bak` 按规矩只留切换当次一份（本次未在设备留 .bak，回滚靠本地留档重推）。
 - 磁盘紧张是老问题（D 盘曾 100%）；npm pack 的 23MB 前端包用完立刻删。
 - 一次性调查脚本已清理（commit 97a4b7d2）；不可恢复素材暂存 `D:/workspace/_olz-staging/2026-10-24-cleanup/`。
