@@ -1457,7 +1457,7 @@ Chromium 装起来**（约 500 MB）。
 | 索引管理 `admin/index/*`、`admin/scan/*` | `handles.BuildIndex` 等 | 无索引，自然无索引管理 |
 | **离线下载** `fs/add_offline_download`、`admin/setting/set_aria2/set_qbit/set_transmission/set_115*/set_123*/set_pikpak/set_thunder*/set_guangyapan` | `handles.AddOfflineDownload` 等 | 需要外部下载工具/账号体系 |
 | **Torrent** `fs/torrent/{parse,upload_parse,rapid_upload,generate}` | `handles.ParseTorrent` 等 | 同上，且体量大 |
-| **分片上传** `fs/multipart/{init,chunk,complete,status,abort}` | `multipartPkg` | 只有 `fs/put` / `fs/form` 两条直传路径 |
+| **分片上传** `fs/multipart/{init,chunk,complete,status,abort}` | `multipartPkg` | 只有 `fs/put` / `fs/form` 两条直传路径。⚠️ 4.2.6 前端把 Multipart 排在 `available()` 首位，**只要 `/api/public/settings` 报 `multipart_enabled=true`，>10 MiB 的文件就会走这条不存在的路由**（noRoute 回 200+HTML ⇒ 前端重试 3 次 ⇒ 报 `multipart init failed: network error`）。故该 setting 必须为 `false`，见 2026-10-30 条目 |
 | Meta 元数据 `admin/meta/*`（5 个） | `handles.ListMetas` 等 | 需要 meta 表 |
 | 消息中心 `admin/message/{get,send}` | `message.HttpInstance` | 需要消息总线 |
 | S3 / FTP / SFTP / MCP 服务 | `S3()` / `_ftp()` / `MCP()` | 只保留 WebDAV（SFTP 已存档，见 `docs/FEASIBILITY.md` §5.3） |
@@ -1490,7 +1490,7 @@ Chromium 装起来**（约 500 MB）。
 |---|---|
 | `POST /api/me/update` ✅ 已补 | Profile 页改密码/改用户名（Go `handles.UpdateCurrent`）。2026-10-16 补 |
 | `GET /api/auth/logout` ✅ 已补 | 管理页登出（Go `handles.LogOut`）。2026-10-16 补 |
-| `PUT /api/fs/form` | multipart 表单直传。上一行自称"只有 fs/put / fs/form 两条直传路径"，实际无此路由；前端拖拽上传走 `fs/put`，故不阻塞 |
+| `PUT /api/fs/form` | multipart 表单直传。上一行自称"只有 fs/put / fs/form 两条直传路径"，实际无此路由；**前端只在用户手工把上传方式切到 "Form" 时才会调它**（默认不是它，见下方 2026-10-30 条目），故不阻塞 |
 | `GET/POST /api/fs/archive/meta` | 压缩包元信息（Go `handles.FsArchiveMetaSplit`，`router.go:199`）。**不在上面任何删减行**，2026-10-17 复核报告 §3.3 补列。`archive/list` 已实现，meta 未实现 |
 | `POST /api/admin/setting/reset_token` | 轮换 admin token。落点 = `/api/admin/setting/` 前缀白名单 ⇒ `handleSettingRoute` 无匹配分支 ⇒ **JSON 404 信封**（非 NoRoute），症状为前端静默失败 |
 
@@ -4335,3 +4335,47 @@ addition，Linux 下 `tmp_dir` 是 `/tmp/xxx`（安全），Windows 下是 `D:\.
 「**已作废的会话 token 被当成配置字段长期留着**」。判断标准：如果它是用户
 手填/历史遗留且已失效 → 清掉；如果是驱动刷新产物（189pc / WoPan / aliyun 等
 有 refresh 能力的）→ 必须留，否则每次重启都要重新刷新甚至丢令牌。
+
+---
+
+## 55. 网页端上传报 "network error" 的根因：`multipart_enabled` 撒谎（2026-10-30）
+
+**症状**：网页端往 `/ecloud_self`、`/ecloud_family` 上传文件，进度条一起就报
+`network error`，服务端日志没有任何异常（只有 189 列表请求的
+`HttpConnectionClosed` 噪音）。用户最初判断是"天翼云驱动坏了"。
+
+**结论：与驱动无关，与存储类型也无关。** 是 `/api/public/settings` 把
+`multipart_enabled` 报成 `"true"`，而本工程没有 `/api/fs/multipart/*`。
+
+**证据链**（逐段实测，不是推断）：
+
+1. 前端 `openlist-frontend@4.2.6` 的 `Upload-*.js` 把上传方式排成
+   `[Multipart, HTTP Direct, Stream, Form]`，`available()` 依次判
+   `multipart_enabled` / `direct_upload_tools` / 恒真 / 恒真，**默认取第一个**。
+   所以 `multipart_enabled=true` ⇒ 默认 Multipart。
+2. Multipart 的实现里第一行就是：`size <= multipart_chunk_size(10MiB)`
+   ⇒ 退化成 Stream（`PUT /api/fs/put`）；否则 ⇒ `POST /api/fs/multipart/init`。
+3. 本工程 `isRegisteredAuthedPath` 里没有这条路由 ⇒ 落 `noRoute` ⇒
+   **200 + 前端 HTML 外壳**（实测：`POST /api/fs/multipart/init` 返回
+   `<!doctype html>…OPENLIST_CONFIG…`）。
+4. 前端 `X()` 包装只认 `{code: number, data}` 的响应，HTML 被当成"没响应" ⇒
+   重试 3 次（1s/2s 退避）⇒ `throw Error('multipart init failed: network error')`。
+   这条文案在整个 dist 里只出现在这一处，与用户看到的一致。
+
+**为什么小文件没事**：≤10 MiB 走 `/api/fs/put`（`handleFsPut`，已实现）。
+实测 `/ecloud_self`、`/ecloud_family` 用 `/fs/put` 传 5B / 100KB / 1MB / 2MB /
+5MB / 10MB / 12MB **全部 200**，文件在网盘里真实可见（探针文件事后已删除）。
+所以"个人和家庭都不能传"不是两个驱动都坏了，而是两个挂载上试的都是大文件。
+
+**修复**：`public_setting_defaults` 里 `multipart_enabled` 由 `"true"` 改
+`"false"`（`api.zig`）。此时 `available()` 的第一个是 Stream ⇒ 所有大小都走
+`PUT /api/fs/put`。附带一条单测把该值钉死，并断言
+`POST /api/fs/multipart/init` 仍落到 NoRoute —— 将来真做分片上传的人必须
+同时改这两处。
+
+**边界**：`PUT /api/fs/form` 仍未实现（`PUT` 未注册路径 ⇒ 405）。用户若在
+上传方式下拉框里手工选 "Form" 才会踩到；默认不会。
+
+**顺带**：大于 10 MiB 的文件现在整份进 `PUT /api/fs/put`，`http.zig` 按
+`max_body_memory=1MiB` 落盘到 `temp_dir`（`/tmp/cache`，tmpfs 220MB）。
+传超大文件前先看 `df /tmp` —— 这是既有设计，不是本次引入的。

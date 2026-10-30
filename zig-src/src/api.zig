@@ -56,7 +56,12 @@
 //! 2FA/LDAP, offline download and remote archive browsing are also not
 //! implemented; archive browsing is **local ZIP/TAR only** (see
 //! `handleFsArchiveList`, remote archives return 501). `fs/form` (multipart
-//! upload) and `fs/archive/meta` are intentionally skipped — see STATUS §45.3.
+//! upload), `fs/multipart/*` (chunked upload) and `fs/archive/meta` are
+//! intentionally skipped — see STATUS §45.3. Because `fs/multipart/*` is
+//! missing, `/api/public/settings` **must** report `multipart_enabled=false`,
+//! otherwise the 4.2.6 frontend picks that uploader for files >10 MiB and
+//! fails with "multipart init failed: network error" (see the comment on
+//! `public_setting_defaults`).
 //! (A WebDAV server is served at /dav — see webdav.zig.)
 
 const std = @import("std");
@@ -1025,7 +1030,21 @@ const public_setting_defaults = [_]PublicSetting{
     .{ .key = "ldap_login_enabled", .value = "false" },
     .{ .key = "ldap_login_tips", .value = "login with ldap" },
     // ---- TRAFFIC ----
-    .{ .key = "multipart_enabled", .value = "true" },
+    //
+    // ⚠️ 必须是 "false"。4.2.6 前端的 `Upload` chunk 把上传方式排成
+    // `[Multipart, HTTP Direct, Stream, Form]`，默认取**第一个 available()**：
+    //   * `multipart_enabled === "true"` ⇒ 默认 Multipart，而它对**超过
+    //     `multipart_chunk_size` MiB 的文件**直接调 `POST /api/fs/multipart/init`。
+    //     本工程没有这条路由（STATUS §22：分片上传不做），请求落到 `noRoute`
+    //     ⇒ 200 + HTML 外壳；前端 `X()` 包装只认 `{code:number,data}`，
+    //     拿不到就重试 3 次，最后抛 `multipart init failed: network error`
+    //     —— 浏览器里只看到 "network error"，与驱动、与存储类型都无关。
+    //   * "false" ⇒ 默认 Stream，走 `PUT /api/fs/put`（`handleFsPut`，已实现），
+    //     大小文件都能传。
+    // 2026-10-30 线上实测：/ecloud_self、/ecloud_family 用 /fs/put 传 5B/100KB/
+    // 1MB/2MB/5MB/10MB 全部 200；同一台设备 `POST /api/fs/multipart/init`
+    // 返回的确实是 200 + index.html。
+    .{ .key = "multipart_enabled", .value = "false" },
     .{ .key = "multipart_chunk_size", .value = "10" },
 };
 
@@ -5654,6 +5673,34 @@ test "public settings carries the keys the frontend actually reads" {
     // logo 尤其不能为空 —— 空串渲染出来就是 `<img src="">`。
     try testing.expect(data.get("logo").?.asStr().?.len > 0);
     try testing.expect(data.get("site_title").?.asStr().?.len > 0);
+}
+
+test "multipart_enabled must stay false (fs/multipart/* is not implemented)" {
+    // 4.2.6 前端的 `Upload` chunk 默认取第一个 available() 的上传方式：
+    // `multipart_enabled === "true"` ⇒ Multipart，而它对 >chunk_size 的文件
+    // 走 `POST /api/fs/multipart/init`。本工程没有该路由 ⇒ noRoute 返回
+    // 200 + HTML ⇒ 前端重试 3 次后抛 "multipart init failed: network error"。
+    // 因此这里把值钉死成 "false"（此时默认方式是 Stream → PUT /api/fs/put）。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var fe = try frontend_mod.initFromHtml(a, .{}, ROUTING_SHELL);
+    defer fe.deinit();
+    var app = routingApp(a, fe);
+
+    const res = try doRequest(&app, a, "GET", "/api/public/settings");
+    try testing.expectEqual(@as(u16, 200), res.status);
+    const parsed = try json.parse(a, res.buf.slice());
+    const data = parsed.getPath("data").?.object;
+    try testing.expectEqualStrings("false", data.get("multipart_enabled").?.asStr().?);
+
+    // 同一条链路上的另一环：`fs/multipart/init` 确实没有注册（落到 NoRoute
+    // 的 200 + HTML 外壳）。这条断言是为了让"以后真实现了分片上传"的人
+    // 必须同时改上面的 setting 与这个测试，而不是只改一半。
+    const r2 = try doRequest(&app, a, "POST", "/api/fs/multipart/init");
+    try testing.expectEqual(@as(u16, 200), r2.status);
+    try testing.expect(std.mem.indexOf(u8, r2.buf.slice(), "OPENLIST_CONFIG") != null);
 }
 
 test "fs list carries the envelope fields the frontend reads" {
