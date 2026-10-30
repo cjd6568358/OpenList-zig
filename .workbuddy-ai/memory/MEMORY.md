@@ -36,10 +36,10 @@
 
 ## 构建约定（本机有工具链）
 
-- 本机 Zig 0.17.0：`C:\Program Files\zig-x86_64-windows-0.17.0\zig.exe`；`zig build test` = **462 pass + 3 skip**。
+- 本机 Zig 0.17.0：`C:\Program Files\zig-x86_64-windows-0.17.0\zig.exe`；`zig build test` = **466 pass + 3 skip**。
   必须：① 先 `tools/ziglib_patch.py "<toolchain>/lib" C:/zigcache/olz-ziglib`；② 用 **`ZIG_LIB_DIR`** 环境变量（`--zig-lib-dir` 0.17 不认）；③ `ZIG_GLOBAL_CACHE_DIR`/`ZIG_LOCAL_CACHE_DIR` 都指 `C:/zigcache/olz`。
 - **🔴 裸调 `zig build`（漏 export ZIG_LIB_DIR）= 静默丢 TLS 补丁**：编译不报错，部署后 Quark/UC 挂载消失（14→12）。
-  判据：带补丁 **1,353,968 B / `e74276b7`**（2026-10-30 下午版，现役）、1,352,536 B / `dc815b20`（10-30 上午）、`52d38eea`（10-26）。
+  判据：带补丁 **1,375,832 B / `f6e49942`**（2026-10-30 晚版，现役）、1,352,536 B / `dc815b20`（10-30 上午）、`52d38eea`（10-26）。
   ⚠ 代码再变后**尺寸判据失效**，部署后以 `mount(s) published` = 14（Quark/UC 在 = TLS 补丁在）+ sha256 为准。
   **部署后必须 grep `mount(s) published`，应为 14**。
 - 打包机 `10.0.0.4` 可选（`tools/build_remote.py`，`/tmp/olz-build`）。`-Ddrivers=` 白名单必须 comptime 分支。`build_remote.py` 必须走 `zig build test`。
@@ -108,7 +108,7 @@
 
 - **权威待办 = `zig-src/TODO.md`**；审计 = `zig-src/docs/STATUS.md`（§22/§23）、驱动审计 = `docs/AUDIT_2026-10-18-drivers.md`。
 - 已知欠项：全驱动真实 API+UI 回归、`model.Storage` 无 `modified`、配置项 `delayed_start`/`cors`/`tasks`。
-- 验证基线：462 单测 + 3 skip；生产 aarch64 **1,353,968 B / `e74276b7`**（2026-10-30 下午）；真机 e2e 32/32。
+- 验证基线：466 单测 + 3 skip；生产 aarch64 **1,375,832 B / `f6e49942`**（2026-10-30 晚）；真机 e2e 32/32。
 - **请求体安全阀 `zig.max_upload_mb`（默认 64 MiB）**：>4MiB 请求体落 `temp_dir`（生产 = tmpfs 220MB 占 RAM），
   150-220MB 会 OOM/看门狗重启，>220MB ENOSPC 掐连接。超限回 **413 JSON**（中文 message，axios 可弹出）。
   0 = 恢复 8GiB。WebDAV PUT 同用此上限。`temp_dir` 指到大存储后可调高。
