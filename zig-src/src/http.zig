@@ -692,7 +692,8 @@ pub const Server = struct {
                     return;
                 },
                 error.BodyTooLarge => {
-                    try writeSimpleError(stream, 413, "Content Too Large");
+                    // JSON 信封让前端能把 message 弹出来（见 bodyTooLargeJson）。
+                    try writeBodyTooLarge(stream, self.opts.max_body);
                     return;
                 },
                 else => return e,
@@ -1161,6 +1162,29 @@ fn writeSimpleError(stream: std.Io.net.Stream, status: u16, text: []const u8) !v
     try sw.interface.flush();
 }
 
+/// 413（请求体超过 `max_body`）的响应体：JSON 信封，形状与 `res.jsonError`
+/// 一致 —— 前端 axios 的错误拦截会取 `response.data.message` 直接展示；
+/// 裸文本只能得到 "Upload failed with status 413"。
+pub fn bodyTooLargeJson(buf: []u8, max_body: u64) ?[]const u8 {
+    const mib = max_body / (1024 * 1024);
+    return std.fmt.bufPrint(
+        buf,
+        "{{\"code\":413,\"message\":\"文件超过上传上限 {d} MiB（zig.max_upload_mb）: 本机临时目录放不下更大的上传，大文件请用网盘官方客户端，或将 temp_dir 指向更大存储后调高上限\"}}",
+        .{mib},
+    ) catch null;
+}
+
+fn writeBodyTooLarge(stream: std.Io.net.Stream, max_body: u64) !void {
+    var text_buf: [512]u8 = undefined;
+    const text = bodyTooLargeJson(&text_buf, max_body) orelse return;
+    var b: [768]u8 = undefined;
+    const s = std.fmt.bufPrint(&b, "HTTP/1.1 413 {s}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ reasonPhrase(413), text.len, text }) catch return;
+    var wbuf: [512]u8 = undefined;
+    var sw = stream.writer(rt.io(), &wbuf);
+    try sw.interface.writeAll(s);
+    try sw.interface.flush();
+}
+
 // ---------------------------------------------------------------------------
 // Buffered connection reader
 // ---------------------------------------------------------------------------
@@ -1403,6 +1427,18 @@ test "T5: run() returns after shutdown once connections drain" {
 
 fn runWorker(server: *Server) void {
     server.run() catch {};
+}
+
+test "413 body is a JSON envelope carrying the limit in MiB" {
+    var buf: [512]u8 = undefined;
+    const s = bodyTooLargeJson(&buf, 64 * 1024 * 1024).?;
+    // 前端 axios 的错误拦截读 `response.data.message`；code 必须是数字。
+    try testing.expect(std.mem.startsWith(u8, s, "{\"code\":413,\"message\":\""));
+    try testing.expect(std.mem.indexOf(u8, s, "64 MiB") != null);
+
+    // 放大到非整 MiB 的旧 8 GiB 上限也不该截断（/1024/1024 后是 8192）。
+    const s2 = bodyTooLargeJson(&buf, 8 * 1024 * 1024 * 1024).?;
+    try testing.expect(std.mem.indexOf(u8, s2, "8192 MiB") != null);
 }
 
 test "H6: set/add reject CR/LF/NUL in header names and values" {

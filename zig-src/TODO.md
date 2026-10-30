@@ -1,7 +1,9 @@
 # TODO — openlist-zig 待办清单
 
-> 最后更新：2026-10-22（三个变体驱动收尾：`123 Open` / `QuarkOpen` / `115 Open`
-> 改成**编译期可选**并真机验证，过程中修掉 2 个契约 bug，见 STATUS.md §53）
+> 最后更新：2026-10-30（网页端上传 network error 根因 = `multipart_enabled` 撒谎，
+> 已改 false 并部署；新增请求体安全阀 `zig.max_upload_mb`（默认 64 MiB）与
+> `/api/*` 未注册路径 501 JSON 兜底，见 STATUS §55/§56。
+> **下一轮主项 = §5.5 分片直传**）
 >
 > 上一版：2026-10-18（审计修复两轮全部收官：§37.4 剩余项 + P3 + N1 落地，
 > 构建 400/400、真机 e2e 92/92，审计文档整合进 docs/，见 STATUS.md §38）
@@ -259,6 +261,46 @@ python tools/import_go_config.py <backup.json> <out_config.json> \
   审计与复核文档已收敛到 `zig-src/docs/AUDIT_2026-10-18-drivers.md`（权威）+
   `docs/STATUS.md`（状态与编年日志）；更早的 6 份审计与 `outputs/` 原稿已于
   2026-10-18 清理，需要时从 git 历史取回（`git show 7356589e:<path>`）。
+
+---
+
+## 5.5 【下一轮，用户 2026-10-30 拍板】分片直传（网页端大文件上传的正解）
+
+**背景**：`multipart_enabled` 已关（STATUS §55），网页端上传全走 `PUT /api/fs/put`，
+受 `zig.max_upload_mb`（默认 64 MiB，2026-10-30 新增的安全阀）限制。光猫 tmpfs
+只有 220 MB 且占 RAM，"整份落盘再交给驱动"的路永远走不通 —— 要支持大文件，
+必须**分片直传驱动**：分片字节由前端逐片送来，服务端不落盘。
+
+**接口（对齐 4.2.6 前端 `Upload-*.js` 的实际调用，逐条实测过）**：
+
+| 端点 | 前端行为 |
+|---|---|
+| `POST /api/fs/multipart/init`（头：`File-Path`/`X-File-Size`/`X-Chunk-Size`/`Last-Modified`） | 失败重试 3 次（1s/2s）后抛 `multipart init failed: network error`；响应 `data{upload_id, chunk_size, total_chunks, state, received[], received_bytes}` |
+| `PUT /api/fs/multipart/chunk`（头：`X-Upload-Id`/`X-Chunk-Index`，body=分片字节） | 并发 3；响应 code 429/409 可重试，其他非 200 抛错；`X()` 只认 `{code:number,data}` |
+| `POST /api/fs/multipart/complete`（头：`X-Upload-Id`） | 发出后轮询 status 直到 `state==="completed"` |
+| `GET /api/fs/multipart/status?upload_id=` | `data.state`: `receiving`/`completed`/`failed*` |
+| `POST /api/fs/multipart/abort` | 前端 4.2.6 未调用，可后置 |
+
+**设计要点**：
+
+1. **服务端不落盘**。每片的 MD5 在内存片上现算；189 的 commit 需要
+   `fileMd5`（整文件）与 `sliceMd5`（各片 MD5 大写 hex 用 `\n` 连接后再 MD5），
+   两者都能增量算（`hash.Md5Stream` 边喂边更）—— complete 时就绪，不需要再读文件。
+2. **驱动要新增可选槽位**（vtable 可选项，参照 `copy` 的先例）：
+   `beginUpload(dir,name,size,chunk_size) → session` / `putChunk(session, part_no, md5_b64, bytes)` /
+   `commitUpload(session, file_md5, slice_md5)`。189/189pc 直接映射到
+   `initMultiUpload` / `getMultiUploadUrls+PUT`（复用 `putPartRaw` 的重试）/
+   `commitMultiUploadFile`。其他驱动先回 501 "driver does not support chunked upload"。
+3. **session = App 级内存 map**（upload_id → 会话），30 min 过期清理；
+   进程重启丢会话 ⇒ 前端重新 init（received 空），无需持久化。
+4. **与安全阀的关系**：chunk PUT 本身 = chunk_size（默认 10 MiB）<
+   `max_upload_mb`，不受影响；`fs/put` 与 WebDAV 大文件仍被 64 MiB 拦住。
+5. **验收**：网页端传 1 GB 到 `/ecloud_self` 成功；服务端 RSS 峰值 < 60 MB；
+   `zig build test` 全绿 + 真机 e2e；`multipart_enabled` 翻回 `true`
+   （要同步改 `public_setting_defaults` 的注释与钉住它的单测）。
+
+预估 1–2 天。**动工前先读一遍 4.2.6 `Upload-legacy-Cl_JVVnw.js` 的 `Z()`/`E()`/
+`X()`**（本地缓存 `/tmp/fe/all/`，或从 npmmirror 重下）。
 
 ---
 

@@ -123,6 +123,11 @@ pub const Config = struct {
     ca_bundle: []const u8,
     http_timeout: i64,
 
+    /// 单个请求体的上限（MiB）。这个构建把 >4 MiB 的请求体整份落盘到
+    /// `temp_dir`（光猫上是 tmpfs，吃的是 RAM），超限即 413 —— 见 main.zig
+    /// 的注释。0 = 沿用 http.zig 的 8 GiB 硬上限（不推荐在光猫上这么配）。
+    max_upload_mb: i64,
+
     /// Frontend presentation. OpenList keeps these in its settings table and
     /// rewrites `index.html` from them at startup; this build has no database,
     /// so they are static config. Defaults match OpenList's fresh install (see
@@ -618,6 +623,11 @@ pub fn load(alloc: std.mem.Allocator, path: []const u8) !*Config {
 
     cfg.ca_bundle = str(cfg.root.getPath("zig.ca_bundle"), "");
     cfg.http_timeout = int(cfg.root.getPath("zig.http_timeout"), 60);
+    // 请求体安全阀：光猫上 spool 目录是 tmpfs（220 MB，吃 RAM），一旦放行
+    // 150-220 MB 的上传就会把内存顶爆（OOM → 看门狗重启）。默认 64 MiB
+    // 给足并发余量（前端同时最多 3 个文件在传）；temp_dir 指到大容量外挂
+    // 存储后可调高。Go 没有对应键（服务器不缺内存），属 Zig 部署特有。
+    cfg.max_upload_mb = int(cfg.root.getPath("zig.max_upload_mb"), 64);
 
     cfg.site_title = str(cfg.root.getPath("zig.site_title"), "OpenList (zig)");
     cfg.main_color = str(cfg.root.getPath("zig.main_color"), "#1890ff");
@@ -826,6 +836,7 @@ pub const DEFAULT_CONFIG =
     \\  "zig": {
     \\    "ca_bundle": "",
     \\    "http_timeout": 60,
+    \\    "max_upload_mb": 64,
     \\    "web_version": "rolling",
     \\    "cdn_fallbacks": [],
     \\    "site_title": "OpenList (zig)",
@@ -862,6 +873,8 @@ test "load creates defaults then round-trips" {
     try testing.expectEqualStrings("0.0.0.0", cfg.address);
     try testing.expect(cfg.jwt_secret.len > 0);
     try testing.expectEqual(@as(usize, 0), cfg.storages.len);
+    // 请求体安全阀默认 64 MiB（main.zig 据此算 max_body；见 main.zig 注释）。
+    try testing.expectEqual(@as(i64, 64), cfg.max_upload_mb);
 
     // written file must be parseable and carry the generated secret
     const back = try std.Io.Dir.cwd().readFileAlloc(rt.io(), path, testing.allocator, .limited(1 << 20));
@@ -870,6 +883,25 @@ test "load creates defaults then round-trips" {
     defer arena.deinit();
     const v = try json.parse(arena.allocator(), back);
     try testing.expectEqualStrings(cfg.jwt_secret, v.strAt("jwt_secret").?);
+}
+
+test "zig.max_upload_mb is honoured and 0 restores the 8 GiB ceiling" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const path = try std.fs.path.join(testing.allocator, &.{ dir, "config.json" });
+    defer testing.allocator.free(path);
+
+    try std.Io.Dir.cwd().writeFile(rt.io(), .{ .sub_path = path, .data =
+        \\{"jwt_secret":"x","zig":{"max_upload_mb":256},"storages":[]}
+    });
+
+    const cfg = try load(testing.allocator, path);
+    defer cfg.deinit();
+    setForTest(cfg);
+    defer setForTest(null);
+    try testing.expectEqual(@as(i64, 256), cfg.max_upload_mb);
 }
 
 test "unknown keys survive a save" {

@@ -4379,3 +4379,56 @@ addition，Linux 下 `tmp_dir` 是 `/tmp/xxx`（安全），Windows 下是 `D:\.
 **顺带**：大于 10 MiB 的文件现在整份进 `PUT /api/fs/put`，`http.zig` 按
 `max_body_memory=1MiB` 落盘到 `temp_dir`（`/tmp/cache`，tmpfs 220MB）。
 传超大文件前先看 `df /tmp` —— 这是既有设计，不是本次引入的。
+
+---
+
+## 56. 请求体安全阀 + `/api/*` 未注册路径 501（2026-10-30 下午）
+
+§55 把网页端上传收回 `fs/put` 之后，遗留两个隐患，本轮一起修掉：
+
+### 56.1 `zig.max_upload_mb`（默认 64 MiB）—— 防止上传打爆光猫
+
+`fs/put` 的请求体 >4 MiB 会整份落盘到 `temp_dir`（生产 = `/tmp/cache`，tmpfs
+220 MB，**占的是 RAM**）。旧的 `max_body = 8 GiB` 在这台设备上是纸面的：
+
+- >220 MB：tmpfs `ENOSPC` → `readRequest` 失败 → 连接被掐断、不回任何响应；
+- 150–220 MB：tmpfs 吃掉 150+ MB RAM（available 只有 ~219 MB）→ OOM、
+  openlist 被杀，极端情况拖到硬件看门狗重启。
+
+现在 `max_body = zig.max_upload_mb × 1 MiB`（默认 64），超限返回 **413 JSON**
+（`{"code":413,"message":"文件超过上传上限 … MiB（zig.max_upload_mb）…"}`
+—— axios 的错误拦截能直接把 message 弹出来，而不是 "Upload failed with
+status 413"）。64 是按"前端最多 3 文件并发 + 219 MB available"算的余量；
+`temp_dir` 指到大容量外挂存储后可调高，0 = 恢复 8 GiB 硬上限。
+
+**影响面**：WebDAV `PUT` 与 `/api/fs/put` 同用这个上限 —— >64 MiB 的 WebDAV
+上传也会被 413。这是有意收紧：此前它们在 64–220 MB 段"能过但危险"。
+
+### 56.2 `/api/*` 未注册路径 → 真实 501 JSON（刻意偏差）
+
+上游 NoRoute 对 `/api/*` 回 200 + index.html —— 对 API 来说是最坑的失败方式：
+curl 看到 200，前端把 HTML 当 JSON 静默解析失败，真问题（路由不存在）被包装
+成 "network error"（§55 正是这么掩盖的）。现在 `/api/*` 未注册路径返回
+
+```
+HTTP/1.1 501
+{"code":501,"message":"not implemented: <METHOD> <PATH>","data":null}
+```
+
+`/api/` 之外（SPA 路由、静态资源）维持上游行为：GET/POST → 200 + shell，
+其他方法 → 405。**注意不能走 `res.jsonError`** —— 它对齐 Go `c.JSON(200,…)`
+恒回 HTTP 200（http.zig jsonError 注释），这里需要真实状态码。
+
+前端影响面核查过：4.2.6 无条件调用的未实现端点只有
+`GET /api/public/archive_extensions` 与 `GET /api/public/offline_download_tools`
+（前者每次页面加载都调），两者早已在 `handle()` 里先行放行（200 + 空列表），
+不会踩到 501。其余未实现端点（分享/离线下载/webauthn/2fa/search/…）都在
+用户主动操作时才调，501 的 message 反而能一眼说明"为什么按钮没反应"。
+
+### 56.3 验证
+
+`zig build test` **462 pass + 3 skip**。真机部署后核验：
+`GET /api/nope` → 501 + "not implemented: GET /api/nope"；
+70 MiB 上传 → 413 JSON；10 MiB 上传 → 200；14 mounts published。
+
+**下一轮**：分片直传（设计已写进 TODO §5.5）。

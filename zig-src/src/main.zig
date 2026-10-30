@@ -165,9 +165,16 @@ pub fn main(init: std.process.Init) !void {
         .port = port,
         .spool_dir = spool_dir,
         .max_body_memory = 4 * 1024 * 1024,
-        // 设备上正文是落盘的，8 GiB 远超可写分区；但仍要允许大文件上传，
-        // 所以保持较大上限，改由 `max_connections` 提供真正的资源闸门。
-        .max_body = 8 * 1024 * 1024 * 1024,
+        // 请求体安全阀（`zig.max_upload_mb`，默认 64 MiB）。旧的 8 GiB 上限
+        // 在光猫上是纸面的：>4 MiB 的正文会整份落进 `temp_dir` —— 生产配置里
+        // 是 tmpfs（220 MB，占的是 RAM）。放行 150-220 MB 的上传轻则
+        // ENOSPC（连接被掐断，浏览器只见 network error），重则 OOM、拖到
+        // 硬件看门狗重启。64 MiB 是按"前端最多 3 个文件并发 + 219 MB
+        // available"算出来的余量；`temp_dir` 指到大容量存储后可调高。
+        .max_body = if (cfg.max_upload_mb > 0)
+            @as(u64, @intCast(cfg.max_upload_mb)) * 1024 * 1024
+        else
+            8 * 1024 * 1024 * 1024,
         .read_timeout_s = 300,
         // H04：把配置里的 max_connections 真正接到 accept 循环。
         // 以前这两个值被解析出来却从未传入，等于没有保护。

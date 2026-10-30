@@ -731,12 +731,39 @@ pub fn handle(app: *App, req: *http.Request, res: *http.Response) !void {
     //   * 否则               ⇒ 200 + `Content-Type: text/html` + 前端 shell。
     // 注意 405 这一支是 2026-10-17 读源码时才确认的：早先的注释凭"实测
     // PUT 也是 200"把它判成未对齐，实际是当时没走到这条分支。
+    //
+    // 2026-10-30 起 `/api/*` 未注册路径改为 **501 JSON**（`noRoute` 内），
+    // 不再回落 HTML 外壳 —— 见 `noRoute` 上的理由。
     return noRoute(app, req, res, p);
 }
 
 /// Go `static.Static` 里注册进 `e.NoRoute` 的那个 handler，逐条对齐。
 /// 返回给 `handle` / `handleAuthed` 两处共用（未注册路径都落到这里）。
+///
+/// ★ 2026-10-30 引入一处**刻意偏差**：`/api/*` 未注册路径不再回落 HTML 外壳，
+/// 改为 **501 JSON**。理由：上游的 NoRoute 对 `/api/*` 返回 200 + index.html，
+/// 前端会把 HTML 当 JSON 解析后静默降级 —— 网页端上传那次
+/// `multipart init failed: network error`（STATUS §55）就是这么被掩盖的：
+/// 真问题（路由不存在）被包装成了"网络错误"。宁可明说"没实现"。
+/// `/api/` 之外（前端 SPA 路由、静态资源）维持上游行为不变。
 fn noRoute(app: *App, req: *http.Request, res: *http.Response, p: []const u8) !void {
+    if (std.mem.startsWith(u8, p, "/api/")) {
+        const msg = std.fmt.allocPrint(
+            res.arena,
+            "not implemented: {s} {s}",
+            .{ req.method, p },
+        ) catch "not implemented";
+        // 注意用**真实** HTTP 501，不能走 `jsonError` —— 后者对齐 Go 的
+        // `c.JSON(200, …)` 恒回 HTTP 200（见 http.zig jsonError 注释），
+        // 而这里恰恰要让状态码本身说明问题（curl/脚本一眼可见，前端 axios
+        // 走错误分支也能拿到 message）。
+        res.status = 501;
+        try res.set("Content-Type", "application/json; charset=utf-8");
+        try res.buf.append("{\"code\":501,\"message\":");
+        try json.writeString(&res.buf, msg);
+        try res.buf.append(",\"data\":null}");
+        return;
+    }
     if (!std.mem.eql(u8, req.method, "GET") and !std.mem.eql(u8, req.method, "POST")) {
         res.setStatus(405);
         return;
@@ -748,10 +775,10 @@ fn noRoute(app: *App, req: *http.Request, res: *http.Response, p: []const u8) !v
 }
 
 /// 该路径是否为**已注册的**受保护 API 端点（≈ Go 的 gin 路由表）。
-/// 未注册 → 上游 NoRoute → 前端 shell（200 HTML），无论登录与否 ——
-/// 见 `handleAuthed` 开头的检查。
+/// 未注册 → `noRoute`：2026-10-30 起对 `/api/*` 返回 **501 JSON**（见
+/// `noRoute` 的注释），`/api/` 之外仍是前端 shell（200 HTML）。
 /// ⚠ 新增端点时必须同步这里（以及下面的 dispatch），否则未登录访问新
-/// 端点会拿到 HTML shell。块级粒度（`admin/storage/` 的内部子操作由
+/// 端点会拿到 501。块级粒度（`admin/storage/` 的内部子操作由
 /// handler 自己校验），比 gin 的逐路由粒度略粗，边角差异见 STATUS §35。
 fn isRegisteredAuthedPath(p: []const u8) bool {
     const exact = [_][]const u8{
@@ -780,6 +807,8 @@ fn handleAuthed(app: *App, req: *http.Request, res: *http.Response) !void {
     // Go 的 NoRoute（gin）：未注册的路径（含"前缀像已注册、端点不存在"）
     // 直接回落前端 shell —— 实测生产实例 `POST /api/nonexistent` 是 200 +
     // index.html，**不看登录状态**（NoRoute 挂在路由表外）。
+    // ⚠ 2026-10-30 起对 `/api/*` 刻意偏差为 501 JSON（HTML 外壳会把真问题
+    // 掩盖成"network error"，见 STATUS §55）；`/api/` 之外维持上游行为。
     if (!isRegisteredAuthedPath(p)) return noRoute(app, req, res, p);
 
     // The download routes also accept a per-file sign rather than a token; see
@@ -5149,10 +5178,12 @@ test "routing: /dav now serves WebDAV (auth-gated, OPTIONS open)" {
     // 上游 advertise 的是 **Class 2**（`DAV: 1, 2`）—— 因为它有 LOCK 系统。
     try testing.expectEqualStrings("1, 2", dav_hdr.?);
 
-    // 未注册的 /api 路径 ⇒ Go NoRoute ⇒ 200 + 前端 shell（不是 JSON 404）。
+    // 未注册的 /api 路径 ⇒ 501 JSON（2026-10-30 起的刻意偏差：上游回
+    // 200 + 前端 shell，但那会把"路由不存在"包装成前端的 network error，
+    // 见 STATUS §55）。非 /api 路径仍是 200 + shell。
     const typo = try doRequest(&app, a, "GET", "/api/nope");
-    try testing.expectEqual(@as(u16, 200), typo.status);
-    try testing.expect(std.mem.indexOf(u8, typo.buf.slice(), "OPENLIST_CONFIG") != null);
+    try testing.expectEqual(@as(u16, 501), typo.status);
+    try testing.expect(std.mem.indexOf(u8, typo.buf.slice(), "not implemented") != null);
 }
 
 test "routing: assets with no dist_dir answer 404 rather than the shell" {
@@ -5612,18 +5643,32 @@ test "every JSON endpoint emits strict, parseable JSON" {
         _ = try json.parse(a, res.buf.slice());
     }
 
-    // 5) 未注册的 /api/* ⇒ Go NoRoute ⇒ 200 + 前端 shell（**不是** JSON 404）。
-    //    这是 2026-10-17 读 `server/static/static.go:213-227` 定下来的：上游
-    //    的 NoRoute 挂在路由表外，`/api/nope` 与 `/随便什么` 一视同仁。
+    // 5) 未注册的 /api/* ⇒ **501 JSON**（2026-10-30 起的刻意偏差）。上游的
+    //    NoRoute 对 /api/* 回 200 + 前端 shell，前端会把 HTML 当 JSON 静默
+    //    解析失败 —— multipart 那次（STATUS §55）正是这样被掩盖成
+    //    "network error" 的。宁可明说 not implemented。
     {
         const res = try doRequest(&app, a, "GET", "/api/nope");
+        try testing.expectEqual(@as(u16, 501), res.status);
+        try testing.expect(std.mem.indexOf(u8, res.buf.slice(), "not implemented: GET /api/nope") != null);
+    }
+    // 非 GET/POST 的未注册**非 API**路径 ⇒ 仍按上游 405（noRoute 的方法分支
+    // 对 /api/ 之外的路径保持原行为）。
+    {
+        const res = try doRequest(&app, a, "PUT", "/some/page");
+        try testing.expectEqual(@as(u16, 405), res.status);
+    }
+    // 未注册的 /api 路径 + 非常规方法 ⇒ 同样 501（API 分支先于方法分支）。
+    {
+        const res = try doRequest(&app, a, "PUT", "/api/fs/form");
+        try testing.expectEqual(@as(u16, 501), res.status);
+        try testing.expect(std.mem.indexOf(u8, res.buf.slice(), "not implemented: PUT /api/fs/form") != null);
+    }
+    // 非 /api 路径 ⇒ 200 + 前端 shell（SPA 路由，行为不变）。
+    {
+        const res = try doRequest(&app, a, "GET", "/some/page");
         try testing.expectEqual(@as(u16, 200), res.status);
         try testing.expect(std.mem.indexOf(u8, res.buf.slice(), "OPENLIST_CONFIG") != null);
-    }
-    // 非 GET/POST 的未注册路径 ⇒ 405（同一 handler 的第一个分支）。
-    {
-        const res = try doRequest(&app, a, "PUT", "/api/nope");
-        try testing.expectEqual(@as(u16, 405), res.status);
     }
 }
 
@@ -5695,12 +5740,12 @@ test "multipart_enabled must stay false (fs/multipart/* is not implemented)" {
     const data = parsed.getPath("data").?.object;
     try testing.expectEqualStrings("false", data.get("multipart_enabled").?.asStr().?);
 
-    // 同一条链路上的另一环：`fs/multipart/init` 确实没有注册（落到 NoRoute
-    // 的 200 + HTML 外壳）。这条断言是为了让"以后真实现了分片上传"的人
-    // 必须同时改上面的 setting 与这个测试，而不是只改一半。
+    // 同一条链路上的另一环：`fs/multipart/init` 确实没有注册 ⇒ 501 JSON。
+    // 这条断言是为了让"以后真实现了分片上传"的人必须同时改上面的 setting
+    // 与这个测试，而不是只改一半。
     const r2 = try doRequest(&app, a, "POST", "/api/fs/multipart/init");
-    try testing.expectEqual(@as(u16, 200), r2.status);
-    try testing.expect(std.mem.indexOf(u8, r2.buf.slice(), "OPENLIST_CONFIG") != null);
+    try testing.expectEqual(@as(u16, 501), r2.status);
+    try testing.expect(std.mem.indexOf(u8, r2.buf.slice(), "not implemented: POST /api/fs/multipart/init") != null);
 }
 
 test "fs list carries the envelope fields the frontend reads" {

@@ -36,10 +36,11 @@
 
 ## 构建约定（本机有工具链）
 
-- 本机 Zig 0.17.0：`C:\Program Files\zig-x86_64-windows-0.17.0\zig.exe`；`zig build test` = **460 pass + 3 skip**。
+- 本机 Zig 0.17.0：`C:\Program Files\zig-x86_64-windows-0.17.0\zig.exe`；`zig build test` = **462 pass + 3 skip**。
   必须：① 先 `tools/ziglib_patch.py "<toolchain>/lib" C:/zigcache/olz-ziglib`；② 用 **`ZIG_LIB_DIR`** 环境变量（`--zig-lib-dir` 0.17 不认）；③ `ZIG_GLOBAL_CACHE_DIR`/`ZIG_LOCAL_CACHE_DIR` 都指 `C:/zigcache/olz`。
 - **🔴 裸调 `zig build`（漏 export ZIG_LIB_DIR）= 静默丢 TLS 补丁**：编译不报错，部署后 Quark/UC 挂载消失（14→12）。
-  判据：带补丁 **1,352,536 B / `dc815b20`**（2026-10-30 版，现役）、`52d38eea`（10-26 版）、1,352,552 B / `47648f5c`（10-24 版）；裸构建 1,352,624 B / `af22fd5f`。
+  判据：带补丁 **1,353,968 B / `e74276b7`**（2026-10-30 下午版，现役）、1,352,536 B / `dc815b20`（10-30 上午）、`52d38eea`（10-26）。
+  ⚠ 代码再变后**尺寸判据失效**，部署后以 `mount(s) published` = 14（Quark/UC 在 = TLS 补丁在）+ sha256 为准。
   **部署后必须 grep `mount(s) published`，应为 14**。
 - 打包机 `10.0.0.4` 可选（`tools/build_remote.py`，`/tmp/olz-build`）。`-Ddrivers=` 白名单必须 comptime 分支。`build_remote.py` 必须走 `zig build test`。
 - ⚠ `zig build` 吞 "All tests passed" 且末尾打误导性 `failed command`（退出码 0）；判成功看 `--summary all` 的 `test success`。
@@ -107,13 +108,21 @@
 
 - **权威待办 = `zig-src/TODO.md`**；审计 = `zig-src/docs/STATUS.md`（§22/§23）、驱动审计 = `docs/AUDIT_2026-10-18-drivers.md`。
 - 已知欠项：全驱动真实 API+UI 回归、`model.Storage` 无 `modified`、配置项 `delayed_start`/`cors`/`tasks`。
-- 验证基线：460 单测 + 3 skip；生产 aarch64 **1,352,536 B / `dc815b20`**（2026-10-30）；真机 e2e 32/32。
+- 验证基线：462 单测 + 3 skip；生产 aarch64 **1,353,968 B / `e74276b7`**（2026-10-30 下午）；真机 e2e 32/32。
+- **请求体安全阀 `zig.max_upload_mb`（默认 64 MiB）**：>4MiB 请求体落 `temp_dir`（生产 = tmpfs 220MB 占 RAM），
+  150-220MB 会 OOM/看门狗重启，>220MB ENOSPC 掐连接。超限回 **413 JSON**（中文 message，axios 可弹出）。
+  0 = 恢复 8GiB。WebDAV PUT 同用此上限。`temp_dir` 指到大存储后可调高。
+- **`/api/*` 未注册路径 = 真实 501 JSON**（`not implemented: <METHOD> <PATH>`，刻意偏差 Go 的 200+HTML 外壳）；
+  `/api/` 之外仍是 200+shell / 405。**不能用 `res.jsonError`**（它对齐 Go `c.JSON(200,…) ` 恒回 HTTP 200）。
+  前端 4.2.6 无条件调用的未实现端点只有 archive_extensions / offline_download_tools，已在 handle() 先行放行（200 空列表）。
+- **下一轮主项 = 分片直传**（设计已写 TODO §5.5：服务端不落盘、驱动加 beginUpload/putChunk/commitUpload 槽位、
+  session 内存 map、MD5 增量算、`multipart_enabled` 要翻回 true）。
 - **网页端上传只有 `PUT /api/fs/put` 一条路**：`/api/fs/form` 与 `/api/fs/multipart/*` 都没实现
   ⇒ `/api/public/settings` 的 `multipart_enabled` **必须 `false`**（否则前端 4.2.6 默认选 Multipart，
   >10MiB 走不存在的 `/fs/multipart/init`，落 noRoute 回 HTML ⇒ 报 `multipart init failed: network error`）。
   详见 STATUS §55，有单测钉住。调试真机可拿 `config.zig.json` 的 `zig.token` 直接当 `Authorization`。
 - **根目录整洁铁律**：仓库根只允许上游文件 + `zig-src/ .github/ .workbuddy/ .workbuddy-ai/`；Zig 脚本一律 `zig-src/tools/`，新脚本用 `Path(__file__).resolve().parents[2]` 定位仓库根。
 - **pan115 fixture 铁律**：`src/drivers/115list_fixture.json`（`tools/gen_115_fixture.py` 生成）**必须入库**；真机原文 `115list_sample.json` 含真实文件名**永不入库**。
-- **外部二进制留档**：`D:/workspace/server/armbian/bin/openlist/` = 现役 openlist（1,352,536 B / `dc815b20`，10-30 版）+ 设备现役 `config.zig.json`；`_backup/` 收旧版（`openlist-20261026-52d38eea`、10-24 版、10-22/10-21 版）。设备侧 `.bak` 按规矩只留切换当次一份（本次未在设备留 .bak，回滚靠本地留档重推）。
+- **外部二进制留档**：`D:/workspace/server/armbian/bin/openlist/` = 现役 openlist（1,353,968 B / `e74276b7`，10-30 下午版）+ 设备现役 `config.zig.json`；旧版 `_backup/` 用户已清空（回滚靠 git 重建）。设备侧不留 .bak。
 - 磁盘紧张是老问题（D 盘曾 100%）；npm pack 的 23MB 前端包用完立刻删。
 - 一次性调查脚本已清理（commit 97a4b7d2）；不可恢复素材暂存 `D:/workspace/_olz-staging/2026-10-24-cleanup/`。
