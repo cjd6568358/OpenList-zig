@@ -33,7 +33,7 @@
 - Zig 0.17.0：`C:\Program Files\zig-x86_64-windows-0.17.0\zig.exe`；`zig build test` = **467 pass + 3 skip**。必须 ① `tools/ziglib_patch.py "<toolchain>/lib" C:/zigcache/olz-ziglib`；② 用 **`ZIG_LIB_DIR`**（`--zig-lib-dir` 0.17 不认）；③ `ZIG_GLOBAL_CACHE_DIR`/`ZIG_LOCAL_CACHE_DIR` → `C:/zigcache/olz`。
 - **🔴 裸调 `zig build`（漏 ZIG_LIB_DIR）= 静默丢 TLS 补丁**：不报错，部署后 Quark/UC 消失（14→12）。尺寸判据**代码一变即失效**（1,376,016 B / `935ab9fc` = 10-31 生产现役）；**最终判据：部署后 grep `mount(s) published` = 14** + sha256。
 - 打包机 `10.0.0.4` 可选（`tools/build_remote.py`，`/tmp/olz-build`），必须走 `zig build test`；`-Ddrivers=` 白名单必须 comptime 分支。
-- ⚠ `zig build` 吞 "All tests passed" 且末尾打误导性 `failed command`（退出码 0）；判成功看 `--summary all` 的 `test success`。
+- ⚠ `zig build` 吞 "All tests passed" 且末尾打误导性 `failed command`（退出码 0）；判成功看 `--summary all` 的 `test success`。**跑测试一律带 `--summary all`**（不带的话 step 命中缓存就一行输出都没有，看不出 pass 数），判据是 `N pass, M skip` 而不是末尾那行 `failed command`。裸跑 `.zig-cache/o/*/test.exe` 必崩（`--listen=-` 是 server 模式，从 stdin 读协议，EndOfStream panic）—— 那是正常现象，不是测试失败。裸 `zig test src/tests.zig` 编译不过（缺 `build_options` 模块），只能走 `zig build test`。
 - 单测一律 `std.testing.allocator`；**D 盘满会假报 NoSpaceLeft/泄漏**。
 - **Zig 0.17 坑**：裸 `assert` 移除 → `std.debug.assert`；`**` 数组重复非法 → 定长数组 + `@memset`；驱动新方法必须放进 struct；`_ = self;` 在 self 已用时是编译错误。
 - **CLI**：`openlist version`（六行，对齐 Go `cmd/version.go`）/ `-v`；裸 positional **必须 `.json` 结尾**，否则 `unknown command` + exit 2 —— 旧行为把任何裸词当 config 路径，`openlist version` 曾静默在 5244 起服务并在 cwd 建 `data/`（误判成「命令挂住」）。CLI 输出走 stderr。
@@ -96,6 +96,7 @@
 ## 文档与留档
 
 - **权威待办 `zig-src/TODO.md`**（只放未做项）；状态与编年 `zig-src/docs/STATUS.md`；驱动审计 `docs/AUDIT_2026-10-18-drivers.md`。基线：467 单测 + 3 skip。分片上传真机验收用 `tools/multipart_upload.py`（Git Bash 要给 `--path` 加 `MSYS_NO_PATHCONV=1`，否则路径被改写成 `D:/Program Files/Git/...` ⇒ 服务端回 `storage not found`）。
+- **SFTP 端到端回归** `zig-src/tools/sftp_ssh_e2e.py`（唯一依赖 **paramiko** 的工具，装在 `binaries/python/envs/default`）：先起服务（data 目录首次用 `OPENLIST_ADMIN_PASSWORD=<pw>` 建管理员，config 里塞一个 Local 存储，`--sftp-ssh <port>`），再 `python tools/sftp_ssh_e2e.py --port <n> --password <pw>`。⚠ Windows 自带 `sftp.exe` 非交互拿不到口令（`SSH_ASKPASS` 无效）⇒ 只能走 paramiko；paramiko 只认 `curve25519-sha256@libssh.org`，脚本里补了 `curve25519-sha256` 别名，**不要**为此改服务端算法宣告。裸协议探针 `tools/sftp_probe.py`（零依赖，走 `--sftp-plain`，不含 SSH 层）。
 - **根目录整洁铁律**：根只允许上游文件 + `zig-src/ .github/ .workbuddy/ .workbuddy-ai/`；Zig 脚本一律 `zig-src/tools/`，新脚本用 `Path(__file__).resolve().parents[2]` 定位根。
 - **pan115 fixture 铁律**：`src/drivers/115list_fixture.json`（`tools/gen_115_fixture.py` 生成）**必须入库**；真机原文 `115list_sample.json` **永不入库**。
 - **外部二进制留档**：`D:/workspace/server/armbian/bin/openlist/` = 二进制（= 设备现役 `935ab9fc`，10-31 版）+ 设备现役 `config.zig.json`；`_backup/` 已清空，设备侧不留 .bak。换二进制走设备脚本规定的流程：传 `openlist.new` → `chmod 755` → `openlist_start.sh stop` → `mv -f` → `openlist_start.sh`。
