@@ -38,6 +38,8 @@ test {
     _ = @import("client.zig");
     _ = @import("frontend.zig");
     _ = @import("archive.zig");
+    // SFTP 服务端：协议编解码 + 会话状态（纯 Zig，不依赖 SSH/驱动）
+    _ = @import("sftp.zig");
 
     // Drivers
     _ = @import("drivers/local.zig");

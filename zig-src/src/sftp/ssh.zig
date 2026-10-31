@@ -1,0 +1,734 @@
+//! SSH-2 传输层（RFC 4253）+ `curve25519-sha256` 密钥交换（RFC 8731）
+//! + `ssh-ed25519` 主机密钥 + `aes128-ctr` / `hmac-sha2-256`。
+//!
+//! ## 范围
+//!
+//! 这一层只负责「把字节流变成可信的、加密的双向管道」：
+//!
+//!   - 版本交换（`SSH-2.0-...`）
+//!   - 算法协商（KEXINIT），只宣告**本实现真的支持**的那一套
+//!   - `curve25519-sha256` 密钥交换 + 主机签名
+//!   - 二进制包协议（长度 / 填充 / 序列号 / MAC）
+//!   - `NEWKEYS` 后的对称加密
+//!
+//! 认证（RFC 4252）与连接层（RFC 4254）不在这里，见下一层的 `auth.zig` /
+//! `channel.zig`（待做）。刻意切开是因为：**传输层错一个字节，上面全部不可
+//! 用**，而它的正确性可以独立验证（KEX 完成 + 加密通道收发一致）。
+//!
+//! ## 为什么只支持一套算法
+//!
+//! SSH 的算法协商是个矩阵，支持越多，出错的组合越多。这里只宣告：
+//!
+//! | 类别 | 唯一选项 | 理由 |
+//! |---|---|---|
+//! | KEX | `curve25519-sha256` | 现代客户端（OpenSSH 7.4+、WinSCP 5.13+、rclone）全支持 |
+//! | 主机密钥 | `ssh-ed25519` | 不用 RSA，省掉 PKCS#1 与 DigestInfo |
+//! | 加密 | `aes128-ctr` | std 有 AES，CTR 只需 20 行；避免 OpenSSH 私有的 chacha 变体 |
+//! | MAC | `hmac-sha2-256` | 标准、简单 |
+//! | 压缩 | `none` | 压缩与 SFTP 无关，开了只是多一条出错路径 |
+//!
+//! 协商失败时明确断连并说明原因，不静默降级 —— 降级意味着「你以为在用
+//! curve25519，实际在用 group1-sha1」。
+//!
+//! ## 一个容易搞错的地方：MAC 覆盖的是**明文**包
+//!
+//! RFC 4253 §6.4：MAC 计算在加密之前，覆盖 `sequence_number || unencrypted_packet`
+//! （含 4 字节长度字段）。先加密再算 MAC 是错的，会导致和对端永远对不上，
+//! 而症状只是「连接建立后所有包都 BadMac」。
+
+const std = @import("std");
+const rt = @import("../rt.zig");
+const log = @import("../log.zig");
+const Buf = @import("../util/buf.zig").Buf;
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const Ed25519 = std.crypto.sign.Ed25519;
+const X25519 = std.crypto.dh.X25519;
+const Aes128 = std.crypto.core.aes.Aes128;
+
+// ---- 消息号（RFC 4253 §12）----
+pub const MSG_DISCONNECT: u8 = 1;
+pub const MSG_IGNORE: u8 = 2;
+pub const MSG_UNIMPLEMENTED: u8 = 3;
+pub const MSG_DEBUG: u8 = 4;
+pub const MSG_SERVICE_REQUEST: u8 = 5;
+pub const MSG_SERVICE_ACCEPT: u8 = 6;
+pub const MSG_KEXINIT: u8 = 20;
+pub const MSG_NEWKEYS: u8 = 21;
+pub const MSG_KEX_ECDH_INIT: u8 = 30;
+pub const MSG_KEX_ECDH_REPLY: u8 = 31;
+
+pub const server_version = "SSH-2.0-OpenList_0.1";
+
+/// 单包上限。OpenSSH 默认 256 KiB；SFTP 的读块不会超过这个量级。
+const max_packet: u32 = 256 * 1024;
+
+// ---------------------------------------------------------------------------
+// 小工具：SSH 的大端写入 / 读取
+// ---------------------------------------------------------------------------
+
+pub fn putU32(out: *Buf, v: u32) !void {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, .big);
+    try out.append(&b);
+}
+
+pub fn putU64(out: *Buf, v: u64) !void {
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b, v, .big);
+    try out.append(&b);
+}
+
+/// SSH `string`：u32 长度 + 原始字节。
+pub fn putString(out: *Buf, s: []const u8) !void {
+    try putU32(out, @intCast(s.len));
+    try out.append(s);
+}
+
+/// SSH `name-list`：逗号分隔的 `string`（空列表就是长度 0）。
+pub fn putNameList(out: *Buf, s: []const u8) !void {
+    try putString(out, s);
+}
+
+/// SSH `mpint`：大端二进制补码整数，最高位为 1 时要补一个 0x00。
+pub fn putMpint(out: *Buf, bytes: []const u8) !void {
+    var i: usize = 0;
+    while (i < bytes.len and bytes[i] == 0) i += 1;
+    const v = bytes[i..];
+    if (v.len == 0) {
+        try putU32(out, 0); // 零
+        return;
+    }
+    if (v[0] & 0x80 != 0) {
+        try putU32(out, @intCast(v.len + 1));
+        try out.appendByte(0);
+        try out.append(v);
+    } else {
+        try putU32(out, @intCast(v.len));
+        try out.append(v);
+    }
+}
+
+pub const Reader = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    pub fn take(self: *Reader, n: usize) ![]const u8 {
+        if (self.pos + n > self.buf.len) return error.Truncated;
+        const out = self.buf[self.pos .. self.pos + n];
+        self.pos += n;
+        return out;
+    }
+    pub fn byte(self: *Reader) !u8 {
+        return (try self.take(1))[0];
+    }
+    pub fn u32v(self: *Reader) !u32 {
+        const b = try self.take(4);
+        return std.mem.readInt(u32, b[0..4], .big);
+    }
+    pub fn string(self: *Reader) ![]const u8 {
+        return self.take(try self.u32v());
+    }
+};
+
+// ---------------------------------------------------------------------------
+// AES-128-CTR
+// ---------------------------------------------------------------------------
+
+/// 流式 CTR。SSH 的包长度字段也是加密的，所以必须能「先解 4 字节、再解剩
+/// 下的」—— 分两次调用必须共用同一条 keystream，这就是为什么这里自己维护
+/// 计数器与剩余位置，而不是每次调用重开一个流。
+const CtrCipher = struct {
+    ctx: std.crypto.core.aes.AesEncryptCtx(Aes128),
+    counter: [16]u8,
+    ks: [16]u8 = undefined,
+    pos: usize = 16, // 16 = 需要生成下一块
+
+    fn init(key: [16]u8, iv: [16]u8) CtrCipher {
+        return .{ .ctx = Aes128.initEnc(key), .counter = iv };
+    }
+
+    fn xor(self: *CtrCipher, data: []u8) void {
+        for (data) |*b| {
+            if (self.pos == 16) {
+                self.ctx.encrypt(&self.ks, &self.counter);
+                // 128 位大端计数器 +1
+                var i: usize = 15;
+                while (true) {
+                    self.counter[i] +%= 1;
+                    if (self.counter[i] != 0) break;
+                    if (i == 0) break;
+                    i -= 1;
+                }
+                self.pos = 0;
+            }
+            b.* ^= self.ks[self.pos];
+            self.pos += 1;
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// 主机密钥
+// ---------------------------------------------------------------------------
+
+pub const HostKey = struct {
+    kp: Ed25519.KeyPair,
+    /// `string "ssh-ed25519" || string pubkey` —— KEX 里原样发送。
+    blob: []u8,
+
+    pub fn deinit(self: *HostKey, alloc: std.mem.Allocator) void {
+        alloc.free(self.blob);
+    }
+
+    /// 从文件加载 32 字节 seed；文件不存在就生成一个新的并写回。
+    ///
+    /// 主机密钥**必须稳定**：客户端会记住它（known_hosts），每次重启都换
+    /// 一个会让所有人都看到「主机密钥已更改」的警告。所以宁可写文件失败时
+    /// 只告警、退化成进程内临时密钥，也不静默生成新的。
+    pub fn loadOrCreate(alloc: std.mem.Allocator, path: []const u8) !HostKey {
+        const io = rt.io();
+        var seed: [32]u8 = undefined;
+
+        if (std.Io.Dir.cwd().openFile(io, path, .{})) |f| {
+            defer f.close(io);
+            const n = std.Io.File.readPositionalAll(f, io, &seed, 0) catch 0;
+            if (n != seed.len) {
+                log.warn("ssh: host key file {s} is short ({d} bytes); regenerating", .{ path, n });
+                io.random(&seed);
+                writeSeed(io, path, seed);
+            }
+        } else |_| {
+            io.random(&seed);
+            writeSeed(io, path, seed);
+        }
+
+        return fromSeed(alloc, seed);
+    }
+
+    fn writeSeed(io: std.Io, path: []const u8, seed: [32]u8) void {
+        if (std.fs.path.dirname(path)) |dir| {
+            // 0.17：`Dir.makePath` 改名 `createDirPath`。
+            std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+        }
+        var f = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch |e| {
+            log.warn("ssh: cannot write host key {s}: {s} (using an ephemeral key)", .{ path, @errorName(e) });
+            return;
+        };
+        defer f.close(io);
+        f.writeStreamingAll(io, &seed) catch |e| {
+            log.warn("ssh: cannot write host key {s}: {s}", .{ path, @errorName(e) });
+        };
+    }
+
+    pub fn fromSeed(alloc: std.mem.Allocator, seed: [32]u8) !HostKey {
+        const kp = Ed25519.KeyPair.generateDeterministic(seed) catch return error.BadHostKey;
+
+        var blob = Buf.init(alloc);
+        // `toOwned` 是复制，临时 Buf 必须自己释放（见 util/buf.zig）。
+        defer blob.deinit();
+        try putString(&blob, "ssh-ed25519");
+        try putString(&blob, &kp.public_key.toBytes());
+
+        return .{ .kp = kp, .blob = try blob.toOwned() };
+    }
+
+    /// 对 `msg` 签名，返回 SSH 签名 blob：`string "ssh-ed25519" || string sig`。
+    pub fn sign(self: HostKey, alloc: std.mem.Allocator, msg: []const u8) ![]u8 {
+        const sig = try self.kp.sign(msg, null);
+        var out = Buf.init(alloc);
+        defer out.deinit();
+        try putString(&out, "ssh-ed25519");
+        try putString(&out, &sig.toBytes());
+        return out.toOwned();
+    }
+};
+
+// ---------------------------------------------------------------------------
+// 传输层
+// ---------------------------------------------------------------------------
+
+pub const Transport = struct {
+    alloc: std.mem.Allocator,
+    rd: *std.Io.Reader,
+    wr: *std.Io.Writer,
+
+    seq_in: u32 = 0,
+    seq_out: u32 = 0,
+
+    enc_in: ?CtrCipher = null,
+    mac_in: ?[32]u8 = null,
+    enc_out: ?CtrCipher = null,
+    mac_out: ?[32]u8 = null,
+
+    client_version: []u8 = &.{},
+    /// 我们发出的 KEXINIT payload（不含消息号以外的任何加工），算 H 用。
+    kexinit_sent: []u8 = &.{},
+    kexinit_recv: []u8 = &.{},
+    session_id: ?[32]u8 = null,
+
+    pub fn deinit(self: *Transport) void {
+        if (self.client_version.len > 0) self.alloc.free(self.client_version);
+        if (self.kexinit_sent.len > 0) self.alloc.free(self.kexinit_sent);
+        if (self.kexinit_recv.len > 0) self.alloc.free(self.kexinit_recv);
+    }
+
+    /// 版本交换。客户端可以在 `SSH-` 行之前发任意多行（RFC 允许），跳过它们。
+    pub fn exchangeVersion(self: *Transport) !void {
+        try self.wr.writeAll(server_version ++ "\r\n");
+        try self.wr.flush();
+
+        var line: [256]u8 = undefined;
+        var n: usize = 0;
+        var lines: usize = 0;
+        var one: [1]u8 = undefined;
+
+        while (true) {
+            self.rd.readSliceAll(&one) catch return error.ConnectionClosed;
+            if (one[0] == '\n') {
+                lines += 1;
+                if (lines > 50) return error.TooManyPreambleLines;
+                if (n > 0 and line[n - 1] == '\r') n -= 1;
+                if (std.mem.startsWith(u8, line[0..n], "SSH-")) {
+                    self.client_version = try self.alloc.dupe(u8, line[0..n]);
+                    return;
+                }
+                n = 0;
+                continue;
+            }
+            if (n >= line.len) return error.VersionTooLong;
+            line[n] = one[0];
+            n += 1;
+        }
+    }
+
+    /// 读一个包，返回 payload（调用方的 `a` 拥有）。**不含** padding 与长度字段。
+    pub fn readPacket(self: *Transport, a: std.mem.Allocator) ![]const u8 {
+        var lenbuf: [4]u8 = undefined;
+        self.rd.readSliceAll(&lenbuf) catch return error.ConnectionClosed;
+        if (self.enc_in) |*c| c.xor(&lenbuf);
+
+        const len = std.mem.readInt(u32, &lenbuf, .big);
+        if (len < 5 or len > max_packet) return error.BadPacketLength;
+
+        const body = try a.alloc(u8, len);
+        self.rd.readSliceAll(body) catch return error.ConnectionClosed;
+        if (self.enc_in) |*c| c.xor(body);
+
+        if (self.mac_in) |key| {
+            var got: [32]u8 = undefined;
+            self.rd.readSliceAll(&got) catch return error.ConnectionClosed;
+
+            var h = HmacSha256.init(&key);
+            var seqb: [4]u8 = undefined;
+            std.mem.writeInt(u32, &seqb, self.seq_in, .big);
+            h.update(&seqb);
+            h.update(&lenbuf);
+            h.update(body);
+            var want: [32]u8 = undefined;
+            h.final(&want);
+            if (!std.crypto.timing_safe.eql([32]u8, want, got)) return error.BadMac;
+        }
+
+        const padlen = body[0];
+        if (padlen < 4 or @as(usize, padlen) + 1 > len) return error.BadPadding;
+        self.seq_in +%= 1;
+        return body[1 .. len - padlen];
+    }
+
+    /// 发一个包。`payload` 的第一字节是消息号。
+    pub fn writePacket(self: *Transport, payload: []const u8) !void {
+        const block: usize = if (self.enc_out != null) 16 else 8;
+        const base = 4 + 1 + payload.len;
+        var pad: usize = block - (base % block);
+        if (pad < 4) pad += block;
+        const total = base + pad;
+
+        const buf = try self.alloc.alloc(u8, total);
+        defer self.alloc.free(buf);
+
+        std.mem.writeInt(u32, buf[0..4], @intCast(total - 4), .big);
+        buf[4] = @intCast(pad);
+        @memcpy(buf[5..][0..payload.len], payload);
+        rt.io().random(buf[5 + payload.len ..]);
+
+        // ⚠ MAC 覆盖**明文**（含长度字段），必须在加密之前算。
+        if (self.mac_out) |key| {
+            var h = HmacSha256.init(&key);
+            var seqb: [4]u8 = undefined;
+            std.mem.writeInt(u32, &seqb, self.seq_out, .big);
+            h.update(&seqb);
+            h.update(buf);
+            var mac: [32]u8 = undefined;
+            h.final(&mac);
+
+            if (self.enc_out) |*c| c.xor(buf);
+            try self.wr.writeAll(buf);
+            try self.wr.writeAll(&mac);
+        } else {
+            try self.wr.writeAll(buf);
+        }
+        try self.wr.flush();
+        self.seq_out +%= 1;
+    }
+
+    fn sendMsg(self: *Transport, msg: u8, body: []const u8) !void {
+        var b = Buf.init(self.alloc);
+        defer b.deinit();
+        try b.appendByte(msg);
+        try b.append(body);
+        try self.writePacket(b.slice());
+    }
+};
+
+// ---------------------------------------------------------------------------
+// 密钥交换
+// ---------------------------------------------------------------------------
+
+/// 从 `K || H || letter || session_id` 派生一段密钥（RFC 4253 §7.2）。
+fn derive(k_mpint: []const u8, h_hash: [32]u8, letter: u8, session_id: [32]u8, out: []u8) void {
+    var digest: [32]u8 = undefined;
+    var hh = Sha256.init(.{});
+    hh.update(k_mpint);
+    hh.update(&h_hash);
+    hh.update(&[_]u8{letter});
+    hh.update(&session_id);
+    hh.final(&digest);
+    @memcpy(out[0..@min(out.len, 32)], digest[0..@min(out.len, 32)]);
+    // 本实现只需要 <= 32 字节的密钥，无需继续 K2/K3。
+}
+
+pub const KexResult = struct {
+    h: [32]u8,
+    session_id: [32]u8,
+    k_mpint: []u8, // 由调用方 alloc 拥有
+
+    pub fn deinit(self: KexResult, alloc: std.mem.Allocator) void {
+        alloc.free(self.k_mpint);
+    }
+};
+
+/// 走完一次完整 KEX：协商 → ECDH → 签名 → NEWKEYS → 安装密钥。
+///
+/// `a` 是**连接级** allocator：`k_mpint` 要活到密钥派生结束。
+pub fn kex(t: *Transport, host_key: HostKey, a: std.mem.Allocator) !KexResult {
+    // ---- 1. 发 KEXINIT ----
+    {
+        var b = Buf.init(a);
+        defer b.deinit();
+        try b.appendByte(MSG_KEXINIT);
+        var cookie: [16]u8 = undefined;
+        rt.io().random(&cookie);
+        try b.append(&cookie);
+        try putNameList(&b, "curve25519-sha256");
+        try putNameList(&b, "ssh-ed25519");
+        try putNameList(&b, "aes128-ctr");
+        try putNameList(&b, "aes128-ctr");
+        try putNameList(&b, "hmac-sha2-256");
+        try putNameList(&b, "hmac-sha2-256");
+        try putNameList(&b, "none");
+        try putNameList(&b, "none");
+        try putNameList(&b, "");
+        try putNameList(&b, "");
+        try b.appendByte(0); // first_kex_packet_follows
+        try putU32(&b, 0);
+
+        if (t.kexinit_sent.len > 0) a.free(t.kexinit_sent);
+        t.kexinit_sent = try a.dupe(u8, b.slice());
+        try t.writePacket(b.slice());
+    }
+
+    // ---- 2. 收客户端的 KEXINIT ----
+    {
+        const p = try t.readPacket(a);
+        if (p.len < 1 or p[0] != MSG_KEXINIT) return error.ExpectedKexInit;
+        if (t.kexinit_recv.len > 0) a.free(t.kexinit_recv);
+        t.kexinit_recv = try a.dupe(u8, p);
+        try checkKexInit(p);
+    }
+
+    // ---- 3. 收 KEX_ECDH_INIT，拿 Q_C ----
+    const q_c: []const u8 = blk: {
+        const p = try t.readPacket(a);
+        if (p.len < 1 or p[0] != MSG_KEX_ECDH_INIT) return error.ExpectedEcdhInit;
+        var r = Reader{ .buf = p[1..] };
+        const q = try r.string();
+        if (q.len != 32) return error.BadEcdhKey;
+        break :blk try a.dupe(u8, q);
+    };
+    defer a.free(q_c);
+
+    // ---- 4. 临时密钥对 + 共享秘密 ----
+    const eph = X25519.KeyPair.generate(rt.io());
+    var q_c_arr: [32]u8 = undefined;
+    @memcpy(&q_c_arr, q_c);
+    const shared = X25519.scalarmult(eph.secret_key, q_c_arr) catch return error.BadEcdhKey;
+
+    var k_mpint = Buf.init(a);
+    errdefer k_mpint.deinit();
+    try putMpint(&k_mpint, &shared);
+    const k_bytes = try k_mpint.toOwned();
+
+    // ---- 5. H = SHA256(V_C || V_S || I_C || I_S || K_S || Q_C || Q_S || K) ----
+    var hb = Buf.init(a);
+    defer hb.deinit();
+    try putString(&hb, t.client_version);
+    try putString(&hb, server_version);
+    try putString(&hb, t.kexinit_recv);
+    try putString(&hb, t.kexinit_sent);
+    try putString(&hb, host_key.blob);
+    try putString(&hb, &q_c_arr);
+    try putString(&hb, &eph.public_key);
+    try hb.append(k_bytes);
+
+    var h_hash: [32]u8 = undefined;
+    Sha256.hash(hb.slice(), &h_hash, .{});
+
+    const session_id = t.session_id orelse h_hash;
+
+    // ---- 6. 签名并发 KEX_ECDH_REPLY ----
+    const sig = try host_key.sign(a, &h_hash);
+    defer a.free(sig);
+
+    {
+        var b = Buf.init(a);
+        defer b.deinit();
+        try b.appendByte(MSG_KEX_ECDH_REPLY);
+        try putString(&b, host_key.blob);
+        try putString(&b, &eph.public_key);
+        try putString(&b, sig);
+        try t.writePacket(b.slice());
+    }
+
+    // ---- 7. NEWKEYS 双向 ----
+    try t.sendMsg(MSG_NEWKEYS, "");
+    {
+        const p = try t.readPacket(a);
+        if (p.len < 1 or p[0] != MSG_NEWKEYS) return error.ExpectedNewKeys;
+    }
+
+    // ---- 8. 安装密钥 ----
+    // 服务端：c2s 用于接收，s2c 用于发送。
+    var iv_c2s: [16]u8 = undefined;
+    var iv_s2c: [16]u8 = undefined;
+    var key_c2s: [16]u8 = undefined;
+    var key_s2c: [16]u8 = undefined;
+    var mac_c2s: [32]u8 = undefined;
+    var mac_s2c: [32]u8 = undefined;
+    derive(k_bytes, h_hash, 'A', session_id, &iv_c2s);
+    derive(k_bytes, h_hash, 'B', session_id, &iv_s2c);
+    derive(k_bytes, h_hash, 'C', session_id, &key_c2s);
+    derive(k_bytes, h_hash, 'D', session_id, &key_s2c);
+    derive(k_bytes, h_hash, 'E', session_id, &mac_c2s);
+    derive(k_bytes, h_hash, 'F', session_id, &mac_s2c);
+
+    t.enc_in = CtrCipher.init(key_c2s, iv_c2s);
+    t.mac_in = mac_c2s;
+    t.enc_out = CtrCipher.init(key_s2c, iv_s2c);
+    t.mac_out = mac_s2c;
+    t.session_id = session_id;
+
+    return .{ .h = h_hash, .session_id = session_id, .k_mpint = k_bytes };
+}
+
+/// 校验客户端的 KEXINIT 里第一项是不是我们支持的那套。
+///
+/// 只比「首选算法」：RFC 允许客户端给一长串，但服务端的首选若不在其中，
+/// 协商就该失败 —— 与其猜，不如断开并说清楚。
+fn checkKexInit(payload: []const u8) !void {
+    var r = Reader{ .buf = payload[1..] };
+    _ = try r.take(16); // cookie
+    const kex_names = try r.string();
+    const hostkey_names = try r.string();
+    const enc_c2s = try r.string();
+    const enc_s2c = try r.string();
+    const mac_c2s = try r.string();
+    const mac_s2c = try r.string();
+
+    if (!hasName(kex_names, "curve25519-sha256")) {
+        log.warn("ssh: client kex list has no curve25519-sha256: {s}", .{kex_names});
+        return error.NoCommonKex;
+    }
+    if (!hasName(hostkey_names, "ssh-ed25519")) {
+        log.warn("ssh: client host-key list has no ssh-ed25519: {s}", .{hostkey_names});
+        return error.NoCommonHostKey;
+    }
+    if (!hasName(enc_c2s, "aes128-ctr") or !hasName(enc_s2c, "aes128-ctr")) {
+        log.warn("ssh: client cipher list has no aes128-ctr: {s}", .{enc_c2s});
+        return error.NoCommonCipher;
+    }
+    if (!hasName(mac_c2s, "hmac-sha2-256") or !hasName(mac_s2c, "hmac-sha2-256")) {
+        log.warn("ssh: client mac list has no hmac-sha2-256: {s}", .{mac_c2s});
+        return error.NoCommonMac;
+    }
+}
+
+fn hasName(list: []const u8, want: []const u8) bool {
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |n| {
+        if (std.mem.eql(u8, n, want)) return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// Zig 0.17 移除了 `**` 数组重复运算符，测试里统一用这个。
+fn fill(comptime n: usize, v: u8) [n]u8 {
+    var a: [n]u8 = undefined;
+    @memset(&a, v);
+    return a;
+}
+
+test "ssh: mpint 编码（最高位为 1 时补 0x00）" {
+    var b = Buf.init(testing.allocator);
+    defer b.deinit();
+
+    // 0x80 开头 ⇒ 必须补一个前导 0，长度从 2 变 3
+    try putMpint(&b, &[_]u8{ 0x80, 0x01 });
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, b.slice()[0..4], .big));
+    try testing.expectEqual(@as(u8, 0), b.slice()[4]);
+    try testing.expectEqual(@as(u8, 0x80), b.slice()[5]);
+    try testing.expectEqual(@as(u8, 0x01), b.slice()[6]);
+
+    // 前导零被剥掉
+    var b2 = Buf.init(testing.allocator);
+    defer b2.deinit();
+    try putMpint(&b2, &[_]u8{ 0x00, 0x00, 0x7f });
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, b2.slice()[0..4], .big));
+    try testing.expectEqual(@as(u8, 0x7f), b2.slice()[4]);
+
+    // 全零 ⇒ 长度 0
+    var b3 = Buf.init(testing.allocator);
+    defer b3.deinit();
+    try putMpint(&b3, &[_]u8{ 0, 0 });
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, b3.slice()[0..4], .big));
+}
+
+test "ssh: CTR 分两次调用与一次性调用等价" {
+    const key = fill(16, 0x2b);
+    const iv = fill(16, 0xf0);
+
+    var whole = fill(64, 0);
+    var c1 = CtrCipher.init(key, iv);
+    c1.xor(&whole);
+
+    var split = fill(64, 0);
+    var c2 = CtrCipher.init(key, iv);
+    c2.xor(split[0..4]); // 先解长度字段
+    c2.xor(split[4..]); // 再解剩下的
+    try testing.expectEqualSlices(u8, &whole, &split);
+
+    // 再 XOR 一次应当还原（CTR 是对合）
+    var back = whole;
+    var c3 = CtrCipher.init(key, iv);
+    c3.xor(&back);
+    try testing.expectEqualSlices(u8, &fill(64, 0), &back);
+}
+
+test "ssh: hasName 精确匹配（不接受前缀）" {
+    try testing.expect(hasName("a,curve25519-sha256,b", "curve25519-sha256"));
+    try testing.expect(!hasName("curve25519-sha256@libssh.org", "curve25519-sha256"));
+    try testing.expect(!hasName("", "curve25519-sha256"));
+    try testing.expect(hasName("", ""));
+}
+
+test "ssh: 主机密钥 blob 结构" {
+    const seed = fill(32, 7);
+    var hk = try HostKey.fromSeed(testing.allocator, seed);
+    defer hk.deinit(testing.allocator);
+
+    var r = Reader{ .buf = hk.blob };
+    try testing.expectEqualStrings("ssh-ed25519", try r.string());
+    try testing.expectEqual(@as(usize, 32), (try r.string()).len);
+    try testing.expectEqual(@as(usize, 0), r.buf.len - r.pos);
+}
+
+test "ssh: 同一 seed 的主机密钥稳定（known_hosts 不会天天变）" {
+    const seed = fill(32, 9);
+    var a = try HostKey.fromSeed(testing.allocator, seed);
+    defer a.deinit(testing.allocator);
+    var b = try HostKey.fromSeed(testing.allocator, seed);
+    defer b.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, a.blob, b.blob);
+}
+
+test "ssh: 签名 blob 可被自身公钥验证" {
+    const seed = fill(32, 3);
+    var hk = try HostKey.fromSeed(testing.allocator, seed);
+    defer hk.deinit(testing.allocator);
+
+    const msg = "the quick brown fox";
+    const blob = try hk.sign(testing.allocator, msg);
+    defer testing.allocator.free(blob);
+
+    var r = Reader{ .buf = blob };
+    try testing.expectEqualStrings("ssh-ed25519", try r.string());
+    const raw = try r.string();
+    try testing.expectEqual(@as(usize, 64), raw.len);
+
+    const sig = Ed25519.Signature.fromBytes(raw[0..64].*);
+    try sig.verify(msg, hk.kp.public_key);
+}
+
+test "ssh: 密钥派生的六个方向互不相同" {
+    const k = fill(32, 0xab);
+    const h = fill(32, 0xcd);
+    const sid = fill(32, 0xef);
+
+    var iv_c2s: [16]u8 = undefined;
+    var iv_s2c: [16]u8 = undefined;
+    var key_c2s: [16]u8 = undefined;
+    var key_s2c: [16]u8 = undefined;
+    var mac_c2s: [32]u8 = undefined;
+    var mac_s2c: [32]u8 = undefined;
+    derive(&k, h, 'A', sid, &iv_c2s);
+    derive(&k, h, 'B', sid, &iv_s2c);
+    derive(&k, h, 'C', sid, &key_c2s);
+    derive(&k, h, 'D', sid, &key_s2c);
+    derive(&k, h, 'E', sid, &mac_c2s);
+    derive(&k, h, 'F', sid, &mac_s2c);
+
+    try testing.expect(!std.mem.eql(u8, &iv_c2s, &iv_s2c));
+    try testing.expect(!std.mem.eql(u8, &key_c2s, &key_s2c));
+    try testing.expect(!std.mem.eql(u8, &mac_c2s, &mac_s2c));
+    try testing.expect(!std.mem.eql(u8, &key_c2s, &iv_c2s));
+}
+
+// ---------------------------------------------------------------------------
+// 连接循环
+// ---------------------------------------------------------------------------
+
+/// 处理一条 SSH 连接：版本交换 → KEX → 消息循环。
+///
+/// 目前循环只应答 `SERVICE_REQUEST`（回 `SERVICE_ACCEPT`），认证与 channel
+/// 在下一层实现。客户端走到这一步会看到「认证未实现」—— 但**能走到这一步
+/// 就说明传输层是对的**：认证消息是加密且带 MAC 的，密钥或 MAC 错一个字节，
+/// 客户端会报 `Corrupted MAC on input`，而不是 `Permission denied`。
+/// 版本交换 + KEX。返回后 `t` 处于加密状态，可以开始收发应用层消息。
+///
+/// 连接循环（认证 / channel）不在这里 —— 见 `channel.zig`。切开是为了让传输层
+/// 的正确性能独立验证：KEX 完成 + 加密通道收发一致，就说明这一层没问题。
+pub fn handshake(t: *Transport, host_key: HostKey, alloc: std.mem.Allocator) !void {
+    try t.exchangeVersion();
+    log.info("ssh: client version {s}", .{t.client_version});
+
+    const kr = try kex(t, host_key, alloc);
+    defer kr.deinit(alloc);
+    log.info("ssh: kex ok (curve25519-sha256 / ssh-ed25519 / aes128-ctr / hmac-sha2-256)", .{});
+}
+
+pub fn sendDisconnect(t: *Transport, reason: u32, desc: []const u8) !void {
+    var b = Buf.init(t.alloc);
+    defer b.deinit();
+    try b.appendByte(MSG_DISCONNECT);
+    try putU32(&b, reason);
+    try putString(&b, desc);
+    try putString(&b, "");
+    try t.writePacket(b.slice());
+}

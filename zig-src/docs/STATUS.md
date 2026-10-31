@@ -4615,3 +4615,637 @@ aarch64 产物 **1,374,976 B / `076cc19b`**（比 §57 的 1,375,832 B 小 856 B
 
 唯一 ERROR 是 `ThunderExpert: userinfo_expired`（06:11 与 14:25 两次启动都有，
 即已知的 `/thunder` 问题，日常用 `/thunderweb`），与本次改动无关。
+
+## 60. SFTP 服务端选型调研 + 协议/会话层落地（2026-10-31 傍晚）
+
+起因：确认「对外提供的服务」只有 WebDAV 之后，讨论如果要支持 SFTP 需要哪些
+底层依赖。三份外部材料逐一核过，结论与最初的直觉不同，记在这里避免重复调研。
+
+### 60.1 Zig 0.17 已移除 `@cImport`（决定性事实）
+
+实测（最小复现）：`@cImport` 报 `error: invalid builtin function: '@cImport'`。
+`lib/std/c.zig` 文件还在，但 builtin 已删除。
+
+⇒ **任何 C 库接入都必须手写胶水层**：C 侧把复杂 struct/union 收成「简单签名 +
+opaque 指针」，Zig 侧只声明 `extern fn`，C 源编成独立 module（未 import 的
+target 不链接其对象）。`D:/workspace/smart-iot/server` 的
+`vendor/bearssl/glue/br_glue.c`（792 行）+ `build.zig:25-50` 的 `bearssl_c`
+模块就是这个范式的现成模板，将来若要链 libssh 直接照抄结构。
+
+### 60.2 三份材料的评估
+
+| 材料 | 是什么 | 对本工程的结论 |
+|---|---|---|
+| `zig-utils/zig-sftp` | SFTP v3 协议层 + CLI，1021 行（`protocol.zig` 492 / `server.zig` 298） | 只覆盖三层里的一层；**无 LICENSE 文件**（根目录与 `find -iname "*license*"` 零命中），默认保留所有权利，AGPL-3.0 项目**不能复制**；且锁 `minimum_zig_version = 0.17.0-dev.1441` 并依赖 `zig_cli`。只借两条设计判断（见 60.3） |
+| `smart-iot/server/vendor/bearssl` | BearSSL 全量 C 源（277 个 `.c`，含 `rsa/`、`ec/`、`int/`、`glue/br_glue.c`） | **对 SFTP 无净收益**：它独有的价值是 TLS 1.2 服务端引擎（`br_glue_srv_*`），与 SSH 无关；唯一能替的 RSA 已被 `std.crypto.ff` 覆盖。真正有价值的是它的 C 桥接**范式** |
+| `libssh`（上一轮评估） | 唯一提供完整 SSH **服务端** API 的成熟 C 库 | 可行但重：静态链 OpenSSL 或 mbedTLS，产物 1.3 MB → 2.5~5 MB。**降级为备选** |
+
+关键更正：上一轮把 RSA 判为「硬缺口」，**这个判断被 smart-iot 推翻**。
+`smart-iot/server/core/net/rsa.zig` 只有 128 行纯 Zig，靠
+`std.crypto.ff.Modulus.powWithEncodedExponent` 就完成了 PKCS#1 v1.5 加解密，
+并有 1024-bit 密钥的往返单测。SSH 的 `rsa-sha2-256` sign/vrfy 是同一套原语加
+DigestInfo 前缀（约 80 行）。
+
+核对 `lib/std/crypto/` 后，SSH 需要的密码学**全部就位**：
+`dh.X25519`、`25519/ed25519.zig`、`sign.ecdsa`、`ff`（RSA）、`aes*`、`chacha20`、
+`hmac`、`sha2`。⇒ **纯 Zig 路线成立，零 C 依赖。**
+
+### 60.3 落地的两层（本次提交）
+
+`src/sftp/protocol.zig`（492 行代码 + 16 测试）——v3 线协议编解码：
+
+* 帧 = 4 字节大端长度前缀（含类型字节）+ 1 字节类型 + 负载；
+  `max_packet_len = 256 KiB` 与 OpenSSH `sftp-server` 一致。
+* `parse()` 用 **`null` 表示「还要更多字节」**，与 `error.*` 严格区分 ——
+  这是流式 RFC 实现最经典的坑：把「等数据」当错误，只要 TCP 分段落在包中间
+  就会丢合法流量。
+* 长度前缀在**任何分配之前**校验，`0xFFFFFFFF` 前缀直接 `PacketTooLong`，
+  不会挂住也不会 OOM（有测试钉住）。
+* `AttrFlags` 是 `packed struct(u32)`，`extended` 用 `_pad: u27` 顶到 **bit31**
+  （`0x80000000`）而不是 bit4；测试逐位核对 5 个标志，防止布局漂移。
+* `Attributes` 用 `?u64` / `?u32` 表达「本包带没带这一项」，而不是用 0 代替 ——
+  `SETSTAT` 里 `size = 0` 是「截断成 0 字节」，`size = null` 是「不动大小」。
+* `Reader` 所有读取都做边界检查；`readString` 的长度在分配前与剩余字节比较。
+
+`src/sftp/session.zig`（298 行代码 + 13 测试）——会话状态：
+
+* 句柄表上限 512（真实客户端并发是个位数，留两个数量级余量），id 从 1 递增
+  且不复用，重复 `close` 返回 `false` 而非崩溃。
+* `reset()` 处理客户端中途重发 `INIT`：不清空就是长连接上的缓慢泄漏。
+* 路径归一化是**纯词法**的，绝不 `stat` —— 一旦碰文件系统就会跟随符号链接，
+  而符号链接正是绕过纯文本检查的通道；且驱动可能是云盘 API，归一化不该有 I/O。
+* `..` 越过根时**钳到根并置 `clamped` 标志**，不报错：虚拟路径的 `/` 就是
+  虚拟根，`/../x` 归一化成 `/x` 仍在根内，不存在逃逸；而 Windows 资源管理器
+  会发带 `..` 的冗余路径，拒绝只会造成「能用但莫名失败」。
+* 拒绝 NUL 字节与超过 4096 字节的路径。
+
+### 60.4 验证
+
+| 项 | 结果 |
+|---|---|
+| `zig build test` | **497 pass + 3 skip**（基线 467 + 新增 30） |
+| `zig build -Doptimize=small` | **1,376,016 B / `935ab9fc`，与改动前逐字节相同** |
+| 结论 | 新模块未被 `main.zig` 引用 ⇒ 不进产物，零体积成本（Zig 只编译被 import 的文件） |
+
+体积零变化是刻意的：这两层要等 SSH 层接上才会被引用，现在只是可单测的地基。
+
+### 60.5 剩余（见 `TODO.md` §5）
+
+SSH-2 传输层（RFC 4253/4252/4254）→ 请求分发到 `driver.Driver` vtable →
+`sftp` 配置段 → 四家客户端互通回归。认证的失败计数 key **必须用纯 IP 不带
+端口**（上游 Go 版用 `IP:端口`，扫描器每次源端口不同，限速形同虚设，见 §9）。
+
+### 60.6 handler 层（同日，接 60.3）
+
+`src/sftp/handler.zig`（1488 行含 12 测试）把 `PacketType` 分发到
+`driver.Driver` vtable。
+
+**设计要点：用两个窄接口隔离依赖。** 分发真正需要的只有「路径 → (驱动, 相对
+路径)」和「link → 一段字节」，所以定义 `Resolver` / `Fetcher` 两个 20 行的
+结构体，生产里分别包 `App.resolve` 与 `client.zig`，测试里包内存驱动与内存
+切片。结果是整套分发逻辑能纯单测，不需要起服务、不需要网络、不需要凭据。
+
+已支持：`INIT`、`REALPATH`、`STAT`/`LSTAT`/`FSTAT`、`OPENDIR`/`READDIR`
+（64 条一页，末尾回 `SSH_FX_EOF`）、`MKDIR`/`RMDIR`/`REMOVE`/`RENAME`、
+`OPEN`(只读)/`READ`/`CLOSE`、`SETSTAT`。
+
+明确未支持并回 `SSH_FX_OP_UNSUPPORTED`（不静默）：`OPEN` 写模式与 `WRITE`
+（需要「pwrite 进 temp_dir 稀疏文件 + CLOSE 时整份 put」，还要接容量闸）、
+`SETSTAT` 的 `size`（截断是真实数据操作，不能假装成功）、`READLINK` /
+`SYMLINK` / `EXTENDED`。
+
+几个实现决定：
+
+* **句柄状态挂在 `session.Handle.extra` 上**，配一个 `release` 回调。会话层
+  因此不必 import `model.zig` / `driver.zig`，仍是零依赖；`closeHandle` /
+  `reset` / `deinit` 三处都会调 `release`，不会漏。
+* **`OPEN` 时深拷贝 link**。驱动返回的 `url` / `text` 活在**请求 arena** 里，
+  句柄要跨请求存活，不拷贝就是悬垂指针。
+* **`READ` 用 1 MiB 窗口缓存**。SFTP 客户端典型读块 32 KiB，缓存把「每块一次
+  Range 请求」降到「每 32 块一次」。`link.text`（Strm 类内存源）直接切片，
+  不经过缓存。
+* **`RENAME` 跨目录 = `move` + `rename` 两步**。vtable 的 `move` 第二个参数
+  是**目标目录**（条目保持原名），所以解析目标时必须用 `dirname(new_path)`
+  而不是 `new_path` 本身 —— 传文件路径会让驱动拼出 `/dst/c.txt/a.txt`。
+  改名失败时源文件已经移动，如实回错误而不是假装成功。
+* **跨存储 `RENAME` 回 `op_unsupported`**：`move` 只在同一驱动内有效。
+
+### 60.7 一个真实 bug：`std.fs.path.join` 不能用于虚拟路径
+
+跨目录 RENAME 的单测第一次是红的：`/dst/c.txt` 不存在。根因是
+`std.fs.path.join` **按宿主平台分隔符拼接**，在 Windows 上产出
+`/dst\a.txt`，而虚拟路径必须永远是 `/`。
+
+这不是测试环境问题 —— 同一段代码在 Linux 上正确、在 Windows 上错误，说明
+它依赖了不该依赖的东西。改用 12 行的 `joinVirtual`（永远 `/`），handler 与
+测试桩共用。教训：**虚拟路径的拼接通通用 `std.mem` / 自写 helper，不要用
+`std.fs.path` 的 join**（`dirname` / `basename` 反而是安全的，它们同时识别
+两种分隔符）。
+
+### 60.8 验证
+
+| 项 | 结果 |
+|---|---|
+| `zig build test --summary all` | **509 pass + 3 skip**（512 total；新增 41 个：protocol 16 + session 13 + handler 12） |
+| `zig build -Doptimize=small` | **1,376,016 B / `935ab9fc`，与改动前逐字节相同** |
+
+体积仍为零变化：三层都还没被 `main.zig` 引用，Zig 只编译被 import 的文件。
+
+### 60.9 生产接线 + 裸 SFTP 端到端验证（同日晚）
+
+`src/sftp_wire.zig`（约 300 行）把前两层接到真实世界：
+
+* `resolverFor(app)` —— 包 `App.resolve`；额外提供 `listRootFn`，把**虚拟根**
+  的一级名字（挂载点第一段、去重）列出来。没有它，客户端 `OPENDIR /` 会拿到
+  `NO_SUCH_FILE`，用户看到的是一片空白 —— 比报错更难排查。已知限制：嵌套
+  挂载（`/a/b`）在根下只暴露 `a`，而 `a` 本身不是挂载点，`OPENDIR /a` 仍会
+  失败；真实配置里挂载点基本都是一级，不值得为它维护合成目录树。
+* `Wire` —— 每条连接一个 `client.Client` + `cookiejar`。⚠ 必须**就地**初始化
+  （`initInPlace`）：`Client` 持有 `*Jar`，返回值构造会让指针悬垂。
+* `fetchFn` —— `local_path` 走 `readPositionalAll`（0.17 的 pread 写法），
+  `url` 走 Range 请求；`206` 直接用，`200`（上游忽略 Range）只有在覆盖目标
+  区间时才切，否则明确报 `NotSupported`。
+* `servePlain` / `serveStream` —— 裸 TCP 监听，只绑 `127.0.0.1`、必须显式
+  `--sftp-plain <port>`、每次启动打 WARN。**没有认证**：谁能连上谁就是管理员。
+
+### 60.10 两个 bug
+
+**（1）`readSliceShort` 的语义是「读满整个 buffer」。**
+
+第一版用 `rd.readSliceShort(&chunk)`（16 KiB 缓冲）读 socket，结果客户端发完
+一个 9 字节的 INIT 包就在等回复，服务端在等 16 KiB —— 双方死锁。探针表现是
+「TCP 连上了，INIT 超时，服务端零日志」。
+
+`std.Io.Reader.readSliceShort` 的实现是循环 `readVec` 直到缓冲满或 EOF，所以
+它**不是**「有多少拿多少」。正确的读法是 `readVec`（一次读多少算多少）。这条
+值得记住：0.17 里名字带 `Short` 的是「短读**结束**」，不是「读一小段」。
+
+**（2）`zig build` 在 exe 被占用时会 `AccessDenied` 失败。**
+
+调试期间服务在跑，`zig build` 报 `failed updating file ... AccessDenied`。
+必须先停服务再编译 —— 和 Linux 上 `ETXTBSY` 是同一类问题。
+
+### 60.11 端到端验证（真机链路，local 驱动）
+
+配置：一个 `Local` 挂载 `/local` → `D:/workspace/_olz-sftp-test/data`，
+`--sftp-plain 15399`。探针 `tools/sftp_probe.py` 直接说 SFTP（不经 SSH）：
+
+```
+INIT     -> VERSION 3
+REALPATH /                        -> NAME count=1  d 0 /
+OPENDIR  /                        -> HANDLE
+READDIR  page 1                   -> NAME count=1   d 0 local
+READDIR  page 2                   -> STATUS EOF
+OPENDIR  /local                   -> HANDLE
+READDIR  page 1                   -> NAME count=3
+    -     2000 big.bin
+    -       11 readme.txt
+    d        0 sub
+READDIR  page 2                   -> STATUS EOF
+STAT     /local/readme.txt        -> ATTRS size=11 permissions=33188 (0o100644)
+OPEN     /local/readme.txt        -> HANDLE
+READ     /local/readme.txt        -> DATA 11 bytes: b'hello sftp\n'
+CLOSE    /local/readme.txt        -> STATUS OK
+OPEN(w)  /local/nope.txt          -> STATUS OP_UNSUPPORTED
+SETSTAT  /local/readme.txt (size=0)-> STATUS OP_UNSUPPORTED
+MKDIR    /local/tmp-probe         -> STATUS OK   （磁盘上真的建了）
+STAT     /local/tmp-probe         -> ATTRS permissions=16877 (0o040755)
+RMDIR    /local/tmp-probe         -> STATUS OK
+RENAME   /local/readme.txt /local/readme-renamed.txt -> STATUS OK（磁盘上真的改了）
+```
+
+READ 的内容与磁盘逐字节一致，MKDIR / RENAME 在文件系统上真的生效 —— 这证明
+「协议 → 分发 → 驱动 vtable → 真实文件系统」整条链路是通的，不是只回了个
+`OK`。
+
+### 60.12 体积
+
+| 项 | 值 |
+|---|---|
+| 接线前 | 1,376,016 B / `935ab9fc` |
+| 接线后（native Windows 构建） | 1,889,792 B / `82e055b9` |
+| 增量 | **+513,776 B** |
+
+增量来自三层 SFTP + `sftp_wire` + 它拉进来的 `client.zig` / `cookiejar`。
+注意这个数字是 **Windows native** 产物；aarch64-linux-musl 的实际增量要等
+SSH 层落地后一起量（届时 `main.zig` 才会真正引用整条链路）。
+
+单测：**510 pass + 3 skip**（新增 1 个虚拟根用例）。
+
+### 60.13 SSH-2 传输层落地（同日晚）
+
+`src/sftp/ssh.zig`（约 800 行，7 测试）实现「把字节流变成可信加密管道」：
+
+| 层 | 实现 |
+|---|---|
+| 版本交换 | `SSH-2.0-OpenList_0.1`；跳过客户端 `SSH-` 行之前的任意前置行（RFC 允许，最多 50 行） |
+| 算法协商 | 只宣告 `curve25519-sha256` / `ssh-ed25519` / `aes128-ctr` / `hmac-sha2-256` / `none` |
+| 密钥交换 | ECDH：`K = X25519(d_S, Q_C)`，`H = SHA256(V_C‖V_S‖I_C‖I_S‖K_S‖Q_C‖Q_S‖K)` |
+| 主机密钥 | Ed25519，32 字节 seed 持久化到 `data/ssh_host_ed25519_key`（每次重启换密钥会让所有人看到 known_hosts 警告） |
+| 包协议 | 长度/填充/序列号/MAC；**MAC 覆盖明文包**（RFC 4253 §6.4），先加密再算 MAC 必然对不上 |
+| 加密 | AES-128-CTR（自写 20 行，SSH 的长度字段也加密，所以必须支持「先解 4 字节再解剩余」的分段调用） |
+
+**只支持一套算法的理由**：SSH 的算法矩阵支持越多、出错组合越多。协商失败时
+明确断连并说明缺哪一项，不静默降级 —— 降级意味着「你以为在用 curve25519，
+实际在用 group1-sha1」。
+
+### 60.14 OpenSSH 10.3 客户端实测（决定性验证）
+
+```
+debug1: Remote protocol version 2.0, remote software version OpenList_0.1
+debug1: kex: algorithm: curve25519-sha256
+debug1: kex: host key algorithm: ssh-ed25519
+debug1: kex: server->client cipher: aes128-ctr MAC: hmac-sha2-256 compression: none
+debug1: Server host key: ssh-ed25519 SHA256:3ypnXyzrblKZsGsBazeWXkQuihyBR8BkkuRpvqBM/L8
+debug2: service_accept: ssh-userauth
+debug1: SSH2_MSG_SERVICE_ACCEPT received
+debug1: Received SSH2_MSG_UNIMPLEMENTED for 4
+```
+
+这五行合起来证明的东西比看上去多：
+
+* `Server host key: ... SHA256:...` —— 客户端**验签通过**。签名错会报
+  `Host key verification failed` 或 `incorrect signature`。
+* `service_accept: ssh-userauth` —— 客户端**成功解密**了我们的包。密钥或 IV
+  错一个字节，这里就是乱码。
+* 没有 `Corrupted MAC on input` —— MAC 计算（含序列号、长度字段、明文顺序）
+  完全正确。
+* `SSH2_MSG_UNIMPLEMENTED for 4` —— 客户端发 `USERAUTH_REQUEST`（序号 4），
+  我们按 RFC 回 UNIMPLEMENTED。这是**认证尚未实现**的预期表现，不是传输层
+  的问题。
+
+服务端日志对应两行：`ssh: client version SSH-2.0-OpenSSH_10.3` +
+`ssh: kex ok (curve25519-sha256 / ssh-ed25519 / aes128-ctr / hmac-sha2-256)`。
+
+### 60.15 这一轮踩的坑（都是 0.17 的 API 变更）
+
+1. **`**` 数组重复运算符被移除**：`[_]u8{0} ** 64` 报
+   `binary operator '*' has whitespace on one side`。改用 `@memset` 的 helper。
+2. **`AesEncryptCtx` 是泛型**：`std.crypto.core.aes.AesEncryptCtx` 是
+   `fn (comptime type) type`，必须写 `AesEncryptCtx(Aes128)`。
+3. **`Dir.makePath` → `Dir.createDirPath`**。
+4. **`Buf.toOwned()` 又漏了一次**：`fromSeed` / `sign` 里用 `errdefer` 导致成功
+   路径泄漏（`testing.allocator` 直接报出来）。这个坑在 `session.zig` 已经踩过
+   一次，说明「临时 Buf 一律 `defer`」应当成为条件反射。
+
+### 60.16 体积
+
+| 阶段 | 大小 | sha256 |
+|---|---|---|
+| handler 层完成 | 1,376,016 B | `935ab9fc` |
+| + 生产接线（裸 SFTP） | 1,889,792 B | `82e055b9` |
+| + SSH 传输层 | **1,915,904 B** | `b29afc1d` |
+
+均为 Windows native 构建。SSH 层本身只增加 **26,112 B** —— 因为 curve25519 /
+ed25519 / AES / HMAC 全部来自 `std.crypto`，没有引入任何外部依赖。
+
+单测：**517 pass + 3 skip**（新增 7 个 SSH 用例）。
+
+### 60.17 连接层 + 认证 + OpenSSH `sftp` 端到端（同日晚）
+
+`src/sftp/channel.zig`（约 400 行）补上最后一段：RFC 4254 连接层 + RFC 4252
+认证 + SFTP 字节流桥接。
+
+**结构**：`SftpHandler` 是一个「一个完整 SFTP 包进、回复字节出」的回调。
+channel 层因此不 import `handler` / `session` —— SSH 连接管理和 SFTP 语义各自
+可测、可替换。`serveSsh` 里的装配与裸端点完全一样（一个 `Wire`、一个
+`Session`、一个 `Context`），区别只在字节从哪儿来。
+
+**单 channel**：SFTP 客户端一律只开一个 `session` channel 跑 `subsystem sftp`。
+第二个 `CHANNEL_OPEN` 明确回 `SSH_OPEN_ADMINISTRATIVELY_PROHIBITED`，不静默忽略。
+
+**`max_packet` 必须分片**：OpenSSH 宣告的 max packet 是 32 KiB，而一个
+`READDIR` 回复可能超过它 —— 超长包会被客户端判协议错误并断连。`sendData`
+按 `remote_max_packet` 切片。
+
+**窗口**：接收方向每消费过半就补 `CHANNEL_WINDOW_ADJUST`；发送方向扣减
+`remote_window`，不足时只告警仍发（真实客户端初始窗口 2 MiB，单个回复最大
+256 KiB，正常不会触顶）。严格做法需要 pending 队列，对一个 channel 不值得。
+
+### 60.18 ⚠ 认证是临时后门（必须替换）
+
+`acceptUnverified()` **不校验任何凭据**就回 `USERAUTH_SUCCESS`，`none` 和
+`password` 两条路径都走它。
+
+为什么需要它：`sftp -b`（批量模式）**禁用密码提示**，不先把认证放通就没法用
+真实客户端验证「channel → SFTP → 驱动」整条链路。
+
+三条约束同时成立才允许存在，缺一不可：
+
+1. 只有 `--sftp-ssh` 才走到这里（默认不监听）；
+2. 只绑 `127.0.0.1`；
+3. 每次放行都打 `WARN ... ACCEPTED WITHOUT CHECKING`。
+
+替换点只有一个函数，`TODO(auth)` 标好了。**这一条不做完，`--sftp-ssh` 不能
+上线，也不能绑非 loopback 地址。**
+
+### 60.19 OpenSSH `sftp` 客户端实测
+
+```
+sftp> pwd
+Remote working directory: /
+sftp> ls /
+/local
+sftp> ls /local
+/local/readme.txt   /local/sub
+sftp> ls /local/sub
+/local/sub/inner.txt
+sftp> get /local/readme.txt /tmp/sftp-out.txt
+sftp> get /local/sub/inner.txt /tmp/sftp-inner.txt
+```
+下载到的两个文件内容与磁盘逐字节一致（`hello sftp over ssh` / `nested`）。
+
+```
+sftp> mkdir /local/newdir      → 磁盘上真的建了
+sftp> ls /local                → 列出 newdir
+sftp> rename /local/readme.txt /local/r2.txt   → 磁盘上真的改名
+sftp> rename /local/r2.txt /local/readme.txt   → 改回来
+sftp> rmdir /local/newdir      → 真的删了
+sftp> put /tmp/sftp-out.txt /local/uploaded.txt
+dest open "/local/uploaded.txt": Operation unsupported
+```
+
+`put` 的报错是刻意的：写路径未实现就明确说 `Operation unsupported`，不假装
+成功、也不静默丢数据。
+
+### 60.20 一个隐蔽的 channel 号 bug
+
+第一版 `CHANNEL_SUCCESS` / `CHANNEL_FAILURE` 的 `recipient channel` 填的是
+**请求里带的那个号**（我们的 local id = 1），而客户端认的是**它自己的** channel
+号（`remote_id`，通常是 0）。症状很轻：
+
+```
+channel_by_id: 1: bad id: channel free
+channel_input_status_confirm: 1: unknown
+```
+
+传输照样能跑、`get` 照样能下 —— 只有关闭 channel 时行为不可预期。修成
+`self.remote_id` 后两行警告消失。
+
+这类 bug 单测抓不到（需要真实客户端），也说明「端到端跑一遍真实客户端」不是
+可选项：只测自己写的协议层，会漏掉所有「谁该用哪个 id」的语义错误。
+
+### 60.21 体积
+
+| 阶段 | 大小 | sha256 |
+|---|---|---|
+| + SSH 传输层 | 1,915,904 B | `b29afc1d` |
+| + 连接层/认证/桥接 | **1,922,560 B** | `897aa7c8` |
+
+连接层只增加 **6,656 B**。
+
+单测：**518 pass + 3 skip**。
+
+### 60.22 认证接真校验（同日晚）
+
+`channel.zig` 的临时后门 `acceptUnverified()` **已删除**，换成 `Auth` 接口：
+
+```zig
+pub const Auth = struct {
+    ctx: *anyopaque,
+    verifyFn: *const fn (ctx, alloc, user, pw) bool,
+};
+```
+
+channel 层只问「过没过」，不知道 `twoHashPwd` 的存在 —— 口令哈希形态属于账户
+层，SSH 和 HTTP 登录必须用**同一套**实现，否则迟早漂移。
+
+生产实现 `sftp_wire.sshVerify`：
+
+1. `admin_hash` 为空（还没建管理员）⇒ 直接拒绝；
+2. `api.authThrottleAllow()` 为 false ⇒ 拒绝，**连哈希都不算**（与 HTTP 登录
+   的检查顺序一致）；
+3. 用户名不等 ⇒ `recordFailure` + 拒绝；
+4. `twoHashPwd(pw, admin_salt)` 与 `admin_hash` 不等 ⇒ `recordFailure` + 拒绝；
+5. 全部通过 ⇒ `recordSuccess`（清零计数）+ 放行。
+
+对外**不区分**「用户名错」和「口令错」：两者都只回 `USERAUTH_FAILURE`，客户端
+看到的都是 `Permission denied`。
+
+`none` 方法**永远不通过** —— 放行它等于无认证登录。客户端收到 FAILURE 后会
+自动改试 password。
+
+### 60.23 SSH 与 HTTP 共用失败计数
+
+`api.zig` 新增 `authThrottleAllow/Failure/Success`，包住原来 `login_throttle`
+（M11 实现，对齐 Go `LoginCache`：5 次失败锁 5 分钟）。
+
+共用是刻意的：**换个协议不能绕过限速**。副作用是 SSH 爆破会顺带锁住 HTTP
+登录 5 分钟 —— 单管理员部署下可接受，Go 也是同一份 `LoginCache`。
+
+⚠ 计数 key 目前是**全局**而非按 IP：`std.Io.net.Stream` 不暴露对端地址（与
+HTTP 登录同一个限制）。后果是任何人都能锁住管理员账户 5 分钟。将来拿到 IP 后
+key **必须用纯 IP、不带端口**（上游用 `IP:端口`，扫描器源端口每次都变，计数
+永远到不了阈值 —— `docs/STATUS.md` §9）。
+
+### 60.24 实测（OpenSSH `sftp`，`OPENLIST_ADMIN_PASSWORD=test123`）
+
+| 场景 | 结果 |
+|---|---|
+| 错误口令 | `admin@127.0.0.1: Permission denied (password).` + 服务端 `WARN ssh: password auth failed (user=admin)` |
+| 正确口令 | 登录成功，`pwd` / `ls /` / `ls /local` / `get` 全部正常，文件内容逐字节一致 |
+| 连续 5 次错口令后再用**正确**口令 | 仍被拒；服务端 `WARN ssh: auth refused — account locked after too many failed attempts` |
+
+最后一条是关键的：**锁定期内即使口令正确也不放行**，且日志明确说是锁定而非
+口令错误。没有这条日志时，用户会以为密码打错了，而实际上要等 5 分钟 —— 这是
+「正确口令登不上」最典型的误诊来源。
+
+### 60.25 体积
+
+| 阶段 | 大小 | sha256 |
+|---|---|---|
+| + 连接层/桥接（认证放行） | 1,922,560 B | `897aa7c8` |
+| + 认证真校验 | **1,923,584 B** | `3461e7cd` |
+
+认证只增加 **1,024 B**（复用已有的 `twoHashPwd` 与 `login_throttle`，没有新依赖）。
+
+单测：**518 pass + 3 skip**（认证路径依赖 `App` 与全局计数，靠真机客户端验证）。
+
+### 60.26 写路径落地（同日晚）
+
+SFTP 按 offset 随机写，而驱动只有「整份 `put`」。中间的桥是**稀疏 temp 文件**：
+
+```
+OPEN(write|creat|trunc) → 在 temp_dir 建空文件，登记写句柄
+WRITE(offset, data)     → pwrite 到 temp，记录最高偏移
+CLOSE                   → 把 temp 包成 model.Source，一次 driver.put
+```
+
+`FileState` 从 struct 改成 `union(enum) { read, write }`。用 union 而不是一堆
+可空字段：读句柄有 `link` 和窗口缓存，写句柄有 temp 文件，混在一起会让「读
+句柄被当成写句柄用」变成运行期才发现的空指针。
+
+容量闸与 `fs/put` / 分片回退路径**同一笔账**：`max_write_bytes` =
+`App.mp_max_bytes` = `zig.max_upload_mb`。超限时 `WRITE` 立刻失败，不等把
+tmpfs 写满 —— 写满时错误会变成 ENOSPC，客户端只看到含糊的 I/O 错误。
+
+**不支持断点续传**：`write` 但没有 `trunc`、且目标已存在时明确回
+`op_unsupported`。真要支持得先把现有内容拉到 temp 再覆盖写，那是另一条完整
+的下载路径。主流客户端（rclone / WinSCP / FileZilla）上传都用
+`write|creat|trunc`，不受影响。
+
+### 60.27 两个 bug，第二个很危险
+
+**（1）`CreateFileOptions.read` 默认是 `false`（只写）。**
+
+temp 文件用 `createFile(..., .{ .truncate = true })` 打开后是只写句柄，
+`CLOSE` 时 `readPositionalAll` 读它得到 `AccessDenied`。症状：
+`sftp> put` 显示 "Uploading..."，然后 `close remote: Permission denied`，
+而临时文件里其实已经有完整内容。加 `.read = true` 解决。
+
+**（2）WRITE 失败后客户端仍会发 CLOSE ⇒ 截断文件被当成完整文件上传。**
+
+实测：9 MiB 上传，容量闸（8 MiB）在第 9 块拒绝，客户端报
+`write remote: Failure` —— 但**磁盘上留下了正好 8,388,608 字节的
+`over.bin`**。因为 CLOSE 无条件 `put`，把已写入的前 8 MiB 当成完整文件传了
+上去。如果目标原本有文件，还会被这个截断版本覆盖。
+
+修法：`WriteState.failed` 标志，任何写入失败都置位；CLOSE 见到它就不 `put`，
+直接删 temp 并回 `SSH_FX_FAILURE`。修完再测：
+
+```
+sftp> put /tmp/over.bin /local/over.bin
+write remote "/local/over.bin": Failure
+close remote: Failure
+=== 磁盘 ===
+-rw-r--r-- 1 ... big.bin
+-rw-r--r-- 1 ... readme.txt
+-rw-r--r-- 1 ... uploaded.txt          ← 没有 over.bin
+=== temp 残留 ===
+0
+```
+
+这类 bug 只在「中途失败 + 客户端仍提交」时出现，正常路径完全测不到。它是
+「容量闸」这个功能能否成立的前提：闸拦下数据却留下截断文件，比不设闸更糟。
+
+### 60.28 实测（OpenSSH `sftp`）
+
+| 场景 | 结果 |
+|---|---|
+| 29 B 小文件 `put` + `get` | 内容一致 |
+| 1 MiB 随机数据 `put` + `get` | **MD5 一致**（跨多个 WRITE 块） |
+| 9 MiB（超 8 MiB 闸） | `write` + `close` 双双 Failure，**磁盘无残留、temp 零残留** |
+| 上传后 temp 目录 | 0 个文件（CLOSE 即删） |
+
+### 60.29 体积
+
+| 阶段 | 大小 | sha256 |
+|---|---|---|
+| + 认证真校验 | 1,923,584 B | `3461e7cd` |
+| + 写路径 | **1,930,240 B** | `95a4034a` |
+
+写路径增加 **6,656 B**。单测：**518 pass + 3 skip**（写路径依赖真实文件系统，
+靠 OpenSSH 客户端验证）。
+
+### 60.30 配置面：`sftp` 段（同日晚）
+
+之前 `config.zig` 里的 `sftp` 段是「读了即忽略」，SFTP 只能靠命令行开关启动。
+现在变成真读：
+
+```json
+"sftp": {
+  "enable": false,
+  "address": "0.0.0.0",
+  "port": 2022,
+  "host_key": "data/ssh_host_ed25519_key"
+}
+```
+
+**默认关闭**。与 WebDAV 不同：`/dav` 是上游常挂的，而 SSH 端点暴露面更大、
+且需要独立端口，不该在用户没明确要求时自己开。
+
+**兼容 Go 的写法**：`sftp.listen`（`":2022"` / `"0.0.0.0:2022"` /
+`"127.0.0.1:2022"`）也能解析 —— 同一份 `config.json` 对两个版本都有效。
+优先级：`--sftp-ssh <port>` > `sftp.address` + `sftp.port` > `sftp.listen`
+> 默认（`0.0.0.0:2022`）。
+
+解析逻辑抽成顶层纯函数 `parseListen`，语义刻意保守：**解析不出来的部分保持
+原值**，绝不把非法端口变成 0（那会绑到随机端口或静默失败）。单测覆盖
+`:2222` / `127.0.0.1:2223` / `10.0.0.1:abc` / 无冒号 / 端口 0 五种输入。
+
+**地址必须是 IP 字面量**：`std.Io.net.IpAddress.parse` 不做域名解析，写主机名
+会在启动时直接报错并提示「用 0.0.0.0 这样的 IP 字面量」，而不是静默绑错。
+
+**主机密钥**：`host_key` 指向的 32 字节 seed 文件不存在时首次启动自动生成。
+必须持久化 —— 每次重启换密钥会让所有客户端弹 known_hosts 警告。
+
+### 60.31 三种启动方式实测
+
+| 配置 | 结果 |
+|---|---|
+| `enable=true` + `address=127.0.0.1` + `port=15401` | 日志 `listening on 127.0.0.1:15401`；`sftp -P 15401` 登录、`ls`、`get` 正常；host key 写到配置指定路径（32 B） |
+| `enable=true` + `listen="127.0.0.1:15402"`（Go 写法） | 监听 15402，`sftp -P 15402` 正常 |
+| `enable=false` + `listen="127.0.0.1:15403"` | 端口**未监听**（socket connect 超时），日志无 `sftp(ssh): listening` |
+
+### 60.32 体积
+
+| 阶段 | 大小 | sha256 |
+|---|---|---|
+| + 写路径 | 1,930,240 B | `95a4034a` |
+| + 配置面 | **1,933,824 B** | `685a9844` |
+
+配置面增加 **3,584 B**。单测：**519 pass + 3 skip**（新增 `parseListen` 用例）。
+
+### 60.33 复核：一处 P0、三处 P1、若干 P2/P3（2026-10-31 晚）
+
+用户要求复核三处（写路径所有权 / KEX 密钥派生 / 窗口扣减），复核过程中
+另外撞到几处。按严重度：
+
+**P0 —— 未认证即可开 channel**（`src/sftp/channel.zig`）
+`Conn.authenticated` 只被赋值（USERAUTH 成功）、**从没被检查**，而
+`onChannelOpen` 没有任何闸门。RFC 4253 不要求「先认证再开 channel」，于是
+KEX 结束后直接发 `CHANNEL_OPEN` + `subsystem sftp` 就能读写全部挂载 ——
+认证形同虚设。修法：`onChannelOpen` / `onChannelRequest` / `onChannelData`
+三处都校验该标志，未认证分别回 `ADMINISTRATIVELY_PROHIBITED` /
+`CHANNEL_FAILURE` / 断连。
+> 文件头原本写着「放行任意口令……少任何一条，这就是个后门」，正好命中。
+
+**P1 —— SFTP 启动失败会拖垮 HTTP**（`src/main.zig`）
+sftp 分支的 4 个 `return` 都在 `server.run()` **之前**：`sftp.port` 写错或线程
+spawn 失败 ⇒ HTTP 服务根本不启动，整个程序哑掉。改成「记 err 后跳过」
+（`if (spawn) |t| t.detach() else |e| log.err`，端口非法用 `sftp:` 标签块
+`break :sftp`）。顺带修了同函数既有的第 249 行：mount 线程 spawn 失败 →
+同步初始化后 `return`，同样是「什么都没监听就退出」。
+
+**P1 —— `sftp.port` 恒压过 `listen`**（`src/config.zig`）
+默认配置把 `"port": 2022` 写进了 config.json，而 `int(getPath(...), default)`
+只要键存在就生效 ⇒ 文档声明的「address+port > listen」实际是反的：只写
+`listen` 的用户（Go 迁移过来的典型配置）会被 2022 顶掉。改成用
+**「键是否存在」**判断（`getPath(...) != null`），listen 只填补未显式给出的
+字段。新增测试三种配置各 load 一次钉住这个优先级。
+
+**P1 —— `openForWrite` 的 fd / temp 泄漏**（`src/sftp/handler.zig`）
+`createFile` 之后还有三处会失败（`create(FileState)`、`vpath` dupe、`p` dupe），
+而它之后没有 errdefer 兜 fd ⇒ 任一失败就漏一个 fd + 一份 temp 文件（生产
+`temp_dir` 是 tmpfs，吃 RAM）。重排：`vpath` / `FileState` / `p` 全部提到
+`createFile` **之前**；`tmp_path` 与 `p` 故意不挂 errdefer（只在 createFile
+失败路径显式释放，避免「release 已 free + errdefer 再 free」）；createFile 后
+挂 `errdefer { close fd; delete temp }`；`writeHandle` 移到 `setExtra` 之前 ——
+保证 errdefer 与 `FileState.release` 在任何路径上都不会跑到同一份资源上。
+（原本还有一处：`createFile` 失败分支先 `free(tmp_path)` 再 `try writeStatus`，
+后者 OOM 时 errdefer 会二次释放。）
+
+**窗口取舍的结论**：原来「不足时告警照发」改成「同步等 `WINDOW_ADJUST`」
+（`waitForWindow`，最多 64 个包，超时才退回照发）。RFC 4254 §5.2 是 MUST NOT
+级别，客户端反应不统一；等待期间收到的 `CHANNEL_DATA` 走 `feedData` 进
+`acc`，交给外层循环，不递归分发。
+
+**P2/P3**：`FileState` / `DirState` 改用**自己记录的 alloc** 释放（release 回调
+拿到的是 `Session.alloc`，而状态是用 `Context.alloc` 建的）；`sshVerify` 的哈希
+比对改用 `api.ctEqual`（与 HTTP 登录一致）；`parseListen` 加裸 IPv6 防护
+（`::1` 不再被切成 host=`::` + port=1，`[::1]:2224` 剥方括号）；三处过期文档
+（channel 头 / USAGE / sftp_wire 头）重写。
+
+**核对无误的三处**：A–F 六方向（A=IV_c2s … F=MAC_s2c）、`session_id` 仅在首次
+KEX 取 H、H 的串接顺序（RFC 8731）、MAC 覆盖 seq‖明文且在加密前算、CTR
+大端计数器 —— 与 RFC 4253 §7.2 逐条一致。
+
+### 60.34 体积与单测（复核后）
+
+| 阶段 | 大小 | sha256 |
+|---|---|---|
+| + 配置面（60.32） | 1,933,824 B | `685a9844` |
+| + 复核修复 | **1,935,360 B** | `948ed083` |
+
+复核只增加 **1,536 B**。单测：**520 pass + 3 skip**（新增
+「listen 只填补未显式给出的 address/port」一条），0 失败。

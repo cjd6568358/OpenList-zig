@@ -82,6 +82,21 @@ pub const Config = struct {
     text_types: []const u8,
 
     temp_dir: []const u8,
+    /// SFTP 服务端（SSH-2 + SFTP v3）。**默认关闭**。
+    ///
+    /// 配置形态刻意兼容 Go 的 `conf.SFTP`：`enable` 同名，监听地址用 Go 的
+    /// `listen`（`":2022"` / `"0.0.0.0:2022"`），同时额外支持拆开的
+    /// `address` + `port`（更好读，且 `listen` 解析不出主机名时能兜底）。
+    /// 同一份配置因此对 Go 版和本版都有效 —— Go 会忽略它不认识的
+    /// `address` / `port` / `host_key`，本版会忽略 Go 的 `listen` 里的主机名
+    /// 之外的差异。
+    sftp_enable: bool,
+    sftp_address: []const u8,
+    sftp_port: i64,
+    /// Ed25519 主机密钥的 32 字节 seed 文件。不存在时首次启动自动生成。
+    /// 每次重启换密钥会让所有客户端弹 known_hosts 警告，所以这个文件要跟
+    /// `config.json` 一样持久化。
+    sftp_host_key: []const u8,
     tls_insecure_skip_verify: bool,
     max_connections: i64,
     max_concurrency: i64,
@@ -605,6 +620,24 @@ pub fn load(alloc: std.mem.Allocator, path: []const u8) !*Config {
     // Go `internal/bootstrap/data/setting.go:128` 的默认值，一字不差。
     cfg.text_types = str(cfg.root.getPath("zig.text_types"), "txt,htm,html,xml,java,properties,sql,js,md,json,conf,ini,vue,php,py,bat,gitignore,yml,go,sh,c,cpp,h,hpp,tsx,vtt,srt,ass,rs,lrc,strm");
     cfg.temp_dir = str(cfg.root.getPath("temp_dir"), "data/temp");
+    // SFTP 服务端：默认关闭。`listen` 是 Go 的写法（`":2022"` /
+    // `"0.0.0.0:2022"`），`address` + `port` 是本版的显式写法（优先）。
+    cfg.sftp_enable = boolean(cfg.root.getPath("sftp.enable"), false);
+    cfg.sftp_address = "0.0.0.0";
+    cfg.sftp_port = 2022;
+    // ⚠ 优先级必须用「**键是否存在**」判断，不能用默认值判断：默认配置把
+    // `"port": 2022` 写进了 config.json，若无条件执行下面的覆盖，只写了
+    // `listen` 的用户会被 2022 顶掉 —— `listen` 里的端口永远不生效，而这
+    // 种配置（Go 迁移过来的）恰恰是最常见的一类。
+    const has_address = cfg.root.getPath("sftp.address") != null;
+    const has_port = cfg.root.getPath("sftp.port") != null;
+    {
+        const listen = str(cfg.root.getPath("sftp.listen"), "");
+        if (listen.len > 0) parseListen(listen, &cfg.sftp_address, &cfg.sftp_port);
+    }
+    if (has_address) cfg.sftp_address = str(cfg.root.getPath("sftp.address"), cfg.sftp_address);
+    if (has_port) cfg.sftp_port = int(cfg.root.getPath("sftp.port"), cfg.sftp_port);
+    cfg.sftp_host_key = str(cfg.root.getPath("sftp.host_key"), "data/ssh_host_ed25519_key");
     cfg.tls_insecure_skip_verify = boolean(cfg.root.getPath("tls_insecure_skip_verify"), false);
     cfg.max_connections = int(cfg.root.getPath("max_connections"), 0);
     cfg.max_concurrency = int(cfg.root.getPath("max_concurrency"), 64);
@@ -820,6 +853,12 @@ pub const DEFAULT_CONFIG =
     \\    "enable_h2c": false
     \\  },
     \\  "temp_dir": "data/temp",
+    \\  "sftp": {
+    \\    "enable": false,
+    \\    "address": "0.0.0.0",
+    \\    "port": 2022,
+    \\    "host_key": "data/ssh_host_ed25519_key"
+    \\  },
     \\  "bleve_dir": "data/bleve",
     \\  "log": {
     \\    "enable": true,
@@ -853,6 +892,101 @@ pub const DEFAULT_CONFIG =
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "sftp: listen 解析（Go 兼容）" {
+    var addr: []const u8 = "0.0.0.0";
+    var port: i64 = 2022;
+
+    // `:2222` ⇒ 地址不变（所有接口），端口变
+    parseListen(":2222", &addr, &port);
+    try testing.expectEqualStrings("0.0.0.0", addr);
+    try testing.expectEqual(@as(i64, 2222), port);
+
+    // 带主机
+    parseListen("127.0.0.1:2223", &addr, &port);
+    try testing.expectEqualStrings("127.0.0.1", addr);
+    try testing.expectEqual(@as(i64, 2223), port);
+
+    // 非法端口：地址已更新，端口保持原值（不能变成 0）
+    parseListen("10.0.0.1:abc", &addr, &port);
+    try testing.expectEqualStrings("10.0.0.1", addr);
+    try testing.expectEqual(@as(i64, 2223), port);
+
+    // 没有冒号：两者都不动
+    parseListen("garbage", &addr, &port);
+    try testing.expectEqualStrings("10.0.0.1", addr);
+    try testing.expectEqual(@as(i64, 2223), port);
+
+    // 端口为 0 也照收（由 main 的 1..65535 校验兜住）
+    parseListen("0.0.0.0:0", &addr, &port);
+    try testing.expectEqual(@as(i64, 0), port);
+
+    // 带端口的 IPv6 必须带方括号：剥掉方括号，端口照收
+    addr = "0.0.0.0";
+    port = 2022;
+    parseListen("[::1]:2224", &addr, &port);
+    try testing.expectEqualStrings("::1", addr);
+    try testing.expectEqual(@as(i64, 2224), port);
+
+    // 裸 IPv6 **不能**被切成 host=`::` + port=1 —— 一动不动
+    addr = "0.0.0.0";
+    port = 2022;
+    parseListen("::1", &addr, &port);
+    try testing.expectEqualStrings("0.0.0.0", addr);
+    try testing.expectEqual(@as(i64, 2022), port);
+}
+
+test "sftp: listen 只填补未显式给出的 address/port" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const path = try std.fs.path.join(testing.allocator, &.{ dir, "config.json" });
+    defer testing.allocator.free(path);
+
+    // ① 只写 `listen` —— Go 迁移过来的典型配置，端口必须来自 listen。
+    try std.Io.Dir.cwd().writeFile(rt.io(), .{ .sub_path = path, .data =
+        \\{"jwt_secret":"x","sftp":{"enable":true,"listen":"127.0.0.1:15402"},"storages":[]}
+    });
+    {
+        const cfg = try load(testing.allocator, path);
+        defer cfg.deinit();
+        setForTest(cfg);
+        defer setForTest(null);
+        try testing.expectEqualStrings("127.0.0.1", cfg.sftp_address);
+        try testing.expectEqual(@as(i64, 15402), cfg.sftp_port);
+        try testing.expectEqual(true, cfg.sftp_enable);
+    }
+
+    // ② 显式 `port` 优先于 `listen`（默认配置里 `port` 是有值的，这条钉住
+    //    「不能用默认值判断是否存在」—— 否则这里的 2022 会被 15402 顶掉，
+    //    或者反过来：只写 listen 的用户被 2022 顶掉）。
+    try std.Io.Dir.cwd().writeFile(rt.io(), .{ .sub_path = path, .data =
+        \\{"jwt_secret":"x","sftp":{"listen":"127.0.0.1:15402","port":2022},"storages":[]}
+    });
+    {
+        const cfg = try load(testing.allocator, path);
+        defer cfg.deinit();
+        setForTest(cfg);
+        defer setForTest(null);
+        try testing.expectEqualStrings("127.0.0.1", cfg.sftp_address);
+        try testing.expectEqual(@as(i64, 2022), cfg.sftp_port);
+    }
+
+    // ③ 什么都没有 ⇒ 默认 `0.0.0.0:2022` 且关闭。
+    try std.Io.Dir.cwd().writeFile(rt.io(), .{ .sub_path = path, .data =
+        \\{"jwt_secret":"x","storages":[]}
+    });
+    {
+        const cfg = try load(testing.allocator, path);
+        defer cfg.deinit();
+        setForTest(cfg);
+        defer setForTest(null);
+        try testing.expectEqualStrings("0.0.0.0", cfg.sftp_address);
+        try testing.expectEqual(@as(i64, 2022), cfg.sftp_port);
+        try testing.expectEqual(false, cfg.sftp_enable);
+    }
+}
 
 test "load creates defaults then round-trips" {
     var tmp = testing.tmpDir(.{});
@@ -1116,3 +1250,31 @@ test "storage modified survives a save/load round-trip" {
     try testing.expect(std.mem.indexOf(u8, raw, "2025-09-26T23:50:34Z") != null);
     try testing.expect(std.mem.indexOf(u8, raw, "0001-01-01T00:00:00Z") != null);
 }
+
+/// 解析 Go 风格的 `sftp.listen`：`":2022"` / `"0.0.0.0:2022"` /
+/// `"127.0.0.1:2022"`。
+///
+/// 语义刻意保守：**解析不出来的部分保持原值**，绝不把非法输入变成
+/// `port = 0`（那会让监听静默失败或绑到随机端口）。主机名为空时沿用
+/// 调用方的默认地址（`0.0.0.0`），与 Go 的 `net.Listen("tcp", ":2022")`
+/// 一致 —— 那是「所有接口」而不是「localhost」。
+fn parseListen(listen: []const u8, addr: *[]const u8, port: *i64) void {
+    const i = std.mem.lastIndexOfScalar(u8, listen, ':') orelse return;
+    const host = listen[0..i];
+
+    // ⚠ 裸 IPv6（`::1`、`fe80::1`）自己带冒号：再按最后一个冒号切会把端口
+    // 切成 `1`，静默绑到 1 号端口 —— 比直接不解析难查得多。带端口的 IPv6
+    // 必须写成 `[::1]:2022`（RFC 3986 §3.2.2），那种形式这里能正确切分，
+    // 方括号要剥掉再交给 `IpAddress.parse`。识别不了的形态一律不动原值。
+    if (std.mem.indexOfScalar(u8, host, ':') != null) {
+        if (!(host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']')) return;
+    }
+
+    if (host.len > 0) {
+        addr.* = if (host[0] == '[') host[1 .. host.len - 1] else host;
+    }
+    if (std.fmt.parseInt(i64, listen[i + 1 ..], 10)) |p| {
+        port.* = p;
+    } else |_| {}
+}
+

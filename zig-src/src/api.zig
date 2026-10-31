@@ -1276,6 +1276,27 @@ const LoginThrottle = struct {
     }
 };
 
+/// SSH 认证与 HTTP 登录**共用**同一份失败计数。
+///
+/// 共用是刻意的：换个协议不能绕过限速。副作用是 SSH 爆破会顺带锁住 HTTP
+/// 登录 5 分钟 —— 单管理员部署下可接受，Go 也是同一份 `LoginCache`。
+///
+/// ⚠ 计数 key 目前是**全局**而不是按 IP：`std.Io.net.Stream` 不暴露对端地址
+/// （见 `http.zig` 模块头）。将来若拿到 IP，key 必须用**纯 IP、不带端口** ——
+/// 上游 Go 版用 `IP:端口`，扫描器每次源端口都不同，计数永远到不了阈值，
+/// 限速形同虚设（`docs/STATUS.md` §9）。
+pub fn authThrottleAllow() bool {
+    return login_throttle.allow();
+}
+
+pub fn authThrottleFailure() void {
+    login_throttle.recordFailure();
+}
+
+pub fn authThrottleSuccess() void {
+    login_throttle.recordSuccess();
+}
+
 /// Go `model.DefaultMaxAuthRetries`。
 const max_auth_retries: u32 = 5;
 /// Go `model.DefaultLockDuration` = 5 分钟。
@@ -5990,7 +6011,7 @@ fn readSecretDefault(a: std.mem.Allocator, cfg: *config.Config, key: []const u8,
 /// Constant-time byte comparison. Written out rather than pulled from
 /// `std.crypto.utils.timingSafeEql`, whose module path has moved between Zig
 /// releases; this is six lines and cannot drift.
-fn ctEqual(a: []const u8, b: []const u8) bool {
+pub fn ctEqual(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) {
         // Touch both buffers so the timing does not depend on length alone,
         // then fail.

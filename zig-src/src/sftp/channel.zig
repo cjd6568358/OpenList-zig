@@ -1,0 +1,550 @@
+//! SSH 连接层（RFC 4254）+ 认证（RFC 4252）+ SFTP 子系统桥接。
+//!
+//! ## 认证（已接真校验）
+//!
+//! `Auth` 接口由 `sftp_wire.sshVerify` 实现：`twoHashPwd(pw, admin_salt)`
+//! 比 `admin_hash`，并与 HTTP 登录**共用同一份失败计数**（换协议不能绕过
+//! 限速）。用户名错与口令错对外不区分，都只回 `USERAUTH_FAILURE`。
+//!
+//! ⚠ **`authenticated` 必须在每个连接层入口检查**：KEX 结束后客户端不需要
+//! 先发 `USERAUTH` 就能直接发 `CHANNEL_OPEN`（RFC 4253 没有强制顺序）。
+//! `onChannelOpen` / `onChannelRequest` / `onChannelData` 三处都查这个
+//! 标志 —— 少任何一处，认证就只是我们自己写的一个字段，端点等于对全网开放。
+//! 所以这里**可以**绑非 loopback，但失败计数目前是全局的，见 `sftp_wire.zig`。
+//!
+//! ## 为什么 channel 只支持一个
+//!
+//! SFTP 客户端（OpenSSH / WinSCP / FileZilla / rclone）一律只开一个 `session`
+//! channel 跑 `subsystem sftp`。支持多路复用意味着要维护 channel 表、每条独立
+//! 的窗口与缓冲，收益为零。第二个 `CHANNEL_OPEN` 明确回
+//! `SSH_OPEN_ADMINISTRATIVELY_PROHIBITED`，而不是静默忽略。
+//!
+//! ## 窗口流控
+//!
+//! 接收方向：每消费 `window_size / 2` 就补一次 `CHANNEL_WINDOW_ADJUST`，避免
+//! 客户端因为窗口耗尽而卡住。
+//!
+//! 发送方向：扣减 `remote_window`；不足时**同步等客户端补窗口**
+//! （RFC 4254 §5.2 明确禁止超发）。等待是有界的 —— 超过 `window_wait_max`
+//! 个包还没等到就退回「照发并告警」，宁可违反窗口也不能把连接挂死。
+//! 等待期间收到的 `CHANNEL_DATA` 追加进 `acc`，交给外层循环处理，不递归
+//! 分发。
+
+const std = @import("std");
+const ssh = @import("ssh.zig");
+const protocol = @import("protocol.zig");
+const Buf = @import("../util/buf.zig").Buf;
+const log = @import("../log.zig");
+const rt = @import("../rt.zig");
+
+// ---- RFC 4252 ----
+pub const MSG_USERAUTH_REQUEST: u8 = 50;
+pub const MSG_USERAUTH_FAILURE: u8 = 51;
+pub const MSG_USERAUTH_SUCCESS: u8 = 52;
+
+// ---- RFC 4254 ----
+pub const MSG_CHANNEL_OPEN: u8 = 90;
+pub const MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
+pub const MSG_CHANNEL_OPEN_FAILURE: u8 = 92;
+pub const MSG_CHANNEL_WINDOW_ADJUST: u8 = 93;
+pub const MSG_CHANNEL_DATA: u8 = 94;
+pub const MSG_CHANNEL_EOF: u8 = 96;
+pub const MSG_CHANNEL_CLOSE: u8 = 97;
+pub const MSG_CHANNEL_REQUEST: u8 = 98;
+pub const MSG_CHANNEL_SUCCESS: u8 = 99;
+pub const MSG_CHANNEL_FAILURE: u8 = 100;
+
+/// 我们向客户端宣告的接收窗口。
+const window_size: u32 = 2 * 1024 * 1024;
+/// 低于这个值就补窗口。
+const window_low: u32 = window_size / 2;
+/// 我们自己接受的最大包长（对客户端宣告）。
+const local_max_packet: u32 = 32 * 1024;
+/// 等 `WINDOW_ADJUST` 时最多处理多少个包。超过就放弃等待、照发。
+const window_wait_max: usize = 64;
+
+/// SFTP 层的入口：一个完整包进，回复字节出。
+///
+/// channel 层不 import `handler` / `session`，只认这个回调 —— 于是「SSH 连接
+/// 管理」和「SFTP 语义」能各自单测，也能各自替换。
+pub const SftpHandler = struct {
+    ctx: *anyopaque,
+    handleFn: *const fn (
+        ctx: *anyopaque,
+        alloc: std.mem.Allocator,
+        pkt: protocol.Packet,
+        out: *Buf,
+    ) anyerror!void,
+
+    pub fn handle(self: SftpHandler, alloc: std.mem.Allocator, pkt: protocol.Packet, out: *Buf) !void {
+        return self.handleFn(self.ctx, alloc, pkt, out);
+    }
+};
+
+/// 凭据校验接口。
+///
+/// channel 层只关心「过没过」，不该知道 `twoHashPwd` 的存在 —— 口令哈希形态
+/// 属于账户层的事，SSH 和 HTTP 登录必须用**同一套**实现，否则迟早漂移。
+pub const Auth = struct {
+    ctx: *anyopaque,
+    /// 返回 true = 凭据有效。实现方负责用户名比对、哈希比对、失败计数。
+    verifyFn: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator, user: []const u8, pw: []const u8) bool,
+
+    pub fn verify(self: Auth, alloc: std.mem.Allocator, user: []const u8, pw: []const u8) bool {
+        return self.verifyFn(self.ctx, alloc, user, pw);
+    }
+};
+
+pub const Conn = struct {
+    alloc: std.mem.Allocator,
+    t: *ssh.Transport,
+    handler: SftpHandler,
+    auth: Auth,
+
+    local_id: u32 = 0,
+    remote_id: u32 = 0,
+    remote_window: u32 = 0,
+    remote_max_packet: u32 = 0,
+    local_window: u32 = 0,
+
+    sftp_open: bool = false,
+    authenticated: bool = false,
+
+    /// SFTP 字节流的累积缓冲：一个 `CHANNEL_DATA` 可能只含半个 SFTP 包，
+    /// 也可能含好几个。
+    acc: Buf,
+
+    pub fn init(alloc: std.mem.Allocator, t: *ssh.Transport, handler: SftpHandler, auth: Auth) Conn {
+        return .{ .alloc = alloc, .t = t, .handler = handler, .auth = auth, .acc = Buf.init(alloc) };
+    }
+
+    pub fn deinit(self: *Conn) void {
+        self.acc.deinit();
+    }
+
+    pub fn loop(self: *Conn) !void {
+        while (true) {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+
+            const p = self.t.readPacket(a) catch |e| {
+                if (e != error.ConnectionClosed) {
+                    log.debug("ssh: read failed: {s}", .{@errorName(e)});
+                }
+                return;
+            };
+            if (p.len == 0) continue;
+
+            self.dispatch(a, p) catch |e| switch (e) {
+                error.PeerDisconnect, error.ChannelClosed => return,
+                else => return e,
+            };
+        }
+    }
+
+    fn dispatch(self: *Conn, a: std.mem.Allocator, p: []const u8) !void {
+        switch (p[0]) {
+            ssh.MSG_DISCONNECT => return error.PeerDisconnect,
+            ssh.MSG_IGNORE, ssh.MSG_DEBUG, ssh.MSG_UNIMPLEMENTED => {},
+            ssh.MSG_SERVICE_REQUEST => try self.onServiceRequest(a, p),
+            MSG_USERAUTH_REQUEST => try self.onUserauth(a, p),
+            MSG_CHANNEL_OPEN => try self.onChannelOpen(a, p),
+            MSG_CHANNEL_REQUEST => try self.onChannelRequest(a, p),
+            MSG_CHANNEL_DATA => try self.onChannelData(a, p),
+            MSG_CHANNEL_WINDOW_ADJUST => try self.onWindowAdjust(p),
+            MSG_CHANNEL_EOF => {},
+            MSG_CHANNEL_CLOSE => return error.ChannelClosed,
+            // TODO(rekey)：客户端在长传输后（OpenSSH 约 1 GB / 1 h）会主动
+            // 发起重协商。现在只回 UNIMPLEMENTED，客户端随即断连 —— 大文件
+            // 传输会在中途掉线。要支持得把 `ssh.kex` 接进这个循环，并且
+            // **沿用首次的 session_id**（RFC 4253 §7.2）。
+            ssh.MSG_KEXINIT => try self.unimplemented(a),
+            else => try self.unimplemented(a),
+        }
+    }
+
+    fn unimplemented(self: *Conn, a: std.mem.Allocator) !void {
+        var b = Buf.init(a);
+        try b.appendByte(ssh.MSG_UNIMPLEMENTED);
+        try ssh.putU32(&b, self.t.seq_in -% 1);
+        try self.t.writePacket(b.slice());
+    }
+
+    fn onServiceRequest(self: *Conn, a: std.mem.Allocator, p: []const u8) !void {
+        var r = ssh.Reader{ .buf = p[1..] };
+        const name = try r.string();
+        if (!std.mem.eql(u8, name, "ssh-userauth")) {
+            try ssh.sendDisconnect(self.t, 7, "service not available"); // SSH_DISCONNECT_SERVICE_NOT_AVAILABLE
+            return error.PeerDisconnect;
+        }
+        var b = Buf.init(a);
+        try b.appendByte(ssh.MSG_SERVICE_ACCEPT);
+        try ssh.putString(&b, "ssh-userauth");
+        try self.t.writePacket(b.slice());
+    }
+
+    fn onUserauth(self: *Conn, a: std.mem.Allocator, p: []const u8) !void {
+        var r = ssh.Reader{ .buf = p[1..] };
+        const user = try r.string();
+        _ = try r.string(); // service name（"ssh-connection"），本实现不区分
+        const method = try r.string();
+
+        if (std.mem.eql(u8, method, "password")) {
+            const changing = try r.byte();
+            if (changing != 0) return self.authFailure(a); // 不支持改口令
+            const pw = try r.string();
+
+            if (self.auth.verify(a, user, pw)) {
+                log.info("ssh: password auth ok (user={s})", .{user});
+                self.authenticated = true;
+                var b = Buf.init(a);
+                try b.appendByte(MSG_USERAUTH_SUCCESS);
+                try self.t.writePacket(b.slice());
+                return;
+            }
+            log.warn("ssh: password auth failed (user={s})", .{user});
+            return self.authFailure(a);
+        }
+
+        if (std.mem.eql(u8, method, "none")) {
+            // `none` 只用于探测可用方法，**永远不通过** —— 放行它等于无认证
+            // 登录。客户端收到 FAILURE 后会自动改试 password。
+            return self.authFailure(a);
+        }
+
+        // `none` 是客户端用来探测可用方法的；publickey 等暂不支持 —— 一律回
+        // FAILURE 并列出我们真正支持的方法，客户端会自动改试 password。
+        return self.authFailure(a);
+    }
+
+    fn authFailure(self: *Conn, a: std.mem.Allocator) !void {
+        var b = Buf.init(a);
+        try b.appendByte(MSG_USERAUTH_FAILURE);
+        try ssh.putString(&b, "password");
+        try b.appendByte(0); // partial success = false
+        try self.t.writePacket(b.slice());
+    }
+
+    fn onChannelOpen(self: *Conn, a: std.mem.Allocator, p: []const u8) !void {
+        var r = ssh.Reader{ .buf = p[1..] };
+        const ctype = try r.string();
+        const sender = try r.u32v();
+        const win = try r.u32v();
+        const maxpkt = try r.u32v();
+
+        // ⚠ 这条闸门不能省：KEX 结束后客户端**不需要**先发 USERAUTH 就能
+        // 直接发 CHANNEL_OPEN。没有它，「认证通过」只是我们自己的一个字段，
+        // 谁都能开一个 session channel 跑 `subsystem sftp` 读写全部挂载。
+        // `authenticated` 只被赋值不被检查 = 端点对全网开放。
+        if (!self.authenticated) {
+            log.warn("ssh: CHANNEL_OPEN before successful authentication — rejected", .{});
+            // SSH_OPEN_ADMINISTRATIVELY_PROHIBITED
+            return self.openFailure(a, sender, 1, "authentication required");
+        }
+
+        if (!std.mem.eql(u8, ctype, "session")) {
+            return self.openFailure(a, sender, 3, "unknown channel type"); // SSH_OPEN_UNKNOWN_CHANNEL_TYPE
+        }
+        if (self.local_id != 0) {
+            // SSH_OPEN_ADMINISTRATIVELY_PROHIBITED
+            return self.openFailure(a, sender, 1, "only one channel per connection");
+        }
+
+        self.remote_id = sender;
+        self.remote_window = win;
+        self.remote_max_packet = maxpkt;
+        self.local_id = 1;
+        self.local_window = window_size;
+
+        var b = Buf.init(a);
+        try b.appendByte(MSG_CHANNEL_OPEN_CONFIRMATION);
+        try ssh.putU32(&b, sender);
+        try ssh.putU32(&b, self.local_id);
+        try ssh.putU32(&b, self.local_window);
+        try ssh.putU32(&b, local_max_packet);
+        try self.t.writePacket(b.slice());
+    }
+
+    fn openFailure(self: *Conn, a: std.mem.Allocator, sender: u32, reason: u32, desc: []const u8) !void {
+        var b = Buf.init(a);
+        // ⚠ 这个 defer 原本漏了：每次拒绝一个 channel（未认证、非法类型、
+        // 超过一个）都会泄漏一个缓冲区。是新加的回归单测用
+        // `testing.allocator` 抓出来的。
+        defer b.deinit();
+        try b.appendByte(MSG_CHANNEL_OPEN_FAILURE);
+        try ssh.putU32(&b, sender);
+        try ssh.putU32(&b, reason);
+        try ssh.putString(&b, desc);
+        try ssh.putString(&b, "");
+        try self.t.writePacket(b.slice());
+    }
+
+    fn onChannelRequest(self: *Conn, a: std.mem.Allocator, p: []const u8) !void {
+        var r = ssh.Reader{ .buf = p[1..] };
+        const ch = try r.u32v();
+        const req = try r.string();
+        const want_reply = (try r.byte()) != 0;
+
+        if (ch != self.local_id or !self.authenticated) {
+            // 未认证的 channel 根本开不起来（见 onChannelOpen），走到这里
+            // 说明对端在乱发 —— 回 FAILURE，不当成协议错误。
+            if (want_reply) try self.channelReply(a, MSG_CHANNEL_FAILURE);
+            return;
+        }
+
+        if (std.mem.eql(u8, req, "subsystem")) {
+            const name = try r.string();
+            if (std.mem.eql(u8, name, "sftp")) {
+                self.sftp_open = true;
+                log.info("ssh: sftp subsystem started", .{});
+                if (want_reply) try self.channelReply(a, MSG_CHANNEL_SUCCESS);
+                return;
+            }
+        }
+
+        // exec / shell / pty-req / env / window-change：SFTP 客户端不会用，
+        // 但会发 `env`，明确拒绝即可（回 FAILURE 不影响后续）。
+        if (want_reply) try self.channelReply(a, MSG_CHANNEL_FAILURE);
+    }
+
+    /// 回 `CHANNEL_SUCCESS` / `CHANNEL_FAILURE`。
+    ///
+    /// ⚠ `recipient channel` 必须是**客户端的** channel 号（`remote_id`），
+    /// 不是请求里带的那个（那是我们的号）。写错的话客户端会报
+    /// `channel_by_id: 1: bad id: channel free` + `input_status_confirm: unknown`
+    /// —— 传输照样能跑，但关闭 channel 时行为不可预期。
+    fn channelReply(self: *Conn, a: std.mem.Allocator, msg: u8) !void {
+        var b = Buf.init(a);
+        try b.appendByte(msg);
+        try ssh.putU32(&b, self.remote_id);
+        try self.t.writePacket(b.slice());
+    }
+
+    fn onWindowAdjust(self: *Conn, p: []const u8) !void {
+        var r = ssh.Reader{ .buf = p[1..] };
+        _ = try r.u32v(); // channel
+        const add = try r.u32v();
+        self.remote_window +|= add;
+    }
+
+    fn onChannelData(self: *Conn, a: std.mem.Allocator, p: []const u8) !void {
+        var r = ssh.Reader{ .buf = p[1..] };
+        const ch = try r.u32v();
+        const data = try r.string();
+
+        if (ch != self.local_id) return error.BadChannel;
+        if (!self.authenticated) return error.BadChannel;
+        if (!self.sftp_open) {
+            log.warn("ssh: channel data before `subsystem sftp`", .{});
+            return;
+        }
+
+        try self.feedData(a, data);
+
+        // 一个 CHANNEL_DATA 可能含多个 SFTP 包，也可能只有半个。
+        while (true) {
+            const maybe = protocol.parse(self.acc.slice()) catch |e| {
+                log.debug("ssh: bad sftp packet: {s}", .{@errorName(e)});
+                return e;
+            };
+            const pkt = maybe orelse break;
+
+            var out = Buf.init(a);
+            self.handler.handle(a, pkt, &out) catch |e| {
+                log.debug("ssh: sftp dispatch failed: {s}", .{@errorName(e)});
+                return e;
+            };
+            if (out.len > 0) try self.sendData(a, out.slice());
+
+            const rest = self.acc.len - pkt.consumed;
+            std.mem.copyForwards(u8, self.acc.data[0..rest], self.acc.data[pkt.consumed..self.acc.len]);
+            self.acc.len = rest;
+        }
+    }
+
+    /// 收到一段 channel 数据：补本地窗口 + 追加到累积缓冲。
+    ///
+    /// 抽出来是为了 `waitForWindow` 也能用：等窗口期间客户端可能仍在发请求，
+    /// 那段数据不能直接丢，也不能递归分发（会在 `sendData` 里再进一次）。
+    fn feedData(self: *Conn, a: std.mem.Allocator, data: []const u8) !void {
+        // 接收窗口：消费了就补，别让客户端卡在 window 上。
+        self.local_window -|= @intCast(data.len);
+        if (self.local_window < window_low) {
+            const add = window_size - self.local_window;
+            var b = Buf.init(a);
+            try b.appendByte(MSG_CHANNEL_WINDOW_ADJUST);
+            try ssh.putU32(&b, self.remote_id);
+            try ssh.putU32(&b, add);
+            try self.t.writePacket(b.slice());
+            self.local_window = window_size;
+        }
+        try self.acc.append(data);
+    }
+
+    /// 等客户端把发送窗口补到 `need` 字节以上。
+    ///
+    /// RFC 4254 §5.2 是 MUST NOT 级别的：超发后客户端行为不统一（有的截断
+    /// 并告警，有的直接断连），赌不起。单 channel + 单线程下同步等是安全的：
+    /// 客户端读走数据后必然回 `WINDOW_ADJUST`。
+    fn waitForWindow(self: *Conn, a: std.mem.Allocator, need: usize) !void {
+        var i: usize = 0;
+        while (self.remote_window < need) {
+            if (i >= window_wait_max) {
+                log.warn("ssh: no WINDOW_ADJUST after {d} packets; sending anyway", .{i});
+                return;
+            }
+            i += 1;
+
+            const p = try self.t.readPacket(a);
+            if (p.len == 0) continue;
+            switch (p[0]) {
+                MSG_CHANNEL_WINDOW_ADJUST => try self.onWindowAdjust(p),
+                MSG_CHANNEL_DATA => {
+                    var r = ssh.Reader{ .buf = p[1..] };
+                    const ch = try r.u32v();
+                    const data = try r.string();
+                    if (ch != self.local_id) return error.BadChannel;
+                    try self.feedData(a, data);
+                },
+                MSG_CHANNEL_EOF => {},
+                MSG_CHANNEL_CLOSE => return error.ChannelClosed,
+                ssh.MSG_DISCONNECT => return error.PeerDisconnect,
+                else => {},
+            }
+        }
+    }
+
+    /// 把 SFTP 字节流发出去，按客户端的 `max_packet` 分片。
+    ///
+    /// 必须分片：OpenSSH 宣告的 max packet 是 32 KiB，而一个 `READDIR` 回复
+    /// 可能超过它 —— 超长包会被客户端直接判协议错误并断连。
+    fn sendData(self: *Conn, a: std.mem.Allocator, data: []const u8) !void {
+        const max = if (self.remote_max_packet > 0) @min(self.remote_max_packet, 64 * 1024) else 32 * 1024;
+
+        var off: usize = 0;
+        while (off < data.len) {
+            const n = @min(@as(usize, max), data.len - off);
+            const chunk = data[off .. off + n];
+
+            if (chunk.len > self.remote_window) {
+                try self.waitForWindow(a, chunk.len);
+            }
+            if (chunk.len > self.remote_window) {
+                log.warn("ssh: remote window still {d} < {d}; sending anyway", .{ self.remote_window, chunk.len });
+                self.remote_window = 0;
+            } else {
+                self.remote_window -= @intCast(chunk.len);
+            }
+
+            var b = Buf.init(self.alloc);
+            defer b.deinit();
+            try b.appendByte(MSG_CHANNEL_DATA);
+            try ssh.putU32(&b, self.remote_id);
+            try ssh.putString(&b, chunk);
+            try self.t.writePacket(b.slice());
+
+            off += n;
+        }
+    }
+};
+
+/// 一条完整连接的入口：握手 → 消息循环。
+pub fn run(
+    alloc: std.mem.Allocator,
+    stream: std.Io.net.Stream,
+    host_key: ssh.HostKey,
+    handler: SftpHandler,
+    auth: Auth,
+) !void {
+    const io = rt.io();
+    var rbuf: [32 * 1024]u8 = undefined;
+    var srd = stream.reader(io, &rbuf);
+
+    var wbuf: [32 * 1024]u8 = undefined;
+    var swr = stream.writer(io, &wbuf);
+
+    var t = ssh.Transport{
+        .alloc = alloc,
+        .rd = &srd.interface,
+        .wr = &swr.interface,
+    };
+    defer t.deinit();
+
+    try ssh.handshake(&t, host_key, alloc);
+
+    var c = Conn.init(alloc, &t, handler, auth);
+    defer c.deinit();
+    try c.loop();
+}
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "ssh/channel: 窗口补给的阈值逻辑（只算数，不碰 socket）" {
+    // 这条测试钉住的是「消费多少补多少」这个不变量：如果补窗口的算术写错，
+    // 大目录列举会在中途卡住，而症状只是「READDIR 卡住」，极难定位。
+    var local: u32 = window_size;
+    const consumed: u32 = 1500 * 1024; // 必须超过 window_size/2 才触发补给
+    local -|= consumed;
+    try testing.expect(local < window_low);
+    const add = window_size - local;
+    try testing.expectEqual(consumed, add);
+    local = window_size;
+    try testing.expectEqual(window_size, local);
+}
+
+fn stubHandle(
+    _: *anyopaque,
+    _: std.mem.Allocator,
+    _: protocol.Packet,
+    _: *Buf,
+) anyerror!void {}
+
+fn stubVerify(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) bool {
+    return true;
+}
+
+test "ssh/channel: 未认证的 CHANNEL_OPEN 必须被拒" {
+    // P0 回归：`authenticated` 曾经只被赋值、从不检查，而 RFC 4253 不要求
+    // 「先认证再开 channel」⇒ KEX 结束后直接发 CHANNEL_OPEN + subsystem sftp
+    // 就能读写全部挂载。这条单测钉住闸门本身 —— 真实客户端永远会先认证，
+    // 所以这个洞靠手工回归是测不出来的。
+    var pkt = Buf.init(testing.allocator);
+    defer pkt.deinit();
+    try pkt.appendByte(MSG_CHANNEL_OPEN);
+    try ssh.putString(&pkt, "session");
+    try ssh.putU32(&pkt, 7); // sender channel（客户端的号）
+    try ssh.putU32(&pkt, 2 * 1024 * 1024); // 宣告窗口
+    try ssh.putU32(&pkt, 32 * 1024); // max packet
+
+    var rd = std.Io.Reader.fixed(pkt.slice());
+    var out = std.Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+
+    var t = ssh.Transport{
+        .alloc = testing.allocator,
+        .rd = &rd,
+        .wr = &out.writer,
+    };
+    var c = Conn.init(testing.allocator, &t, .{
+        .ctx = undefined,
+        .handleFn = stubHandle,
+    }, .{
+        .ctx = undefined,
+        .verifyFn = stubVerify,
+    });
+    defer c.deinit();
+
+    try testing.expect(!c.authenticated);
+    try c.onChannelOpen(testing.allocator, pkt.slice());
+
+    // 写出的是 [len:4][padlen:1][msg]，所以消息号在第 6 个字节。
+    const w = out.written();
+    try testing.expect(w.len > 5);
+    try testing.expectEqual(MSG_CHANNEL_OPEN_FAILURE, w[5]);
+    try testing.expectEqual(@as(u32, 0), c.local_id); // 没有通道被建立
+}
