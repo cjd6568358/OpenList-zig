@@ -1,0 +1,332 @@
+name: Proxy Download
+
+# ============================================================================
+#  给一个下载链接，在 runner 上拉下来，产物挂到本次 run 的 artifacts
+#  —— 支持「代理前缀」，按候选列表逐个尝试，全失败才报错
+# ============================================================================
+#
+#  §0  为什么需要它
+#  ---------------------------------------------------------------------------
+#  大陆网络直连 github.com 的 release 资产域名
+#  （objects.githubusercontent.com / release-assets.githubusercontent.com）
+#  会卡死不起步，必须走 `https://ghfast.top/<原始URL>` 这类前缀代理。
+#  runner 出口在境外本来能直连，但仓库里那些要预置第三方二进制的步骤
+#  需要一个可复现的「取件」入口 —— 于是把「链接 + 代理前缀」做成参数，
+#  谁都能手动跑一次拿到产物。
+#
+#  §1  代理前缀怎么填（proxy_prefixes）
+#  ---------------------------------------------------------------------------
+#  逗号或空白分隔的**前缀列表**，按顺序逐个尝试，第一个成功的胜出：
+#
+#    proxy_prefixes                              实际请求
+#    -----------------------------------------   --------------------------
+#    (留空)                                      <url>                    ← 直连
+#    https://ghfast.top/                         https://ghfast.top/<url>
+#    https://ghfast.top/,direct                  先代理，失败再直连
+#    https://ghfast.top/,https://gh-proxy.com/,direct
+#                                                代理 A → 代理 B → 直连
+#
+#  * 前缀末尾的 `/` 可省略，会自动补上（`https://ghfast.top` 等价于带斜杠）。
+#  * `direct` 或 `-` 是特殊值，表示「用原始 URL 直连」，可放在列表任意位置。
+#  * 前缀只做**字符串拼接**，不改写 URL ⇒ 代理必须支持
+#    `<前缀><完整原始URL>` 这种形式（ghfast.top / gh-proxy.com 都是）。
+#  * 默认 `https://ghfast.top/,direct`：先代理、再直连。链接不是 GitHub 时
+#    代理那次会很快失败（连接失败 / 404 / 429 都落到下一个候选），不会白等。
+#  * 若链接**本身已带代理前缀**，proxy_prefixes 请留空，别叠两层。
+#
+#  §2  成功判据（防止把错误页当产物）
+#  ---------------------------------------------------------------------------
+#    * curl 必须 `-f`（HTTP >= 400 直接失败）且 `-L`（跟随重定向）。
+#    * 落盘文件必须非空。
+#    * 内容嗅探：开头 512 字节像 HTML（`<!DOCTYPE html` / `<html`）而目标
+#      文件名不是 .html/.htm ⇒ 判失败。代理限流、被墙、鉴权页都是
+#      **200 + HTML**，光看状态码发现不了 —— 这条断言就是拦这种「假成功」。
+#    * 可选 sha256 校验（sha256 输入非空时生效，不匹配直接失败）。
+#
+#  §3  产物
+#  ---------------------------------------------------------------------------
+#    artifacts 里固定三个文件：
+#      <文件名>          —— 下载到的原始内容，名字取自 URL 末段
+#                           （`%xx` 会解码；为空则 download.bin；
+#                            也可用 filename 输入覆盖）。
+#                           ⚠ 非 `[A-Za-z0-9._-]` 的字符会被替换成 `_`，
+#                           中文名/带空格的名字请直接用 filename 指定。
+#      <文件名>.sha256   —— 校验行（`<hash>  <文件名>`，可直接 sha256sum -c）
+#      manifest.txt      —— url / 生效候选 / http 状态 / 字节数 / 类型 / 时间
+#    job summary 里另有同名摘要表，方便直接复制回本地核对。
+#
+#  §4  注意
+#  ---------------------------------------------------------------------------
+#    * 不 checkout 仓库：本 workflow 与代码无关，省一次 clone。
+#    * 链接一律经 env 传进 shell，不直接插值 —— URL 里的 `&`、`$`、引号
+#      拼进命令行会被 shell 解释（注入 + 截断两种坑）。
+#    * 单次下载上限 1 小时（curl --max-time 3600），job 上限 90 分钟。
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: >-
+          要下载的原始链接（不带代理前缀）。例如
+          https://github.com/owner/repo/releases/download/v1.0/x.tar.gz
+        required: true
+        type: string
+      proxy_prefixes:
+        description: >-
+          代理前缀，逗号/空白分隔，按序尝试；direct 或 - 表示直连。
+          留空 = 只直连。详见文件头 §1。
+        required: false
+        default: "https://ghfast.top/,direct"
+        type: string
+      filename:
+        description: 产物文件名（含扩展名）。留空取 URL 末段；取不到用 download.bin。
+        required: false
+        default: ""
+        type: string
+      sha256:
+        description: 期望的 sha256（留空跳过校验）
+        required: false
+        default: ""
+        type: string
+      artifact_name:
+        description: >-
+          artifacts 名字。留空 = download-<文件名去扩展名>。
+          同一 run 内 artifact 名不能重复，多次取件请区分。
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    name: fetch ${{ inputs.filename || inputs.url }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Resolve target filename
+        id: prep
+        env:
+          URL: ${{ inputs.url }}
+          FILENAME: ${{ inputs.filename }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          # url 是 required，但 workflow 被复用/手改时仍可能为空，先挡住。
+          if [ -z "${URL// }" ]; then
+            echo "::error::url is empty"
+            exit 1
+          fi
+
+          name="$FILENAME"
+          if [ -z "${name// }" ]; then
+            # URL 末段当文件名：query/fragment 交给 urlparse 切掉，再 %xx 解码。
+            # 用 python3 而不是 bash 参数展开 —— 编码文件名（%20、%E4%B8%AD）
+            # 直接落盘会变成一串 %，python 一行就干净。
+            name=$(python3 -c 'import os,sys,urllib.parse as u; print(os.path.basename(u.unquote(u.urlparse(sys.argv[1]).path)))' "$URL")
+          fi
+          # 只留安全字符：避免 `..`、`/`、空格把文件写出 artifacts 目录。
+          # 代价是非 ASCII 名会被替换成 `_`（中文名请用 filename 输入覆盖）。
+          name=$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_' | sed -e 's/^[._]*//' -e 's/__*/_/g')
+          if [ -z "$name" ]; then name="download.bin"; fi
+
+          aname="$ARTIFACT_NAME"
+          if [ -z "${aname// }" ]; then
+            aname=$(printf 'download-%s' "${name%%.*}" | tr -c 'A-Za-z0-9._-' '_')
+          fi
+
+          echo "::notice::filename=$name artifact=$aname"
+          {
+            echo "filename=$name"
+            echo "artifact_name=$aname"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download (try proxy prefixes in order)
+        id: fetch
+        env:
+          URL: ${{ inputs.url }}
+          PROXY_PREFIXES: ${{ inputs.proxy_prefixes }}
+          NAME: ${{ steps.prep.outputs.filename }}
+          EXPECTED: ${{ inputs.sha256 }}
+          WORK: ${{ runner.temp }}/dl
+        run: |
+          set -euo pipefail
+          # 可选输入在 dispatch 不填时 GitHub 会传空串，但本地复跑可能整个
+          # 变量都不存在 —— set -u 下这会直接 unbound variable 炸掉，先兜住。
+          PROXY_PREFIXES="${PROXY_PREFIXES:-}"
+          EXPECTED="${EXPECTED:-}"
+
+          mkdir -p "$WORK"
+          out="$WORK/$NAME"
+          eff=""
+          http=""
+
+          # 单个候选的一次尝试：成功返回 0。副作用（eff/http）走全局变量，
+          # 因为 bash 函数里的 local 不会传出来。
+          try_one() {
+            local label="$1" target="$2" wout size
+            echo "::group::try [$label] $target"
+            # --retry-all-errors：429/5xx 也重试（代理限流常回 429）。
+            # -A 伪装浏览器：部分 CDN 对空 UA 直接 403。
+            # -w 写到 stdout 供解析；stderr 单独落文件，失败时回显尾巴。
+            if ! wout=$(curl -fL \
+                  --retry 3 --retry-all-errors --retry-delay 2 \
+                  --connect-timeout 15 --max-time 3600 \
+                  -A "Mozilla/5.0 (X11; Linux x86_64) proxy-download-ci" \
+                  -o "$out.part" \
+                  -w '%{http_code}\t%{size_download}\t%{url_effective}' \
+                  "$target" 2>"$WORK/curl.err"); then
+              echo "::warning::[$label] curl failed"
+              tail -3 "$WORK/curl.err" || true
+              rm -f "$out.part"
+              echo "::endgroup::"
+              return 1
+            fi
+
+            IFS=$'\t' read -r http _ eff <<<"$wout"
+            size=$(stat -c %s "$out.part" 2>/dev/null || echo 0)
+            echo "http=$http bytes=$size"
+            if [ "$size" -le 0 ]; then
+              echo "::warning::[$label] empty body, trying next"
+              rm -f "$out.part"
+              echo "::endgroup::"
+              return 1
+            fi
+
+            # 内容嗅探：200 + HTML 错误页是最常见的「假成功」。
+            # 目标本来就是 .html/.htm 时跳过（那时 HTML 是正常产物）。
+            case "$NAME" in
+              *.html|*.htm|*.HTML|*.HTM) ;;
+              *)
+                if head -c 512 "$out.part" | grep -qiE '<!doctype html|<html'; then
+                  echo "::warning::[$label] got an HTML page, not the file (blocked / rate-limited?)"
+                  head -c 200 "$out.part" | tr -d '\0' || true
+                  echo
+                  rm -f "$out.part"
+                  echo "::endgroup::"
+                  return 1
+                fi
+                ;;
+            esac
+
+            mv "$out.part" "$out"
+            echo "::notice::downloaded via [$label]: $size bytes"
+            echo "::endgroup::"
+            return 0
+          }
+
+          # ---- 候选列表 ----
+          # 逗号/空白都当分隔符；空列表 ⇒ 只直连（而不是什么都不做）。
+          candidates=()
+          for p in ${PROXY_PREFIXES//,/ }; do
+            candidates+=("$p")
+          done
+          if [ ${#candidates[@]} -eq 0 ]; then
+            candidates=("direct")
+            echo "::notice::proxy_prefixes empty -> direct only"
+          fi
+
+          ok=0
+          used=""
+          tried=""
+          for p in "${candidates[@]}"; do
+            if [ "$p" = "direct" ] || [ "$p" = "-" ]; then
+              target="$URL"; label="direct"
+            else
+              # 前缀必须以 / 结尾，否则拼出来是 ...tophttps://github.com/...
+              case "$p" in
+                */) ;;
+                *) p="$p/" ;;
+              esac
+              target="${p}${URL}"; label="$p"
+            fi
+            tried="$tried $label"
+            if try_one "$label" "$target"; then
+              ok=1; used="$label"; break
+            fi
+          done
+
+          if [ "$ok" != 1 ]; then
+            echo "::error::all candidates failed:$tried"
+            echo "url: $URL"
+            echo "hint: 代理前缀格式必须是 <前缀><完整URL>；非 GitHub 链接请把 proxy_prefixes 留空走直连。"
+            exit 1
+          fi
+
+          # ---- 可选 sha256 校验 ----
+          if [ -n "${EXPECTED// }" ]; then
+            actual=$(sha256sum "$out" | cut -d' ' -f1)
+            if [ "$actual" != "${EXPECTED,,}" ]; then
+              echo "::error::sha256 mismatch"
+              echo "expected: ${EXPECTED,,}"
+              echo "actual  : $actual"
+              exit 1
+            fi
+            echo "::notice::sha256 verified: $actual"
+          fi
+
+          {
+            echo "effective_url=$eff"
+            echo "http=$http"
+            echo "used=$used"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Collect artifacts
+        env:
+          NAME: ${{ steps.prep.outputs.filename }}
+          WORK: ${{ runner.temp }}/dl
+          URL: ${{ inputs.url }}
+          USED: ${{ steps.fetch.outputs.used }}
+          HTTP: ${{ steps.fetch.outputs.http }}
+          EFFECTIVE: ${{ steps.fetch.outputs.effective_url }}
+        run: |
+          set -euo pipefail
+          # 拷到独立目录再上传：artifacts 里只放要交付的东西，
+          # 免得 .part / curl.err 这类中间文件被一并收走。
+          mkdir -p "$WORK/artifacts"
+          cp "$WORK/$NAME" "$WORK/artifacts/$NAME"
+          cd "$WORK/artifacts"
+
+          sha256sum "$NAME" > "$NAME.sha256"
+          hash=$(cut -d' ' -f1 "$NAME.sha256")
+          size=$(stat -c %s "$NAME")
+          mime=$(file -b --mime-type "$NAME" || echo unknown)
+          desc=$(file -b "$NAME" || true)
+
+          {
+            echo "url: $URL"
+            echo "via: $USED"
+            echo "effective_url: $EFFECTIVE"
+            echo "http: $HTTP"
+            echo "file: $NAME"
+            echo "size: $size"
+            echo "mime: $mime"
+            echo "type: $desc"
+            echo "sha256: $hash"
+            echo "runner: $RUNNER_OS $RUNNER_ARCH"
+            echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > manifest.txt
+
+          cat manifest.txt
+          ls -l
+          {
+            echo "### Proxy Download"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 原始链接 | \`$URL\` |"
+            echo "| 生效候选 | \`$USED\` |"
+            echo "| 文件名 | \`$NAME\` |"
+            echo "| 大小 | $size B |"
+            echo "| MIME | \`$mime\` |"
+            echo "| sha256 | \`$hash\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 与仓库其余 workflow 用同一个 pin（renovate 统一升级）。
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.prep.outputs.artifact_name }}
+          path: ${{ runner.temp }}/dl/artifacts/*
+          if-no-files-found: error
