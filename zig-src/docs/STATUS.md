@@ -136,8 +136,7 @@
   - 编译机侧自检：`sh /root/check-layout.sh`（第 6 项直接打印写盘边界）。
   - 规则全文见 `D:\workspace\server 806\BUILD-ENV.md` §0.5.3。
 - **Zig 0.17.0 硬下界**。本机与打包机都是 0.17.0（版本必须一致，否则产物不可比）。
-- **~~本机 D 盘不能 `zig build`~~（2026-10-22 已失效）**：装上正式工具链后 `zig build`
-  在本机（含 D 盘工作区）正常，maker.exe 不再报错 —— 前提是缓存目录指到 C 盘
+- **本机可以 `zig build`**：本机（含 D 盘工作区）正常，前提是缓存目录指到 C 盘
   （`ZIG_GLOBAL_CACHE_DIR`/`ZIG_LOCAL_CACHE_DIR=C:/zigcache/olz`），D 盘只剩 1.9 GB。
 - **每个驱动必须有单元测试**（`std.testing.allocator` 抓泄漏）。提交前 `zig test` 与交叉编译都要过。
 - **D 盘满 → 测试假报 NoSpaceLeft/泄漏**：先看磁盘，清理大头是 `openlist-zig/.zig-cache`（用 `cmd //c "rd /s /q"`，别用 Git Bash `rm -rf`）。
@@ -1136,7 +1135,7 @@ Local 的必填项是 `root_folder_path`（`driver.RootPath` 的字段名）。
 `admin/storage/create|update|delete` 与 `admin/setting/get` 缺失，意味着
 **网页管理面基本不可用**（加存储、改设置都走不了）。要补齐的话得实现：
 存储增改删 + 设置读写 + 存储启用/禁用，且要落盘回 `cfg.json`。
-~~当前只能靠手改配置文件。~~ → 已全部补齐，实测细节与已知偏差见 §20。
+已全部补齐，实测细节与已知偏差见 §20。
 
 ---
 
@@ -1457,14 +1456,13 @@ Chromium 装起来**（约 500 MB）。
 | 索引管理 `admin/index/*`、`admin/scan/*` | `handles.BuildIndex` 等 | 无索引，自然无索引管理 |
 | **离线下载** `fs/add_offline_download`、`admin/setting/set_aria2/set_qbit/set_transmission/set_115*/set_123*/set_pikpak/set_thunder*/set_guangyapan` | `handles.AddOfflineDownload` 等 | 需要外部下载工具/账号体系 |
 | **Torrent** `fs/torrent/{parse,upload_parse,rapid_upload,generate}` | `handles.ParseTorrent` 等 | 同上，且体量大 |
-| ~~**分片上传**~~ ✅ **已实现** `fs/multipart/{init,chunk,complete,status,abort}` | `multipartPkg` | **2026-10-30 晚落地**（STATUS §57）：189pc 直传（本地零落盘）+ 其余驱动落盘回退；`multipart_enabled` 已翻回 `true`。早期"必须为 false"的条目见 §55（当日白天的事故记录） |
 | Meta 元数据 `admin/meta/*`（5 个） | `handles.ListMetas` 等 | 需要 meta 表 |
 | 消息中心 `admin/message/{get,send}` | `message.HttpInstance` | 需要消息总线 |
-| S3 / FTP / SFTP / MCP 服务 | `S3()` / `_ftp()` / `MCP()` | 只保留 WebDAV（SFTP 已存档，见 `docs/FEASIBILITY.md` §5.3） |
+| S3 / FTP / SFTP / MCP 服务 | `S3()` / `_ftp()` / `MCP()` | 只保留 WebDAV（SFTP 方案分析见 §9） |
 | 其他 fs 端点 | — | `fs/other` `fs/batch_rename` `fs/regex_rename` `fs/recursive_move` `fs/remove_empty_directory` `fs/link` `fs/archive/decompress` `fs/get_direct_upload_info` |
 | 非 API 端点 | — | `/i/:link_name` `/robots.txt` `/sd/:sid/*path` `/sad/:sid/*path` `/ad|ap|ae/*path`（归档下载） |
-| **匿名（游客）浏览** | `middlewares.Auth(true)`（`auth.go:32-48`） | Go 的 `fs/list`、`fs/get`、`fs/archive/meta|list` 双挂载在 `api.Group("/fs", middlewares.Auth(true))`（`router.go:109`）⇒ 空 token 按 guest 只读放行。**Zig 默认仍对空 token 恒 401**（收紧姿态不变），但已提供 opt-in 开关 `zig.guest_browse`（默认 `false`，`config.zig:556` + `api.zig` checkAuth）：开启后空 token 按 guest 只读放行，写操作仍 401。2026-10-17 复核报告 N1 补记、2026-10-18 §38 落地为可配项（产品未拍板默认值，保持关闭） |
-| 配置项 | `conf.Config` | `database` `meilisearch` `bleve_dir` `s3` `ftp` `sftp` `mcp` `tasks` `auto_memory_limit` `min_free_memory` `max_block_limit` `last_launched_version` `proxy_address`（未读即忽略，不报错）。~~`cors`~~ **已实现**（`config.zig:552-556` + `api.zig:745-770`，2026-10-16） |
+| **匿名（游客）浏览** | `middlewares.Auth(true)`（`auth.go:32-48`） | Go 的 `fs/list`、`fs/get`、`fs/archive/meta|list` 双挂载在 `api.Group("/fs", middlewares.Auth(true))`（`router.go:109`）⇒ 空 token 按 guest 只读放行。**Zig 默认对空 token 恒 401**（收紧姿态），已提供 opt-in 开关 `zig.guest_browse`（默认 `false`，`config.zig:556` + `api.zig` checkAuth）：开启后空 token 按 guest 只读放行，写操作仍 401 |
+| 配置项 | `conf.Config` | `database` `meilisearch` `bleve_dir` `s3` `ftp` `sftp` `mcp` `tasks` `auto_memory_limit` `min_free_memory` `max_block_limit` `last_launched_version` `proxy_address`（未读即忽略，不报错）。`cors` 已实现（`config.zig:552-556` + `api.zig:745-770`） |
 
 ### 22.2 特意新增的（Go 里**没有**）
 
@@ -1488,11 +1486,8 @@ Chromium 装起来**（约 500 MB）。
 
 | 端点 | 说明 |
 |---|---|
-| `POST /api/me/update` ✅ 已补 | Profile 页改密码/改用户名（Go `handles.UpdateCurrent`）。2026-10-16 补 |
-| `GET /api/auth/logout` ✅ 已补 | 管理页登出（Go `handles.LogOut`）。2026-10-16 补 |
 | `PUT /api/fs/form` | multipart 表单直传（与分片上传是两条独立协议）。**前端只在用户手工把上传方式切到 "Form" 时才会调它**（默认走分片/Stream），故不阻塞；理由见 §45.3 |
-| `GET/POST /api/fs/archive/meta` | 压缩包元信息（Go `handles.FsArchiveMetaSplit`，`router.go:199`）。**不在上面任何删减行**，2026-10-17 复核报告 §3.3 补列。`archive/list` 已实现，meta 未实现 |
-| `POST /api/admin/setting/reset_token` ✅ 已补 | 轮换 admin token（2026-10-18，STATUS §44；签名密钥对齐 Go `token` 设置而非 jwt_secret） |
+| `GET/POST /api/fs/archive/meta` | 压缩包元信息（Go `handles.FsArchiveMetaSplit`，`router.go:199`）。`archive/list` 已实现，meta 未实现；依赖未实现的 `/ad` `/ae`，理由见 §45.3 |
 
 ---
 
@@ -4346,7 +4341,7 @@ addition，Linux 下 `tmp_dir` 是 `/tmp/xxx`（安全），Windows 下是 `D:\.
 `HttpConnectionClosed` 噪音）。用户最初判断是"天翼云驱动坏了"。
 
 **结论：与驱动无关，与存储类型也无关。** 是 `/api/public/settings` 把
-`multipart_enabled` 报成 `"true"`，而本工程没有 `/api/fs/multipart/*`。
+`multipart_enabled` 报成 `"true"`，而当时本工程没有 `/api/fs/multipart/*`。
 
 **证据链**（逐段实测，不是推断）：
 
@@ -4368,18 +4363,13 @@ addition，Linux 下 `tmp_dir` 是 `/tmp/xxx`（安全），Windows 下是 `D:\.
 5MB / 10MB / 12MB **全部 200**，文件在网盘里真实可见（探针文件事后已删除）。
 所以"个人和家庭都不能传"不是两个驱动都坏了，而是两个挂载上试的都是大文件。
 
-**修复**：`public_setting_defaults` 里 `multipart_enabled` 由 `"true"` 改
-`"false"`（`api.zig`）。此时 `available()` 的第一个是 Stream ⇒ 所有大小都走
-`PUT /api/fs/put`。附带一条单测把该值钉死，并断言
-`POST /api/fs/multipart/init` 仍落到 NoRoute —— 将来真做分片上传的人必须
-同时改这两处。**【2026-10-30 晚更新：已实现，见 STATUS §57；上面的钉死
-单测与 setting 都已按预告同步翻转。】**
+**当时的处置**：`public_setting_defaults` 里 `multipart_enabled` 由 `"true"` 改
+`"false"`（`api.zig`），让 `available()` 的第一个退回 Stream，所有大小都走
+`PUT /api/fs/put`。当日晚间 `/api/fs/multipart/*` 全量落地后该值翻回 `"true"`，
+见 §57。
 
-**边界**：`PUT /api/fs/form` 仍未实现（`PUT` 未注册路径 ⇒ 405）。用户若在
-上传方式下拉框里手工选 "Form" 才会踩到；默认不会。
-
-**顺带**：大于 10 MiB 的文件现在整份进 `PUT /api/fs/put`，`http.zig` 按
-`max_body_memory=1MiB` 落盘到 `temp_dir`（`/tmp/cache`，tmpfs 220MB）。
+**边界**：`PUT /api/fs/form` 未实现，`/api/*` 未注册路径返回 501 JSON
+（§56.2）。用户若在上传方式下拉框里手工选 "Form" 才会踩到；默认不会。
 传超大文件前先看 `df /tmp` —— 这是既有设计，不是本次引入的。
 
 ---
@@ -4433,11 +4423,9 @@ HTTP/1.1 501
 `GET /api/nope` → 501 + "not implemented: GET /api/nope"；
 70 MiB 上传 → 413 JSON；10 MiB 上传 → 200；14 mounts published。
 
-**下一轮**：分片直传（设计已写进 TODO §5.5）。
-
 ---
 
-## 57. 分片直传落地（2026-10-30 晚，TODO §5.5 → ✅）
+## 57. 分片直传落地（2026-10-30 晚）
 
 `/api/fs/multipart/{init,chunk,complete,status,abort}` 全部实现并真机验证，
 `multipart_enabled` 翻回 `true` —— 网页端 >10 MiB 的文件默认走分片通道。
@@ -4502,3 +4490,82 @@ HTTP/1.1 501
 * Zig 测试在 Windows 上 `DebugAllocator` 的泄漏报告路径会挂死 —— 分片测试
   的会话分配改用 arena 批量回收（生产仍走 gpa，成对 free 由 mpFreeSession
   结构保证，真机 RSS 观察）。
+
+---
+
+## 58. 回退路径容量闸 + 1 GiB 分片直传验收（2026-10-31）
+
+### 58.1 为什么加闸
+
+§57 之后两条路径的资源画像不同：**直传**（189pc）零落盘；**回退**（其余驱动）
+把整份文件写进 `temp_dir` —— 生产上那是 tmpfs（220 MB，**占的是 RAM**）。
+§56.1 的 `zig.max_upload_mb` 只拦住了 `fs/put` 与 WebDAV `PUT`，
+`multipart/init` 的回退路径当时没有任何闸：往 `/quark`、`/123` 这类挂载传
+1 GB，会先写满 tmpfs（ENOSPC，连接被掐断、不回响应），或在 150–220 MB 段
+直接把进程 OOM 掉。**入口从 `fs/put` 换成了 `multipart/init`，风险一模一样。**
+
+### 58.2 改动
+
+1. `App.mp_max_bytes`（`api.zig`）= `zig.max_upload_mb`（0 = 不限），`main.zig`
+   启动时接线。
+2. `handleMultipartInit` 回退分支：`size > mp_max_bytes` ⇒ 会话不建、回
+   **真实 HTTP 413** + 中文信封，message 指明「该存储不支持分片直传」并给出
+   两条出路（换直传存储 / 调高上限）。**直传分支不受影响。**
+3. `handleMultipartChunk` 回退分支的 pwrite：`NoSpaceLeft` / `DiskQuota` ⇒
+   会话判 `failed` + 413 可读消息。此前是 500 `cannot write chunk`，前端只会
+   看到 network error（与 §55 的事故同一个坑）。
+4. 删掉 9 处遗留调试打印（`[mp] chunk enter`、`[mp] snap sent`、`[t]`、
+   `[fake]`、`CHUNK RESP=`、`SNAPSHOT=`）—— 它们直接写 stderr，生产上每片
+   刷两行。
+5. `res.jsonError` 恒写 HTTP 200（对齐 Go 信封），要真实状态码必须
+   **先 `jsonError` 再覆盖 `res.status`**。本轮两处 413 都按这个顺序写，
+   单测钉住 `rejected.status == 413`。
+
+### 58.3 单测与产物
+
+`zig build test` **467 pass + 3 skip**（新增 `multipart fallback refuses files
+above zig.max_upload_mb`：上限 8 B、文件 12 B ⇒ HTTP 413 + `code:413` +
+message 含 `zig.max_upload_mb`；`mp_max_bytes = 0` ⇒ 放行）。
+aarch64 产物 **1,374,976 B / `076cc19b`**（比 §57 的 1,375,832 B 小 856 B，
+主要是删掉的调试打印）。
+
+### 58.4 真机验证（`/tmp/olz`，隔离配置只留 `/ecloud_self` + 一个 Local 挂载）
+
+| 用例 | 结果 |
+|---|---|
+| 回退路径（Local）200 MiB init | **HTTP 413** + `文件超过上传上限 64 MiB（zig.max_upload_mb）…` |
+| 回退路径 10 MiB init | 200，会话正常建；abort 200 |
+| 直传路径（189pc）200 MiB init | 200，`chunk_size=10485760`（未被闸拦） |
+| **1 GiB 直传** | init 103 片 × 10 MiB；**complete 成功**；`fs/get` size = 1,073,741,824；首/尾各 1 MiB 与本地生成数据 MD5 一致 |
+
+1 GiB 全程 **2950 s**（≈0.35 MiB/s，瓶颈是家庭上行，不是服务端）；设备
+`/tmp` 占用全程 5.6 MB（直传零落盘）；进程 **RSS 峰值 23.2 MB**（591 个 5 s
+样本），远低于 60 MB 的验收线。测试文件已从网盘删除，测试实例与 `/tmp/olz`
+已清理，生产实例（15244）全程未受影响。
+
+### 58.5 工具
+
+`tools/multipart_upload.py`：手写 init → chunk → complete 的客户端，按片现生成
+确定性数据（`i % 251`），可指定大小或本地文件、校验 size + 首尾 1 MiB、
+`--delete-after`。两个坑写在模块头：
+
+* `/api/fs/get` 是 **POST + JSON body**；用 GET + query 会退回根目录
+  （size 恒 0，校验假失败）。
+* Git Bash 要给 `--path` 加 `MSYS_NO_PATHCONV=1`，否则 `/ecloud_self/x.bin`
+  被改写成 `D:/Program Files/Git/...`，服务端只回 `storage not found`。
+
+### 58.6 文档去陈旧（同轮）
+
+* `TODO.md` 重写成纯待办：已完成的分片直传、Quark TLS / 悬垂指针事故、
+  全驱动回归记录全部删除；剩余项收敛为「驱动 P1 缺口 7 项 + 三个变体缺凭据 +
+  `fs/form` 与 `archive/meta` 明确不做 + Baidu/Onedrive 暂缓」。
+* STATUS §22.1 删掉「分片上传 = 主动删减」整行；§22.4 删掉三行已补端点；
+  §55 的「修复 = `multipart_enabled` 改 false」与 §56 的「下一轮做分片直传」
+  两处过期结论删除，§55 的诊断限定为「当时」。
+* `docs/AUDIT_2026-10-18-drivers.md`：§1 结论表 5 处失效判断（进度传字节 /
+  size 恒 0 / 分片无重试 / err_detail 未接 / appver 未移植）改正；§3 删掉
+  四条已修复的 C 类行；§4 重写为「仍然缺的 7 项 + 待确认」；原 §5（文档漂移
+  清单）与 §6（P0 验证记录）整节删除，编号收敛为 1–5。
+* `README.md` 新增「上传上限」一节（两条通道的界不一样），已实现列表补分片上传。
+* 失效交叉引用清零：`docs/FEASIBILITY.md`（文件已不存在）、`TODO §5.5`
+  （章节已删）全部改指 STATUS §57 / §9。

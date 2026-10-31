@@ -168,6 +168,11 @@ pub fn main(init: std.process.Init) !void {
         log.warn("main: cannot create {s}: {s} — multipart fallback uploads will fail", .{ mp_dir, @errorName(e) });
     };
     app.mp_dir = mp_dir;
+    // 回退路径单文件上限：整份文件要落进 temp_dir，与 `fs/put` 同一资源画像。
+    app.mp_max_bytes = if (cfg.max_upload_mb > 0)
+        @as(u64, @intCast(cfg.max_upload_mb)) * 1024 * 1024
+    else
+        0;
 
     var server = try http.Server.init(gpa, .{
         .address = cfg.address,

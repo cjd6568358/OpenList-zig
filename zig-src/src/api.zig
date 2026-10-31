@@ -163,6 +163,10 @@ pub const App = struct {
     mp_mu: std.Io.Mutex = .init,
     mp_sessions: std.StringHashMapUnmanaged(*MpSession) = .empty,
     mp_dir: []const u8 = "",
+    /// 回退路径（非直传驱动）单文件上限 = `zig.max_upload_mb`（0 = 不限）。
+    /// 回退路径要把整份文件写进 `temp_dir`，资源画像与 `fs/put` 完全相同，
+    /// 所以共用同一个闸；直传路径不落盘，不受此限。
+    mp_max_bytes: u64 = 0,
     mp_seq: u64 = 0,
 
     pub fn init(alloc: std.mem.Allocator) !App {
@@ -1073,8 +1077,8 @@ const public_setting_defaults = [_]PublicSetting{
     .{ .key = "ldap_login_tips", .value = "login with ldap" },
     // ---- TRAFFIC ----
     //
-    // 2026-10-30 晚间：分片上传（/api/fs/multipart/*）已实现（TODO §5.5、
-    // STATUS §57），此开关**翻回 "true"** —— 4.2.6 前端把 Multipart 排在
+    // 2026-10-30 晚间：分片上传（/api/fs/multipart/*）已实现（STATUS §57）。
+    // 此开关**翻回 "true"** —— 4.2.6 前端把 Multipart 排在
     // available() 首位，>chunk_size 的文件将走分片通道：
     //   * 189pc（/ecloud_self、/ecloud_family）：驱动有 mp_* 槽位 ⇒ 分片直传
     //     上游会话，本地零落盘；
@@ -1978,8 +1982,8 @@ fn handleFsPut(app: *App, req: *http.Request, res: *http.Response) !void {
 }
 
 // ---------------------------------------------------------------------------
-// 分片上传（/api/fs/multipart/*，2026-10-30 —— 设计与前端行为见 TODO §5.5、
-// STATUS §57）。协议对齐 Go `server/handles/multipart.go` +
+// 分片上传（/api/fs/multipart/*，2026-10-30 —— 设计与前端行为见 STATUS §57、
+// §58）。协议对齐 Go `server/handles/multipart.go` +
 // `internal/multipart/session.go` 的响应形状（SessionSnapshot 逐字段）。
 //
 // 两条路径，按驱动能力选择：
@@ -1988,8 +1992,8 @@ fn handleFsPut(app: *App, req: *http.Request, res: *http.Response) !void {
 //     `分片 × 并发` 的内存（189 本来就按 10 MiB 分片）。
 //   * **回退**（其他驱动）：分片 pwrite 进 temp_dir 下的一个**稀疏文件**，
 //     complete 时用 `ArchiveFileSource` 同款的随机读 Source 走一次 `driver.put`。
-//     磁盘占用 = 文件大小（光猫 tmpfs 上限 220 MB，与旧的 fs/put 路径同界；
-//     大文件请用支持直传的驱动）。
+//     磁盘占用 = 文件大小 ⇒ 受 `zig.max_upload_mb` 约束（`App.mp_max_bytes`，
+//     init 阶段就回 413），与 `fs/put` 是同一笔账。
 //
 // MD5 累计（直传路径）必须**按片序**喂 Md5Stream —— 前端 3 个并发 worker 的
 // 到达顺序不定，早到的片挂在 `pending`（App 内存，上限 ≈ 并发数 × 分片），
@@ -2334,6 +2338,20 @@ fn handleMultipartInit(app: *App, req: *http.Request, res: *http.Response) !void
             s.total = @divTrunc(size + effective - 1, effective);
         } else {
             // 回退路径：稀疏 spool 文件（写哪个片补哪个洞，pwrite 自动扩洞）。
+            // 落盘量 = 整份文件 ⇒ 先按 `zig.max_upload_mb` 拦一次：光猫的
+            // temp_dir 是 tmpfs（220 MB，占 RAM），放行更大的文件只会把进程
+            // OOM 掉或 ENOSPC 掐断连接（STATUS §56.1 的同一笔账）。
+            if (app.mp_max_bytes > 0 and @as(u64, @intCast(size)) > app.mp_max_bytes) {
+                mpFreeSession(app, s);
+                const msg = std.fmt.allocPrint(
+                    a,
+                    "文件超过上传上限 {d} MiB（zig.max_upload_mb）：该存储不支持分片直传，整份文件要落到本机临时目录。请改用支持直传的存储、用网盘官方客户端，或将 temp_dir 指向更大存储后调高上限",
+                    .{app.mp_max_bytes / (1024 * 1024)},
+                ) catch "file exceeds zig.max_upload_mb and this storage cannot upload without spooling";
+                try res.jsonError(413, msg);
+                res.status = 413; // jsonError 恒写 200（对齐 Go 信封），这里要真实状态码
+                return;
+            }
             if (app.mp_dir.len == 0) {
                 mpFreeSession(app, s);
                 return res.jsonError(500, "multipart spool directory is not configured");
@@ -2414,8 +2432,6 @@ fn handleMultipartInit(app: *App, req: *http.Request, res: *http.Response) !void
 }
 
 fn handleMultipartChunk(app: *App, req: *http.Request, res: *http.Response) !void {
-    std.debug.print("\n[mp] chunk enter\n", .{});
-    defer std.debug.print("\n[mp] chunk exit\n", .{});
     const a = req.arena;
     const io = rt.io();
     const id = req.header("X-Upload-Id") orelse return res.jsonError(404, "multipart session not found");
@@ -2488,7 +2504,6 @@ fn handleMultipartChunk(app: *App, req: *http.Request, res: *http.Response) !voi
         },
     };
 
-    std.debug.print("[mp] direct={} idx={d} len={d}\n", .{ direct, idx, chunk_len });
     if (direct) {
         var ctx = driver.Ctx{ .alloc = a, .tag = s.mount_path, .err_detail = null };
         const d = hashmod.md5(bytes);
@@ -2537,21 +2552,31 @@ fn handleMultipartChunk(app: *App, req: *http.Request, res: *http.Response) !voi
         return mpRespondSnapshot(res, s, a);
     }
 
-    std.debug.print("[mp] fallback pwrite\n", .{});
     // 回退路径：pwrite 进稀疏 spool 文件。
     var f = std.Io.Dir.cwd().openFile(io, s.spool_path, .{ .mode = .read_write }) catch |e| {
         return res.jsonError(500, @errorName(e));
     };
     defer f.close(io);
-    std.Io.File.writePositionalAll(f, io, bytes, @as(u64, @intCast(idx * s.chunk_size))) catch |e| {
-        const msg = std.fmt.allocPrint(a, "cannot write chunk: {s}", .{@errorName(e)}) catch "cannot write chunk";
-        return res.jsonError(500, msg);
+    std.Io.File.writePositionalAll(f, io, bytes, @as(u64, @intCast(idx * s.chunk_size))) catch |e| switch (e) {
+        // temp_dir 写满：会话判死并回可读的 413，别让连接被静默掐断
+        // （浏览器只会看到 network error，与 §55 的事故同一个坑）。
+        error.NoSpaceLeft, error.DiskQuota => {
+            s.mu.lockUncancelable(io);
+            mpSetState(app, s, .failed, "temporary directory is full");
+            s.mu.unlock(io);
+            try res.jsonError(413, "本机临时目录空间不足（temp_dir）：分片落盘失败，请清理临时目录、或将 temp_dir 指向更大存储后重传");
+            res.status = 413; // 同上：jsonError 恒写 200
+            return;
+        },
+        else => {
+            const msg = std.fmt.allocPrint(a, "cannot write chunk: {s}", .{@errorName(e)}) catch "cannot write chunk";
+            return res.jsonError(500, msg);
+        },
     };
     s.mu.lockUncancelable(io);
     if (!already) s.received_bytes += @intCast(chunk_len);
     s.received[@intCast(idx)] = true;
     s.mu.unlock(io);
-    std.debug.print("[mp] fallback done\n", .{});
     return mpRespondSnapshot(res, s, a);
 }
 
@@ -2587,7 +2612,6 @@ fn handleMultipartComplete(app: *App, req: *http.Request, res: *http.Response) !
     const direct = s.direct;
     const drv_session = s.drv_session;
     s.mu.unlock(io);
-    std.debug.print("\n[mp] complete enter direct={}\n", .{direct});
 
     // 挂载可能在会话存活期间被重建（存储编辑）—— 句柄绑定旧驱动实例，
     // 那时只能让用户重传（新建会话会拿到新驱动）。
@@ -2648,7 +2672,6 @@ fn handleMultipartComplete(app: *App, req: *http.Request, res: *http.Response) !
         } else file_md5;
         s.mu.unlock(io);
 
-        std.debug.print("[mp] commit call\n", .{});
         m.driver.mpCommit(&ctx, drv_session.?, file_md5, slice_md5) catch |e| {
             // 句柄已被 commit 自毁。
             s.mu.lockUncancelable(io);
@@ -2662,9 +2685,7 @@ fn handleMultipartComplete(app: *App, req: *http.Request, res: *http.Response) !
         mpSetState(app, s, .completed, "");
         s.storage_pct = 100;
         s.mu.unlock(io);
-        std.debug.print("[mp] committed, notifying\\n", .{});
         notifyObjsUpdateAfterWrite(app, a, m, mpParentOf(s.rel));
-        std.debug.print("[mp] notified, snapshot\\n", .{});
         return mpRespondSnapshot(res, s, a);
     }
 
@@ -2679,7 +2700,6 @@ fn handleMultipartComplete(app: *App, req: *http.Request, res: *http.Response) !
     var src_ctx = ArchiveFileSource{ .file = file, .size = @intCast(s.size) };
     var src = src_ctx.source();
     src.mime = s.mime;
-    std.debug.print("[mp] fallback put call\n", .{});
     m.driver.put(&ctx, s.rel, src) catch |e| {
         s.mu.lockUncancelable(io);
         mpSetState(app, s, .failed, ctx.err_detail orelse @errorName(e));
@@ -2757,14 +2777,11 @@ fn mpJoinSliceMd5(a: std.mem.Allocator, parts: []const []const u8) ![]u8 {
 }
 
 fn mpRespondSnapshot(res: *http.Response, s: *MpSession, a: std.mem.Allocator) !void {
-    std.debug.print("[mp] snap begin\\n", .{});
     var b = Buf.init(a);
     try b.append("{\"code\":200,\"message\":\"success\",\"data\":");
     try s.writeSnapshot(&b, a);
-    std.debug.print("[mp] snap built\\n", .{});
     try b.append("}");
     try res.jsonOkRaw(b.slice());
-    std.debug.print("[mp] snap sent\\n", .{});
 }
 
 /// `rel` 的父目录（“/x/y.txt” → “/x”；根级文件 → “/”）。
@@ -2835,23 +2852,16 @@ const MpFakeDriver = struct {
     }
     fn mpCommit(ptr: *anyopaque, _: *driver.Ctx, session: *anyopaque, file_md5: []const u8, slice_md5: []const u8) anyerror!void {
         const self = as(ptr);
-        std.debug.print("[fake] commit enter md5_len={d}\\n", .{file_md5.len});
         const h: *u32 = @ptrCast(@alignCast(session));
-        std.debug.print("[fake] c2\\n", .{});
         self.alloc.destroy(h);
-        std.debug.print("[fake] c3\\n", .{});
         self.committed += 1;
-        std.debug.print("[fake] c4\\n", .{});
         self.commit_file_md5 = try self.alloc.dupe(u8, file_md5);
-        std.debug.print("[fake] c5\\n", .{});
         self.commit_slice_md5 = try self.alloc.dupe(u8, slice_md5);
     }
     fn mpAbort(ptr: *anyopaque, _: *driver.Ctx, session: *anyopaque) void {
         const self = as(ptr);
         const h: *u32 = @ptrCast(@alignCast(session));
-        std.debug.print("[fake] c2\\n", .{});
         self.alloc.destroy(h);
-        std.debug.print("[fake] c3\\n", .{});
         self.aborted += 1;
     }
 
@@ -2938,7 +2948,6 @@ test "multipart fallback round-trip through a local mount" {
         ch[2] = .{ .name = "X-Chunk-Index", .value = "0" };
         const r = try doRequestJson(&app, a, "PUT", "/api/fs/multipart/chunk", "hello world!", ch);
         const j = try json.parse(a, r.buf.slice());
-        if (j.getPath("code").?.asInt().? != 200) std.debug.print("\nCHUNK RESP=[{s}]\n", .{r.buf.slice()});
         try testing.expectEqual(@as(i64, 200), j.getPath("code").?.asInt().?);
         try testing.expectEqual(@as(i64, 12), j.getPath("data.received_bytes").?.asInt().?);
     }
@@ -2974,6 +2983,58 @@ test "multipart fallback round-trip through a local mount" {
         const j = try json.parse(a, r.buf.slice());
         try testing.expectEqual(@as(i64, 404), j.getPath("code").?.asInt().?);
     }
+}
+
+test "multipart fallback refuses files above zig.max_upload_mb" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fe = try frontend_mod.initFromHtml(a, .{}, ROUTING_SHELL);
+    defer fe.deinit();
+
+    var content_tmp = testing.tmpDir(.{});
+    defer content_tmp.cleanup();
+    var spool_tmp = testing.tmpDir(.{});
+    defer spool_tmp.cleanup();
+    const content_root = try std.Io.Dir.realPathFileAlloc(content_tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(content_root);
+    const spool_root = try std.Io.Dir.realPathFileAlloc(spool_tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(spool_root);
+
+    var local_drv = @import("drivers/local.zig").Local{ .alloc = a, .cfg = .{ .root_folder = content_root } };
+    var app = mpTestApp(a, fe, try a.alloc(Mount, 0));
+    const mounts = try a.alloc(Mount, 1);
+    mounts[0] = .{
+        .storage = .{ .id = 1, .mount_path = "/local", .driver = "Local", .addition = "{}" },
+        .driver = driver.asDriver(@import("drivers/local.zig").Local, &local_drv),
+        .mount_path = "/local",
+        .label = "Local",
+    };
+    app.mounts = mounts;
+    app.mp_dir = spool_root;
+
+    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+
+    const h = try a.alloc(Header, 4);
+    h[0] = .{ .name = "Authorization", .value = auth };
+    h[1] = .{ .name = "File-Path", .value = "%2Flocal%2Fbig.bin" };
+    h[2] = .{ .name = "X-File-Size", .value = "12" };
+    h[3] = .{ .name = "Content-Type", .value = "text/plain" };
+
+    // 上限 8 字节 < 文件 12 字节 ⇒ 真实 413 + 信封：回退路径要整份落盘，
+    // 与 `fs/put` 共用 `zig.max_upload_mb` 这笔账。
+    app.mp_max_bytes = 8;
+    const rejected = try doRequestWith(&app, a, "POST", "/api/fs/multipart/init", "", h);
+    try testing.expectEqual(@as(u16, 413), rejected.status);
+    const rj = try json.parse(a, rejected.buf.slice());
+    try testing.expectEqual(@as(i64, 413), rj.getPath("code").?.asInt().?);
+    try testing.expect(std.mem.indexOf(u8, rj.getPath("message").?.asStr().?, "zig.max_upload_mb") != null);
+
+    // 0 = 不限（temp_dir 指到大容量存储时的配置）⇒ 放行。
+    app.mp_max_bytes = 0;
+    const ok = try doRequestWith(&app, a, "POST", "/api/fs/multipart/init", "", h);
+    try testing.expectEqual(@as(u16, 200), ok.status);
 }
 
 test "multipart direct path accumulates MD5 across out-of-order chunks" {
@@ -3036,12 +3097,9 @@ test "multipart direct path accumulates MD5 across out-of-order chunks" {
         ca[1] = .{ .name = "X-Upload-Id", .value = upload_id };
         const r = try doRequestJson(&app, a, "POST", "/api/fs/multipart/complete", "", ca);
         const j = try json.parse(a, r.buf.slice());
-        std.debug.print("[t] parsed complete resp\\n", .{});
         try testing.expectEqual(@as(i64, 200), j.getPath("code").?.asInt().?);
         try testing.expectEqualStrings("completed", j.getPath("data.state").?.asStr().?);
-        std.debug.print("[t] assertions ok\\n", .{});
     }
-    std.debug.print("[t] checking fake counters\\n", .{});
     try testing.expectEqual(@as(usize, 1), fake.committed);
     // 片到达序（1,0）与 commit 的整文件 MD5（按字节序累计）互不干扰。
     try testing.expectEqual(@as(i64, 2), fake.put_parts.slice()[0]);
@@ -3061,7 +3119,6 @@ test "multipart direct path accumulates MD5 across out-of-order chunks" {
     const h1 = try hashmod.hexUpper(a, &m1);
     const want_slice = try mpJoinSliceMd5(a, &.{ h0, h1 });
     try testing.expectEqualStrings(want_slice, fake.commit_slice_md5);
-    std.debug.print("[t] direct test done\\n", .{});
 }
 
 test "multipart chunk size clamp mirrors Go's ceiling semantics" {
@@ -3098,12 +3155,10 @@ test "multipart chunk size clamp mirrors Go's ceiling semantics" {
         try hdrs.append(.{ .name = "File-Path", .value = try std.fmt.allocPrint(a, "%2Fmpd%2Fc{d}.bin", .{ci}) });
         try hdrs.append(.{ .name = "X-File-Size", .value = "104857600" });
         if (c.req) |v| try hdrs.append(.{ .name = "X-Chunk-Size", .value = v });
-        std.debug.print("[t] clamp case req={s}\\n", .{c.req orelse "(none)"});
         const r = try doRequestWith(&app, a, "POST", "/api/fs/multipart/init", "", hdrs.sliceMut());
         const j = try json.parse(a, r.buf.slice());
         try testing.expectEqual(@as(i64, 200), j.getPath("code").?.asInt().?);
         try testing.expectEqual(@as(i64, c.want), j.getPath("data.chunk_size").?.asInt().?);
-        std.debug.print("[t] clamp case ok\\n", .{});
     }
 }
 
@@ -3149,7 +3204,6 @@ test "multipart session basics: ranges, chunkLen, expiry state" {
     s.received_bytes = 20;
     var b3 = Buf.init(a);
     try s.writeSnapshot(&b3, a);
-    std.debug.print("\nSNAPSHOT=[{s}]\n", .{b3.slice()});
     const j = try json.parse(a, b3.slice());
     try testing.expectEqualStrings("receiving", j.getPath("state").?.asStr().?);
     try testing.expectEqual(@as(i64, 20), j.getPath("received_bytes").?.asInt().?);
@@ -6911,7 +6965,7 @@ test "public settings carries the keys the frontend actually reads" {
 
 test "multipart_enabled is on and fs/multipart/* is registered" {
     // 2026-10-30 上午：分片路由缺失，这里曾钉死 "false"（STATUS §55）。
-    // 同日晚间分片直传落地（TODO §5.5 / STATUS §57）：开关翻回 "true"，
+    // 同日晚间分片直传落地（STATUS §57）：开关翻回 "true"，
     // 路由进入鉴权层（未登录 = code 401 信封，而不再是 501/HTML）。
     // 改回 false 的人必须同时：改这里的断言、写回 noRoute 的 HTML 回落
     // （或保持 501）、并在 STATUS 里说明理由。

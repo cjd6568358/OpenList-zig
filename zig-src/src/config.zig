@@ -111,7 +111,7 @@ pub const Config = struct {
     // 刻意**不**建模的配置项：`tasks`（离线下载/转存任务系统的 worker 池配置）。
     // 本构建没有任务系统，读进来也无处使用；`root` 保留原始文档，
     // `save()` 序列化时其余键原样带回，字段不会丢 —— 属合理子集
-    // （见 TODO §5 与 STATUS §22 的功能边界）。
+    // （见 STATUS §22 的功能边界）。
 
     log_enable: bool,
     log_name: []const u8,

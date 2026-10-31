@@ -30,8 +30,8 @@
 
 ## 构建
 
-- Zig 0.17.0：`C:\Program Files\zig-x86_64-windows-0.17.0\zig.exe`；`zig build test` = **466 pass + 3 skip**。必须 ① `tools/ziglib_patch.py "<toolchain>/lib" C:/zigcache/olz-ziglib`；② 用 **`ZIG_LIB_DIR`**（`--zig-lib-dir` 0.17 不认）；③ `ZIG_GLOBAL_CACHE_DIR`/`ZIG_LOCAL_CACHE_DIR` → `C:/zigcache/olz`。
-- **🔴 裸调 `zig build`（漏 ZIG_LIB_DIR）= 静默丢 TLS 补丁**：不报错，部署后 Quark/UC 消失（14→12）。尺寸判据**代码一变即失效**（1,375,832 B / `f6e49942` 为 10-30 晚设备现役）；**最终判据：部署后 grep `mount(s) published` = 14** + sha256。
+- Zig 0.17.0：`C:\Program Files\zig-x86_64-windows-0.17.0\zig.exe`；`zig build test` = **467 pass + 3 skip**。必须 ① `tools/ziglib_patch.py "<toolchain>/lib" C:/zigcache/olz-ziglib`；② 用 **`ZIG_LIB_DIR`**（`--zig-lib-dir` 0.17 不认）；③ `ZIG_GLOBAL_CACHE_DIR`/`ZIG_LOCAL_CACHE_DIR` → `C:/zigcache/olz`。
+- **🔴 裸调 `zig build`（漏 ZIG_LIB_DIR）= 静默丢 TLS 补丁**：不报错，部署后 Quark/UC 消失（14→12）。尺寸判据**代码一变即失效**（1,374,976 B / `076cc19b` 为 10-31 版）；**最终判据：部署后 grep `mount(s) published` = 14** + sha256。
 - 打包机 `10.0.0.4` 可选（`tools/build_remote.py`，`/tmp/olz-build`），必须走 `zig build test`；`-Ddrivers=` 白名单必须 comptime 分支。
 - ⚠ `zig build` 吞 "All tests passed" 且末尾打误导性 `failed command`（退出码 0）；判成功看 `--summary all` 的 `test success`。
 - 单测一律 `std.testing.allocator`；**D 盘满会假报 NoSpaceLeft/泄漏**。
@@ -55,8 +55,8 @@
 - **日志口径**：请求打点已降 `log.debug` ⇒ 稳态 ≈0–1 行/分（只剩 189 `HttpConnectionClosing` WARN）；细节用 `--log-level debug`/`OPENLIST_LOG_LEVEL=debug`。`/tmp` = tmpfs **220.9 MB**（已用 ~125 MB）⇒ 日志不轮转仍是隐患。
 - **🔴 绝不对光猫下重启/停机命令**：无 `reboot`（rc=127 空操作）；`ubus call system reboot` 会杀 easytier/xray/rtp2httpd 却不完成（极具迷惑）。**重启只有用户能发起**。
 - **重启生产前必须数进程**：`for p in /proc/[0-9]*; do e=$(readlink $p/exe 2>/dev/null); case "$e" in *openlist*) echo "$(basename $p) $e";; esac; done` —— 必须 **1 个**且不带 `(deleted)`（10-20 曾 3 个抢 15244，把 config 写成非法 UTF-8 拒启）。
-- SSH cwd `/root` ⇒ 绝对路径 + 同条 `mkdir -p`；起后台服务必须 `< /dev/null`，起服务+探测同一条 exec。busybox：`chmod` 失效（用 sftp.chmod）、无 `curl`/`pkill`/`setsid`、`wget` 无 `--header`。
-- `zig-src/tools/deploy_device.py start|stop|status|restart [bin] [--port]`（默认 15399）；⚠ **换二进制前必须先 `stop`**（否则 ETXTBSY）。无凭据回归：`tools/driver_matrix.py <base> --user admin --password ...`（base 位置参数，`--expect`/`--only`）。
+- SSH cwd `/root` ⇒ 绝对路径 + 同条 `mkdir -p`；起后台服务必须 `< /dev/null`，起服务+探测同一条 exec。busybox 无 `curl`/`pkill`/`setsid`、`wget` 无 `--header`；`chmod 755` 对 scp 上传的文件**实测有效**。
+- **本机 `tools/deploy_device.py` 跑不了**（依赖 paramiko，pip 无源装不上）；改用 `scp` + `ssh` 手工三步（上传 → `chmod 755` → `cd /tmp/olz && (nohup ./openlist server --config /tmp/olz/cfg.json --port 15399 >run.log 2>&1 </dev/null &)`）。密钥已授权，`ssh -p 10022 root@192.168.1.1` 免密。无凭据回归：`tools/driver_matrix.py <base> --user admin --password ...`（base 位置参数，`--expect`/`--only`）。
 - **留档**：`/opt/armbian/...` → `D:/workspace/server/armbian/...`；`/opt/script`、`/opt/apps`、`/root` → `D:/workspace/server/f4610u/...`；只留最新。easytier 配置在 `/opt/armbian/bin/easytier/easytier.yaml`。
 - 改设备上**运行中脚本**：put 到**同盘** `/opt/script/<name>.new` → `sh -n` → `mv -f`；**绝不能从 /tmp mv**（跨 fs 是 copy+truncate）。
 
@@ -87,15 +87,15 @@
 - **刻意不做**：分享 / SSH 公钥 / webauthn / 2FA / LDAP / 多用户·SQLite·SSO / 搜索索引 / 离线下载 / S3·FTP·SFTP·MCP 服务。中心思想：单管理员管整个存储。
 - **Zig 特有**：itvsh 驱动、CDN fallback、`@zig-setup`、`zig.*` 配置块、编译期驱动白名单、内置页首装面板。
 - 用户 Go 备份实况：`/baidu`、`/onedrive` 在用但暂不移植。
-- **分片上传已实现**（10-30 晚，STATUS §57 / TODO §5.5）：`/api/fs/multipart/*` 全实现，`multipart_enabled=true`；`mp_*` 四槽位（189pc 直传=零落盘），其余驱动回退（分片落 `temp_dir` 稀疏文件，上限 ≈ min(tmpfs 剩余, RAM) ≈ 130MB 浮动）；`mp_begin` 回写生效片大小（189 partSize 阶梯）；会话表 30min TTL；真机 25MiB 乱序 3 片 + 11MiB MD5 一致。
-  ⚠ 已作废：STATUS §55 曾要求 `multipart_enabled=false`、称只有 `PUT /api/fs/put` 一条路 —— 那是 10-30 白天状态。
+- **分片上传**（10-30 晚落地，STATUS §57/§58）：`/api/fs/multipart/*` 全实现，`multipart_enabled=true`；`mp_*` 四槽位（189pc 直传=零落盘），其余驱动回退（分片落 `temp_dir` 稀疏文件）；`mp_begin` 回写生效片大小（189 partSize 阶梯，8MiB 会被抬到 10MiB）；会话表 30min TTL；真机 25MiB 乱序 3 片 + 11MiB MD5 一致。
+- **回退路径单文件上限 = `zig.max_upload_mb`**（10-31 加，`App.mp_max_bytes`）：整份落 temp_dir ⇒ 与 `fs/put` 同一笔账，超限 init 回**真实 413 JSON**；直传路径不受限。分片 pwrite 撞 `NoSpaceLeft/DiskQuota` ⇒ 会话判死 + 413 可读消息（此前是静默掐连接）。
 - **请求体安全阀 `zig.max_upload_mb`（默认 64 MiB）**：>4MiB 请求体落 `temp_dir`（生产 = tmpfs 占 RAM），150–220MB 会 OOM，>220MB ENOSPC 掐连接；超限回 **413 JSON**（中文 message）。0 = 恢复 8GiB；WebDAV PUT 同用此上限。
 - **`/api/*` 未注册路径 = 真实 501 JSON**（`not implemented: <METHOD> <PATH>`，刻意偏差 Go 的 200+HTML）；`/api/` 之外仍是 200+shell / 405。**不能用 `res.jsonError`**（对齐 Go `c.JSON(200,…)` 恒回 200）。前端 4.2.6 无条件调用的未实现端点只有 archive_extensions / offline_download_tools，已在 `handle()` 放行（200 空列表）。调试可用 `config.zig.json` 的 `zig.token` 当 `Authorization`。
 
 ## 文档与留档
 
-- **权威待办 `zig-src/TODO.md`**；审计 `zig-src/docs/STATUS.md`（§22/§23）；驱动审计 `docs/AUDIT_2026-10-18-drivers.md`。欠项：全驱动真实 API+UI 回归、`model.Storage` 无 `modified`、配置项 `delayed_start`/`cors`/`tasks`。基线：466 单测 + 3 skip，真机 e2e 32/32。
+- **权威待办 `zig-src/TODO.md`**（只放未做项）；状态与编年 `zig-src/docs/STATUS.md`；驱动审计 `docs/AUDIT_2026-10-18-drivers.md`。基线：467 单测 + 3 skip。分片上传真机验收用 `tools/multipart_upload.py`（Git Bash 要给 `--path` 加 `MSYS_NO_PATHCONV=1`，否则路径被改写成 `D:/Program Files/Git/...` ⇒ 服务端回 `storage not found`）。
 - **根目录整洁铁律**：根只允许上游文件 + `zig-src/ .github/ .workbuddy/ .workbuddy-ai/`；Zig 脚本一律 `zig-src/tools/`，新脚本用 `Path(__file__).resolve().parents[2]` 定位根。
 - **pan115 fixture 铁律**：`src/drivers/115list_fixture.json`（`tools/gen_115_fixture.py` 生成）**必须入库**；真机原文 `115list_sample.json` **永不入库**。
-- **外部二进制留档**：`D:/workspace/server/armbian/bin/openlist/` = 二进制（1,353,968 B / `e74276b7`，10-30 下午版，可能落后设备一版，换完记得同步）+ 设备现役 `config.zig.json`；`_backup/` 已清空，设备侧不留 .bak。
+- **外部二进制留档**：`D:/workspace/server/armbian/bin/openlist/` = 二进制 + 设备现役 `config.zig.json`；`_backup/` 已清空，设备侧不留 .bak。设备上跑着的版本是 10-30 晚版（1,375,832 B），10-31 版（1,374,976 B / `076cc19b`）只在 `/tmp/olz` 验过，**未替换生产**。
 - 磁盘紧张是老问题（D 盘曾 100%）；npm pack 的 23MB 前端包用完立刻删。一次性脚本已清理（commit 97a4b7d2）；素材暂存 `D:/workspace/_olz-staging/2026-10-24-cleanup/`。

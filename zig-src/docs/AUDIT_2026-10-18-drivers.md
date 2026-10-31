@@ -8,10 +8,9 @@
 > **C** = 疑似未对齐/未完成。itvsh 已完成专项对账（STATUS §39.2），本文不重复。
 > 真机验证口径：STATUS §36B.5「12/12 驱动覆盖收官」+ §41 e2e 全绿。
 >
-> **最终验证基线（2026-10-18 22:38）**：**411/411 单测**；13 挂载 e2e
+> **对账当次基线（2026-10-18 22:38）**：**411/411 单测**；13 挂载 e2e
 > **464 通过 / 0 失败 / 1 跳过**；产物 `73027007e1763f51…`（1,260,816 B）。
-> 文中 §4/§6 出现的 408/409/465 是**各批次当时**的数字（修复是分批验证的），
-> 以本条为准。
+> 后续各轮修复与最新数字见 STATUS §42–§58。
 
 ---
 
@@ -19,19 +18,19 @@
 
 | 驱动（Zig 文件） | Go 对应 | A | B | C | 一句话结论 |
 |---|---|---|---|---|---|
-| local.zig | drivers/local | 6 | 8 | 10 | **1 个真 bug**（进度传字节）；缩略图整块缺；其余为加固/等价 |
+| local.zig | drivers/local | 6 | 8 | 10 | 缩略图整块缺；其余为加固/等价 |
 | webdav.zig | drivers/webdav | 3 | 14 | 6 | digest 三处修正属修正 Go；**SharePoint 分支未实现**（已知缺口） |
 | strm.zig | drivers/strm | 6 | 6 | 6 | 字段级全对齐；Version schema 默认值自相矛盾；反代 URL 推断弱 |
 | aliyundrive.zig | drivers/aliyundrive_open | 6 | 10 | 6 | 协议高度对齐；Link.Expiration 无承载字段；Other(video_preview) 缺 |
-| cloud189.zig | drivers/189 | 6 | 7 | 5 | **1 个真 bug**（fs/get size 恒 0）；torrent 链 Go 侧亦死代码 |
-| cloud189pc.zig | drivers/189pc | 6 | 11 | 11 | **family_transfer / rapid_upload / torrent 三大块零实现**；分片无重试 |
-| pan123.zig | drivers/123 | 5 | 10 | 10 | 自签上传分支分片策略与 Go s3manager 不同（串行、16MiB）；err_detail 未接 |
+| cloud189.zig | drivers/189 | 6 | 7 | 5 | torrent 链 Go 侧亦死代码；其余对齐 |
+| cloud189pc.zig | drivers/189pc | 6 | 11 | 11 | **family_transfer / old 上传 / rapid_upload / torrent 零实现** |
+| pan123.zig | drivers/123 | 5 | 10 | 10 | 自签上传分支分片策略与 Go s3manager 不同（串行、16MiB） |
 | quarkuc.zig | drivers/quark_uc | 7 | 6 | 7 | err_detail 全链路已接；upCommit Referer 未随变体收窄 |
-| pan115.zig | drivers/115 | 5 | 7 | 10 | **动态 appver 拉取未移植**；OSS 分片无重试/无 token 中期刷新 |
+| pan115.zig | drivers/115 | 5 | 7 | 10 | OSS 分片**无 token 中期刷新**；整文件读内存 |
 | wopan.zig | drivers/wopan | 5 | 3 | 8 | psToken 线上发字面量 "undefined"（实测通过，疑镜像 web 前端） |
 | itvsh.zig | drivers/itvsh（私有） | 8 | 5 | 4 | 已专项对账（STATUS §39.2），协议逐字一致 |
 
-合计约 **A 54 / B 71 / C 74** 条差异记录，其中**确认的真 bug 2 个**、**P1 功能缺口 12 项**、
+合计约 **A 54 / B 71 / C 74** 条差异记录，其中**仍未做的 P1 功能缺口 7 项**、
 待确认 4 项（见 §4）。驱动名 12/12 逐字节对齐、操作集 NotSupport 约定 12/12 一致
 （§26.1 复检仍然成立）。
 
@@ -110,7 +109,6 @@ Destination 补尾斜杠（Go 不加，requests.go:155）；12h cron 重建 clie
 | # | Go 行为 | Zig 现状 | 定级 |
 |---|---|---|---|
 | C1 | `vendor=sharepoint` 分支：删 Authorization 改 Cookie 拦截器（meta.go:9、util.go:25-35）+ odrvcookie SOAP 换 RtFa/FedAuth（odrvcookie/fetch.go:49-140） | schema 无 vendor，注释自认不实现（webdav.zig:763-765） | **P1：SharePoint Online 完全不可挂载**（已知取舍，需在文档明示） |
-| C2 | Put callback 设 `Content-Type: s.GetMimetype()`（driver.go:117-119 → gowebdav requests.go:57-58 `if intercept != nil { intercept(r) }` 实证会应用） | 不发 CT，且注释称「Go 根本不发 Content-Type」——**论断与 Go 事实相反**（webdav.zig:673-677） | P1 小缺口 + **注释必须改** |
 | C3 | `args.Redirect` 时 NoRedirectClient 跟随 302/307/308 取最终 URL（driver.go:74-88） | `_ = args` 直发，改为按需 proxy（:484、503） | P2：redirect 解析缺失 |
 | C4 | PROPFIND 发 Accept/Accept-Charset/Accept-Encoding（requests.go:126-130）+ body 含 displayname/getetag（client.go:182-191）+ href 解码失败名字兜底 p.Name（client.go:153-159） | 只有 Depth+Content-Type（:354-357），body 缺两项（:34-44），名字仅取 href basename（:395-400） | P2：漏头漏属性 |
 | C5 | 连续进度（ReaderUpdatingProgress） | 仅 0/100 两点（:684、696）——Go gowebdav 的 PUT 本身也是一次 req，**此项实际等价** | 决议：非缺口 |
@@ -212,7 +210,6 @@ NeedInteractiveAuth（:1226-1228）；扫码登录明确拒绝（:801-804）；
 | C1 | **family_transfer 全链路**：Init 建中转文件夹（driver.go:120-124）；Put 改投家庭云+临时名 `.transfer`+SaveFamilyFileToPersonCloud+删源+节流（driver.go:392-441、utils.go:1441-1511） | 仅存字段，schema 自认未实现（:162、:2297） | **P1：Go 有完整实现，Zig 零实现** |
 | C2 | **rapid_upload**（旧接口 MD5 秒传，driver.go:374-379、utils.go:904-920） | 仅存字段（:2298） | P1 |
 | C3 | **upload_method=old → OldUpload 断点续传**（driver.go:387-389、utils.go:1205-1266） | schema 仅 stream/rapid（:2295），old **静默降级 streamUpload** | **P1：老配置行为静默改变** |
-| C4 | **分片失败重试 3 次+1s+backoff**（utils.go:739-742、1060-1063） | 无重试，首批错即整体失败（:2128-2131） | **P1：弱网可靠性** |
 | C5 | SaveUploadProgress/GetUploadProgress 断点续传（utils.go:1030、1096-1099） | 无 | P2 |
 | C6 | torrent 生态：generate_torrent（utils.go:757-759、864-899）+ /torrent/generate 路由（router.go:236、handles/torrent.go:225）+ torrentFollowMove/Rename/Copy 联动（driver.go:266-349） | 仅存字段（:2300）；Zig 全仓无 torrent 路由 | P2（BT 生态） |
 | C7 | rename 冲突 FileAlreadyExists→ObjectAlreadyExists（driver.go:306-308） | 裸 UpstreamError（:1859→:694-730） | P2 错误码映射 |
@@ -236,7 +233,6 @@ per-worker Client 换取并发（:837-846）。
 
 | # | Go 行为 | Zig 现状 | 定级 |
 |---|---|---|---|
-| C1 | **全程不写 ctx.err_detail**（Go errors.New(message) 用户可见，util.go:244） | 用户只看到泛化 UpstreamError | **P1：透传缺口**（STATUS §31.9 机制已就位，pan123 漏接） |
 | C2 | 自签分支：s3manager 默认 5MiB 片、仅 >50GiB 才放大（driver.go:226-228）、≤5MiB 单 PUT、**默认 5 并发** | 固定 16MiB、≤64MiB 单 PUT、**串行**逐片（:1033-1035、:1206-1233） | P2：性能差 + >160GiB 破 10000 片上限 |
 | C3 | 上传循环 utils.IsCanceled（upload.go:108-120） | 无取消检查，仅 error 后 cancel（:920-934） | P2 |
 | C4 | link 二跳非 302 且 ≥300 时**原样返回**带 Referer 的 u_（driver.go:106-118，不判错） | 返回 Error.UpstreamHttp（:640-642） | P2：失败开放 vs 关闭分叉（403 时行为不同） |
@@ -285,7 +281,6 @@ Go meta.go:11 漏了 default 值本身）。
 
 | # | Go 行为 | Zig 现状 | 定级 |
 |---|---|---|---|
-| C1 | **Init 动态拉取 app 版本**，失败回落 35.6.0.3（appver.go:44-47、driver.go:35） | 编译期常量 app_ver="35.6.0.3"（:64），无 ApiGetVersion 链路 | **P1**：版本号进 UA 与 GenerateToken/sig，上游改版后静默失效 |
 | C2 | OSS 分片每片失败重试 3 次（util.go:339-359） | 单片失败即整链失败（:1235-1238） | **P1**：弱网可靠性 |
 | C3 | TokenRefreshTime ticker ~50 分钟重取 OSS token（util.go:296,345,380；默认值在 SDK 推断） | 每次上传只取一次（:1178） | P1（长传，推断阈值） |
 | C4 | UploadByOSS 流式 PUT（util.go:236-245） | 整文件读进 arena 再 PUT（:1307-1309） | P2：内存放大 |
@@ -337,81 +332,19 @@ Addition.AccessToken 有解析但 **schema 未声明**（:976-982）⇒ 前端�
 
 ---
 
-## 4. Zig 未完成功能/错误总账（按修复优先级）
+## 4. 仍然缺的功能（按优先级）
 
-### P0 — 确认的真 bug（2 个，均已修，2026-10-18）
-
-| # | 位置 | 问题 | 影响 | 状态 |
-|---|---|---|---|---|
-| 1 | local.zig:585 | put 进度回调传**累计字节数**（契约是 0–100 百分比，driver.zig:70-78；其余 8 驱动全传 pct） | 上传进度条溢出 | ✅ **已修**：改传 `off*100/total`（u128 中间量防溢出）+ 回归测试「put reports upload progress as a 0-100 percentage, not bytes」（回调内断言 ≤100 且单调不减） |
-| 2 | cloud189.zig:833 | details() 对文件**硬编码 size=0**（Go driver.go:211-221 返回真 size；189pc 已于 cloud189pc.zig:1596 修过，189 漏修） | /api/fs/get 与 WebDAV PROPFIND 文件大小恒 0 | ✅ **已修**：Entry 补 `size`/`modified`（照 189pc 方案），findChild 从 list 响应搬真值，details 透出；无网络路径单测（同 189pc），靠真机 fs/get 验证 |
-
-验证：打包机构建 **408/408 单测通过**（新增 1 个进度回归测试），aarch64 产物
-`c8797e16b9b0d722…`（1,254,784 B）。真机回归见 §6。
-
-### P1 — 功能缺口（10 项）
+### P1 — 功能缺口（7 项）
 
 | # | 驱动/模块 | 缺口 | 参考 |
 |---|---|---|---|
-| 1 | webdav | `vendor=sharepoint` 分支 + odrvcookie（RtFa/FedAuth SOAP）整支未实现 | webdav.zig:763-765；odrvcookie/fetch.go:49-140 |
-| 2 | webdav | PUT 不发 `Content-Type: <streamer mimetype>`（Go callback 实证会应用，gowebdav requests.go:57-58） | webdav.zig:673-677 |
-| 3 | cloud189pc | **family_transfer 转存全链路**零实现（Go 有完整实现） | driver.go:392-441、utils.go:1441-1511 |
-| 4 | cloud189pc | **upload_method=old 静默降级**为 streamUpload（老配置行为改变）+ rapid_upload 旧秒传缺失 | driver.go:374-389；cloud189pc.zig:2295 |
-| 5 | cloud189pc | 分片上传**无重试**（Go 3 次+backoff） | utils.go:739-742 ↔ cloud189pc.zig:2128-2131 |
-| 6 | pan115 | **动态 appver 拉取**未移植（UA/sig 里带版本号，上游改版后静默失效） | appver.go:44-47 ↔ pan115.zig:64 |
-| 7 | pan115 | OSS 分片无重试、无 token 中期刷新、整文件读内存 | pan115.zig:1235-1238、1178、1307-1309 |
-| 8 | pan123 | **err_detail 未接**（上游 message 用户不可见；quarkuc 已是标杆） | pan123.zig:433 |
-| 9 | aliyundrive | `Other("video_preview")` 未实现（实况/预览播放信息） | driver.go:269-291 |
-| 10 | 全局 | err_detail 只接了 quarkuc/quark/itvsh/pan115；**cloud189 / cloud189pc / aliyundrive / pan123 / webdav / wopan / local / strm 八个驱动的上游错误用户只能看到泛化 message** | driver.zig:40-67 |
-| 11 | api 层 | STATUS §22.4 遗留三端点仍缺：`POST /api/fs/form`（multipart 直传）、`GET/POST /api/fs/archive/meta`、`POST /api/admin/setting/reset_token`（现以 JSON 404 静默失败） | api.zig 白名单无匹配 || 12 | local | 缩略图整块：list thumb URL + `?type=thumb` + 缓存目录 + 限速（schema 已标 [未实现]） | local.zig:362、48-53 |
-
-**2026-10-18 晚已落地 5 项**（同轮修完，构建 409/409 + 真机 e2e 465/0/1）：
-
-| 原编号 | 项 | 落点 | 验证 |
-|---|---|---|---|
-| P1-6 | pan115 **动态 appver 拉取** | `init` 调 `fetchAppVer`（GET `appversion.115.com/1/web/1.0/api/chrome`，读 `data.win.version_code`，失败回落 `default_app_ver`）；`app_ver` 从常量改为驱动字段，UA/GenerateToken/sign 全部用运行期值 | 纯函数 `parseAppVersion` 单测 4 例；真机 run.log 实证 `appversion.115.com ... status=200` |
-| P1-7（前半） | pan115 **OSS 分片 3 次重试** | `ossMultipart` 每片 3 次尝试（对齐 Go util.go:339-359）；**token 中期刷新仍未移植**（ticker 间隔在 SDK 默认值里、不在树内） | 编译 + e2e 写链路 |
-| P1-5 | 189pc **分片 3 次重试 + 1s/2s 退避** | `partWorker`（并发路径）与 `put` 串行路径各一处，对齐 Go `retry.Attempts(3)+Delay(1s)+BackOffDelay` | 编译 + e2e 写链路 |
-| P1-8 | pan123 **err_detail 接入** | `request/get/post/listPage/findChild/resolveEntry` 全链穿 `?*?[]const u8`；list/details/link/mkdir/move/rename/remove/space/put 传 `&ctx.err_detail`；**worker 线程的 refetch 传 null**（跨线程写请求栈帧 = 数据竞争） | 编译期验证（网络路径无单测，同 quarkuc 先例） |
-| P1-2 | webdav **PUT 发 Content-Type** | `model.Source` 新增 `mime` 字段；`fs/put` 用 `mimeFor(basename)`、DAV PUT 优先用请求自身 CT；驱动侧 `src.mime` 非空即发。**顺带修正原注释的错误论断**（Go callback 实际会设 CT） | 编译 + e2e（WebDAV PUT 201/覆盖/ETag 全过） |
-
-**P1 剩余**：webdav SharePoint、189pc family_transfer / old 上传 / rapid_upload /
-torrent、local 缩略图、aliyun `Other(video_preview)`、api 三端点。
-
-**2026-10-18 深夜再落地 1 项（P1-10 err_detail 其余驱动）**：
-cloud189 / cloud189pc / aliyundrive / wopan 四个驱动的请求链全部穿线
-（`request`/`post`/`getBody`/`postBody`/`checkRespErr`/`signedFormPost` +
-各解析链 `resolve`/`findChild`/`listPage`/`getFiles`/`resolveId`/`findEntry`/
-`childByName`/`batchTask`），上游 `res_message`/`message`/`RSP_DESC` 直接
-透出到用户响应。**worker 线程与上传链一律传 null**（数据竞争 + 无 ctx）。
-至此 err_detail 覆盖 8 个驱动（quarkuc/quark/itvsh/pan115/cloud189/
-cloud189pc/aliyundrive/wopan）；local（OS 错误）、strm（无上游）、webdav
-（只有 HTTP 状态码）无「上游人类可读消息」概念，不适用。验证：409/409 单测
-+ 真机 e2e **460/0/2**（多出的跳过是 189 家庭云 mkdir 最终一致性抖动）。
-
-**2026-10-18 深夜第三批（P1-11 部分 + 文档漂移清零）**：
-
-1. **`POST /api/admin/setting/reset_token` 已实现**（原为 JSON 404 静默失败）：
-   生成 Go 同形 token（`openlist-` + UUID + 64 字母数字）→ 写 `zig.token` →
-   落盘 → 同步内存 → 返回 token。**顺带发现并修了一个真差异**：Go 的下载签名
-   密钥是 **`token` 设置**（`internal/sign/sign.go:39`），Zig 一直用
-   `jwt_secret` ⇒ reset_token 在 Zig 里本来「换了也不生效」。现已统一：
-   `App.sign_secret` = `zig.token`（空则回退 jwt_secret，测试构造不受影响），
-   所有 sign/verify 点走单一 `signKey()`。**行为变化**：升级后旧的 `/d/` `/p/`
-   链接会失效（与 Go 换 token 的语义一致）。
-2. **`fs/form` 与 `fs/archive/meta` 仍不做**，理由明确：
-   - `fs/form`：本工程没有 multipart 解析器（全仓 0 处），且前端上传走
-     `fs/put`、WebDAV 走裸 body —— 没有已知客户端依赖它；
-   - `fs/archive/meta`：Go 的响应用 `/ad`|`/ae` 归档下载端点（本工程按边界
-     刻意未实现），只做 meta 会返回一个必然 404 的 `raw_url`，属「半套功能」，
-     不如不做（宁缺毋滥，避免误导前端）。
-3. **文档漂移 11 处全部清零**（§5 表）：pan115/wopan/cloud189 的
-   「Copy 无槽位 / 未移植 Other」等错误论断、cloud189 的 isLog 注释引错文件
-   （并删掉多出的 `isLog=0`，逐字节对齐 Go）、strm 的 Version schema 默认值
-   5→0（否则新建配置跳过迁移）、pan123 的 partNumberEnd 差 1 补注、
-   aliyun callback_concurrency 的「本树无此键」说明、local mkdir_perm 的
-   「Go 会启动失败」偏差说明、189pc schema 的 required 有意偏差说明、
-   STATUS §2 驱动表 UC/WoPan 的 stale 状态。
+| 1 | webdav | `vendor=sharepoint` 分支 + odrvcookie（RtFa/FedAuth SOAP）整支未实现 | `webdav.zig:763`；`odrvcookie/fetch.go:49-140` |
+| 2 | cloud189pc | **family_transfer 转存全链路**零实现（Go 有完整实现） | `driver.go:392-441`、`utils.go:1441-1511` |
+| 3 | cloud189pc | `upload_method=old` 静默降级为 streamUpload；`rapid_upload` 旧秒传缺失 | `driver.go:374-389`；`cloud189pc.zig:2295` |
+| 4 | cloud189pc | `generate_torrent`（上传后生成 `.cas.torrent`）未实现 | `cloud189pc.zig:165` |
+| 5 | local | 缩略图整块：list 的 thumb URL、`?type=thumb` 生成 PNG、缓存目录、token_bucket 限速 | `local.zig:362`、`792-796`；`driver.go:152-160`、`:236-266` |
+| 6 | aliyundrive | `Other("video_preview")` 未实现（实况/预览播放信息） | `driver.go:269-291` |
+| 7 | pan115 | OSS 分片 **token 中期刷新**未移植（刷新 ticker 在 SDK 默认值里，不在 Go 树内） | `pan115.zig` |
 
 ### P2 — 取舍/待确认（记录在案，不阻塞）
 
@@ -421,50 +354,16 @@ cloud189pc/aliyundrive/wopan）；local（OS 错误）、strm（无上游）、w
   （9317140619/7.2.4.0 vs 8025431004/6.2，§3.6-B）——Zig 对齐的是上游 main，
   **本地 Go 树已旧于上游**，后续对账需注意两套事实来源。
 - **全局取消传播**：各上传驱动均无 ctx 取消检查（Go 有 IsCanceled）。
-- **模型层**：Obj.created 永不填（local  ctime 丢失）；Link 无 Expiration/
+- **模型层**：Obj.created 永不填（local ctime 丢失）；Link 无 Expiration/
   Concurrency/PartSize。
 - **已定边界（STATUS §22，非缺口）**：Baidu/Onedrive 不移植、分享/SSO/2FA/
-  LDAP/多用户/离线下载/torrent 路由/分片上传 API/S3·FTP·SFTP·MCP 服务不做；
+  LDAP/多用户/离线下载/torrent 路由/S3·FTP·SFTP·MCP 服务不做；
   local 符号链接默认拒、strm 恒 proxy、匿名浏览 opt-in 默认关。
 
-## 5. 文档/注释漂移清单（顺带修，成本低）
+---
 
-> **状态（2026-10-18 深夜）**：下表 11 处**已全部修复**（webdav CT 在
-> P1-2 轮、其余在 §4 第三批）。保留清单是为了记录「曾经写错什么」——
-> 这类错误论断是本轮审计最大的坑源。
 
-| 位置 | 漂移 |
-|---|---|
-| webdav.zig:673-677 | PUT Content-Type 注释论断与 Go 事实相反（Go callback 会设 CT） |
-| pan115.zig:23 | 「Copy vtable 没有槽位」↔ :228 实际有 copy |
-| wopan.zig:22 | 「内层非 0000 即刷 token」↔ 实现仅 9999 |
-| wopan.zig:26 | 「未移植 Other、离线下载」↔ Go 侧只有注释掉的死代码，无缺口 |
-| cloud189.zig:21-22 | 「Copy 未移植」↔ :399/:924 实际有 copy |
-| cloud189.zig:1192-1199 | isLog 注释引 189pc/utils.go 行号（引错文件） |
-| strm.zig:870 | schema Version default=5 ↔ parse 默认 0（矛盾，建议统一为 0 走迁移） |
-| pan123.zig:856-861 | partNumberEnd 与 Go 差 1 无注释解释（已定性非 bug，建议补注） |
-| STATUS.md §2 | 驱动表 UC/WoPan「未真机」已 stale（§36A/§36B 已补测收官） |
-| aliyundrive.zig:269、1444 | callback_concurrency 字段本 Go 树不存在，自认不起作用，建议删 |
-| local.zig:100-104 | mkdir_perm 非法值静默回落（Go 启动失败）——注释只说了回默认可 |
-
-## 6. 修复验证记录（P0 两项，2026-10-18）
-
-| 项 | 验证 | 结果 |
-|---|---|---|
-| P0-1 local 进度 | 单测「put reports upload progress as a 0-100 percentage, not bytes」（回调内断言 ≤100、单调不减，3×128KiB 文件 ≥3 次回调、收尾 100%）；真机 e2e 465 项全过（含 Local/WebDav/云盘 put 全链路） | ✅ |
-| P0-2 189 web size | 打包机 408/408 单测；真机临时挂 `/ecloud_web`（189Cloud，账密同 §36.2）：put 15 字节文件 → fs/get `size=15, modified=2026-10-18T10:43:44Z`（修复前恒 0）；临时存储已删 | ✅ |
-
-- 构建：打包机 `tools/build_remote.py` 全量，**408/408 单测通过**，aarch64 产物
-  `c8797e16b9b0d722…`（1,254,784 B）。
-- 真机回归：`tools/e2e_test.py --write-cloud` **465 通过 / 0 失败 / 1 跳过**
-  （跳过 = 坚果云根级目录 403 服务商规则，需 WEB 手动删；日志
-  `docs/regression/2026-10-18-p0-fix-e2e.log`）。中途曾一次 WebDAV MKCOL
-  遭设备 TCP reset，实例无 panic、重跑全绿 ⇒ 设备一次性抖动，非回归。
-- 环境备注：测试实例管理员口令已重设为 `openlist-zig-test`（原口令哈希未知，
-  按 `openlist admin set` 流程重置；仅影响 /tmp/olz 测试实例）。
-- 189 web 修复无网络路径单测（同 189pc 先例），验证 = 真机 fs/get，已覆盖。
-
-## 7. 方法与局限
+## 5. 方法与局限
 
 - 驱动名/操作集结构性检查沿用 §26.1 结论（12/12 逐字节、NotSupport 约定一致），
   本轮未重复。
@@ -472,6 +371,6 @@ cloud189pc/aliyundrive/wopan）；local（OS 错误）、strm（无上游）、w
   源码不在树内，相关结论标「推断」，真凭据在设备上可抓包钉死。
 - 189pc 的「Zig 领先本地 Go 树」项（APP_ID/VERSION、短信二验、登录表单字段）
   以上游 main 为事实来源，本地树旧于上游；如需彻底对齐应先更新 Go 树。
-- §3 全部结论只读代码得出；§4 P0 两项的修复改动仅限 local.zig（进度回调）
-  与 cloud189.zig（Entry size/modified 透出），未触碰其他驱动。
+- §3 全部结论只读代码得出；两处真 bug（local 进度回调、189 `fs/get` size）
+  的修复只动 `local.zig` 与 `cloud189.zig`，记录见 STATUS §42。
 

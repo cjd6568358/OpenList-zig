@@ -224,6 +224,8 @@ Zig 特有的东西放在 `zig` 块里，Go 版会忽略它：
 **已实现**：配置加载与写回、挂载点解析（最长前缀 + 段边界）、JWT 鉴权、
 `/api/fs/{list,get,dirs,mkdir,rename,move,copy,remove,put}`、本地与代理下载（本地支持单 Range 流式，代理转发 Range）、
 本地 ZIP/TAR 归档目录列表（`/api/fs/archive/list`）、**驱动层上传进度 callback 全线接通并已由 `PUT /api/fs/put` 暴露给前端**、
+**分片上传**（`/api/fs/multipart/{init,chunk,complete,status,abort}`：实现了 `mp_*` 槽位的驱动
+—— 目前是 189pc —— 走**直传、本地零落盘**；其余驱动回退到 `temp_dir` 稀疏 spool 文件）、
 设置接口（`/api/admin/setting/{list,get,default,save,delete,reset_token}`，仅 config-backed 项）、
 **存储管理面全量 CRUD**（`/api/admin/storage/{list,get,create,update,delete,enable,disable,load_all}`，
 落盘回 config.json + 挂载热更新，2026-10-15 补齐）、
@@ -246,13 +248,33 @@ Zig 特有的东西放在 `zig` 块里，Go 版会忽略它：
 （304/412/If-Range）/WebDAV 全套（PROPFIND 207、PUT 201+Etag、MOVE/COPY、OPTIONS Allow）/
 写操作（mkdir/上传/重命名/移动/复制/删除）/边界与稳定性（路径穿越、信封、并发）。
 
+**分片上传真机验收**（2026-10-31，`tools/multipart_upload.py`，详见 [`docs/STATUS.md`](docs/STATUS.md) §58）：
+1 GiB 直传 `/ecloud_self` 成功（103 片 × 10 MiB，complete 后 `size` 一致、首尾各 1 MiB
+与本地数据 MD5 一致；进程 RSS 峰值 23.2 MB，设备 `/tmp` 占用全程 5.6 MB）；
+回退路径 200 MiB 被 `zig.max_upload_mb` 以 413 拒掉，10 MiB 正常放行。
+
 **未实现或仅部分实现**（见 [`docs/STATUS.md`](docs/STATUS.md) §9/§22/§45.3）：
 数据库与多用户体系、搜索、分享链接、SSO/2FA/LDAP/WebAuthn、后台任务/离线下载/torrent、
 归档**解压与下载**（`/ad` `/ae`）、远程归档浏览（本地 ZIP/TAR 列表已支持）、
 远程 Range 的真正响应流式（当前缓冲）、任务中心操作接口、`fs/form`（multipart）、
 `fs/archive/meta`（依赖未实现的 `/ae`）。
-（存储 CRUD、设置读写、配置导入导出、reset_token 均已补齐，见 [`docs/STATUS.md`](docs/STATUS.md) §20/§36D/§45。）
 **SFTP SSH 服务端：明确暂缓（defer）**，非本轮目标；备选 SSH 实现分析见 [`docs/STATUS.md`](docs/STATUS.md) §9。
+
+## 上传上限
+
+两条通道的限制不一样，别混：
+
+- `PUT /api/fs/put` 与 WebDAV `PUT`：受 `zig.max_upload_mb`（默认 **64 MiB**）约束，
+  超限回 **413 JSON**（中文 message）。原因是请求体超过 16 MiB 会整份落进
+  `temp_dir`，而光猫上那是 tmpfs（220 MB，占 RAM）—— 放行更大的上传只会把进程
+  OOM 掉或 ENOSPC 掐断连接。
+- `/api/fs/multipart/*`（网页端 >10 MiB 的文件默认走它）：
+  - 驱动实现了 `mp_*` 槽位（目前 **189pc**）⇒ **直传**，分片直接推给上游会话，
+    本地零落盘，**大小只受上游配额限制**；
+  - 其余驱动 ⇒ 回退到 `temp_dir` 的稀疏 spool 文件，落盘量 = 整份文件，因此
+    **同样受 `zig.max_upload_mb` 约束**（`init` 阶段就回 413，不会等到写满盘）。
+
+把 `temp_dir` 指到大容量存储后可以调高 `zig.max_upload_mb`；设 0 恢复 8 GiB 硬上限。
 
 ## 已知平台差异
 
