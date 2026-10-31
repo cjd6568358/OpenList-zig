@@ -64,10 +64,11 @@ name: Proxy Download
 #
 #  §4  注意
 #  ---------------------------------------------------------------------------
-#    * 不 checkout 仓库：本 workflow 与代码无关，省一次 clone。
-#      ⚠ 代价是**没有 .git**，而 `gh` 默认靠 `git remote` 推断仓库 ⇒ 会报
-#      `failed to run git: fatal: not a git repository`（2026-10-31 实测）。
-#      所以发布那一步必须显式给 `GH_REPO`，别删。
+#    * 第一个 step 是 checkout，但**不要代码、只要 .git**：`gh release` 靠
+#      `git remote` 推断仓库，没有 .git 就报
+#      `failed to run git: fatal: not a git repository`（2026-10-31 两次实测；
+#      只给 `GH_REPO` 不够）。用 `fetch-depth: 1` 只取一个提交，不拉历史。
+#      发布步骤另外也设了 `GH_REPO` 作为双保险。
 #    * 链接一律经 env 传进 shell，不直接插值 —— URL 里的 `&`、`$`、引号
 #      拼进命令行会被 shell 解释（注入 + 截断两种坑）。
 #    * 发 Release 用 `contents: write`；tag 留空则自动生成
@@ -135,6 +136,16 @@ jobs:
       release_url: ${{ steps.links.outputs.release_url }}
       proxied_release_url: ${{ steps.links.outputs.proxied_release_url }}
     steps:
+      # ★ 唯一一次 checkout，**目的不是要代码，是要 .git**：
+      #   gh 靠 `git remote` 推断仓库，没有 .git 就报
+      #   `failed to run git: fatal: not a git repository`
+      #   （2026-10-31 两次实测；光给 GH_REPO 不够，gh 在部分子命令里仍会摸 git）。
+      #   fetch-depth: 1 只取一个提交，不拉历史。
+      - name: Checkout (仅为给 gh 提供 git 上下文)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+
       - name: Resolve target filename
         id: prep
         env:
@@ -297,10 +308,8 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # ★ 本 workflow 不 checkout（与代码无关），而 gh 默认靠 `git remote`
-          #   推断仓库 ⇒ 在无 .git 的目录里会报
-          #   `failed to run git: fatal: not a git repository`（2026-10-31 实测）。
-          #   显式给 GH_REPO 后 gh 完全不需要 git。
+          # 双保险：checkout 已经给了 .git（gh 靠它推断仓库），这里再把仓库名
+          # 显式写死，就算以后有人删掉 checkout 也不会因为摸不到 git 而失败。
           GH_REPO: ${{ github.repository }}
           NAME: ${{ steps.prep.outputs.filename }}
           WORK: ${{ runner.temp }}/dl
@@ -308,6 +317,13 @@ jobs:
           URL: ${{ inputs.url }}
         run: |
           set -euo pipefail
+          # 失败时给一句人话（配合 continue-on-error：job 继续，但要能一眼看到）。
+          trap 'echo "::warning::Release 发布失败 —— artifacts 仍然可用，但这次没有可套代理前缀的公开链接"' ERR
+
+          # 环境自检：下次再出问题，日志第一行就能看出是 git 上下文还是权限。
+          echo "gh: $(gh --version 2>/dev/null | head -1 || echo '<no gh>')"
+          echo "repo: ${GH_REPO:-<unset>}  origin: $(git remote get-url origin 2>/dev/null || echo '<no git>')"
+
           tag="${TAG// }"
           if [ -z "$tag" ]; then
             # 时间戳 tag：唯一、不覆盖任何已有 release，也不需要清理。
