@@ -65,10 +65,15 @@ name: Proxy Download
 #  §4  注意
 #  ---------------------------------------------------------------------------
 #    * 不 checkout 仓库：本 workflow 与代码无关，省一次 clone。
+#      ⚠ 代价是**没有 .git**，而 `gh` 默认靠 `git remote` 推断仓库 ⇒ 会报
+#      `failed to run git: fatal: not a git repository`（2026-10-31 实测）。
+#      所以发布那一步必须显式给 `GH_REPO`，别删。
 #    * 链接一律经 env 传进 shell，不直接插值 —— URL 里的 `&`、`$`、引号
 #      拼进命令行会被 shell 解释（注入 + 截断两种坑）。
 #    * 发 Release 用 `contents: write`；tag 留空则自动生成
 #      `dl-<UTC 时间戳>`，不会撞已有 tag。
+#    * 发布那一步 `continue-on-error`：artifacts 已经传好了，发不成 Release
+#      也别把整个 job 弄红（但会在那一步打黄标 + 日志，别忽略）。
 #    * 单次下载上限 1 小时（curl --max-time 3600），job 上限 60 分钟。
 
 on:
@@ -288,8 +293,15 @@ jobs:
       - name: Publish Release asset
         id: release
         if: inputs.publish_release
+        # 发不成也把 run 留住：artifacts 已经上传好了，别让整个 job 红掉。
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # ★ 本 workflow 不 checkout（与代码无关），而 gh 默认靠 `git remote`
+          #   推断仓库 ⇒ 在无 .git 的目录里会报
+          #   `failed to run git: fatal: not a git repository`（2026-10-31 实测）。
+          #   显式给 GH_REPO 后 gh 完全不需要 git。
+          GH_REPO: ${{ github.repository }}
           NAME: ${{ steps.prep.outputs.filename }}
           WORK: ${{ runner.temp }}/dl
           TAG: ${{ inputs.release_tag }}
@@ -367,7 +379,7 @@ jobs:
               # ★ 只有这一组能套代理前缀：公开、无需登录。
               rows "Release 资产" "$release_url"
             else
-              echo "| Release 资产 | 未发布（publish_release=false） |"
+              echo "| Release 资产 | 未发布（publish_release=false，或发布失败 —— 看上面那步日志） |"
             fi
             # artifact 是鉴权链接，不渲染代理前缀 —— 套上去只会得到登录页。
             echo "| artifacts 下载页（⚠ 需登录） | \`$artifact_url\` |"
