@@ -4569,3 +4569,49 @@ aarch64 产物 **1,374,976 B / `076cc19b`**（比 §57 的 1,375,832 B 小 856 B
 * `README.md` 新增「上传上限」一节（两条通道的界不一样），已实现列表补分片上传。
 * 失效交叉引用清零：`docs/FEASIBILITY.md`（文件已不存在）、`TODO §5.5`
   （章节已删）全部改指 STATUS §57 / §9。
+
+---
+
+## 59. `openlist version` 与裸 positional 的严格化（2026-10-31 下午）
+
+**现象**：在设备上跑 `/opt/armbian/bin/openlist/openlist version` 排查版本，命令
+不退出、也不打印版本 —— 看起来"挂住"。
+
+**真因不是挂住**：`version` 是裸 positional，旧逻辑把**任何**裸词当成 config
+路径（`openlist [config]` 兼容行为），于是它拿名为 `version` 的配置（不存在）
+加载默认值，**在 5244 端口起了一个服务**，还在 cwd 下建了 `data/` 目录。
+打错的子命令变成"静默起一个多余实例"，比报错危险得多。
+
+### 59.1 改动
+
+1. 新增 `version` 子命令，对齐 Go `cmd/version.go` 的六行输出。
+   `Built At` / `Author` / `Commit ID` 如实写 `unknown`：Go 用 ldflags 注入，
+   Zig 构建没有这一步；硬塞构建时间会破坏「同源逐字节可复现」这条铁律。
+   `WebVersion` 取内嵌外壳版本（`frontend.embedded_shell_version` = `4.2.6`）。
+2. 裸 positional **必须**以 `.json` 结尾，否则 `unknown command` + usage、
+   exit 2。`openlist /tmp/olz/cfg.json` 照旧可用；仓库脚本与设备启动脚本
+   全部走 `--config`，不受影响。
+3. 输出仍走 stderr（与本二进制其余 CLI 输出一致；Go 的 version 是 stdout）。
+
+### 59.2 验证
+
+* 本机（Windows Debug）：`version` ⇒ 六行 + exit 0 + **不留 `data/`**；
+  `verison` ⇒ 报错 + usage + exit 2；`-v` ⇒ 单行 + exit 0。
+* `zig build test` **467 pass + 3 skip**；aarch64 产物
+  **1,376,016 B / `935ab9fc`**。
+
+### 59.3 生产部署（2026-10-31 14:25）
+
+走设备脚本规定的流程：上传 `openlist.new` → `chmod 755` → `stop` →
+`mv -f` → `start`。
+
+| 项 | 结果 |
+|---|---|
+| 挂载 | `storage: init finished, 14 mount(s) published`（TLS 补丁在，Quark/UC 未丢） |
+| 进程 | 单进程 pid 20556；运行中二进制 sha256 = `935ab9fc` |
+| `version` | 设备上六行正常（`Zig Version: 0.17.0 linux/aarch64`） |
+| 冒烟 | `/api/public/settings` 200、`/` 200、`/api/nope` ⇒ 501 JSON |
+| 闸 | `/quark` 200 MiB init ⇒ **413**；`/ecloud_self` 200 MiB init ⇒ 200（随后 abort，无残留） |
+
+唯一 ERROR 是 `ThunderExpert: userinfo_expired`（06:11 与 14:25 两次启动都有，
+即已知的 `/thunder` 问题，日常用 `/thunderweb`），与本次改动无关。

@@ -31,11 +31,12 @@
 ## 构建
 
 - Zig 0.17.0：`C:\Program Files\zig-x86_64-windows-0.17.0\zig.exe`；`zig build test` = **467 pass + 3 skip**。必须 ① `tools/ziglib_patch.py "<toolchain>/lib" C:/zigcache/olz-ziglib`；② 用 **`ZIG_LIB_DIR`**（`--zig-lib-dir` 0.17 不认）；③ `ZIG_GLOBAL_CACHE_DIR`/`ZIG_LOCAL_CACHE_DIR` → `C:/zigcache/olz`。
-- **🔴 裸调 `zig build`（漏 ZIG_LIB_DIR）= 静默丢 TLS 补丁**：不报错，部署后 Quark/UC 消失（14→12）。尺寸判据**代码一变即失效**（1,374,976 B / `076cc19b` 为 10-31 版）；**最终判据：部署后 grep `mount(s) published` = 14** + sha256。
+- **🔴 裸调 `zig build`（漏 ZIG_LIB_DIR）= 静默丢 TLS 补丁**：不报错，部署后 Quark/UC 消失（14→12）。尺寸判据**代码一变即失效**（1,376,016 B / `935ab9fc` = 10-31 生产现役）；**最终判据：部署后 grep `mount(s) published` = 14** + sha256。
 - 打包机 `10.0.0.4` 可选（`tools/build_remote.py`，`/tmp/olz-build`），必须走 `zig build test`；`-Ddrivers=` 白名单必须 comptime 分支。
 - ⚠ `zig build` 吞 "All tests passed" 且末尾打误导性 `failed command`（退出码 0）；判成功看 `--summary all` 的 `test success`。
 - 单测一律 `std.testing.allocator`；**D 盘满会假报 NoSpaceLeft/泄漏**。
 - **Zig 0.17 坑**：裸 `assert` 移除 → `std.debug.assert`；`**` 数组重复非法 → 定长数组 + `@memset`；驱动新方法必须放进 struct；`_ = self;` 在 self 已用时是编译错误。
+- **CLI**：`openlist version`（六行，对齐 Go `cmd/version.go`）/ `-v`；裸 positional **必须 `.json` 结尾**，否则 `unknown command` + exit 2 —— 旧行为把任何裸词当 config 路径，`openlist version` 曾静默在 5244 起服务并在 cwd 建 `data/`（误判成「命令挂住」）。CLI 输出走 stderr。
 - **写盘边界**：构建/调试只写 `/tmp`；工具链 cache 只读（裸调 `zig cc` 曾 +60MB）。编 Go 先 `. /root/build-env.sh`（`D:/workspace/server/0806/BUILD-ENV.md` §0.5.3）。
 - GitHub 产物走 `https://ghfast.top/<原始URL>`，api.github.com JSON 直连（60 次/小时）。仓库内一键取件：`.github/workflows/proxy_download.yml`（dispatch 收 URL + 代理前缀列表，产物进 artifacts）。
 - `remote.py` 坑：argv 空格拼接 ⇒ 远端命令作**单个带引号参数**；内联命令用**绝对路径**（cwd=/root）；`--put` 远端路径**去掉前导斜杠**；别设 `MSYS_NO_PATHCONV=1`。
@@ -97,5 +98,5 @@
 - **权威待办 `zig-src/TODO.md`**（只放未做项）；状态与编年 `zig-src/docs/STATUS.md`；驱动审计 `docs/AUDIT_2026-10-18-drivers.md`。基线：467 单测 + 3 skip。分片上传真机验收用 `tools/multipart_upload.py`（Git Bash 要给 `--path` 加 `MSYS_NO_PATHCONV=1`，否则路径被改写成 `D:/Program Files/Git/...` ⇒ 服务端回 `storage not found`）。
 - **根目录整洁铁律**：根只允许上游文件 + `zig-src/ .github/ .workbuddy/ .workbuddy-ai/`；Zig 脚本一律 `zig-src/tools/`，新脚本用 `Path(__file__).resolve().parents[2]` 定位根。
 - **pan115 fixture 铁律**：`src/drivers/115list_fixture.json`（`tools/gen_115_fixture.py` 生成）**必须入库**；真机原文 `115list_sample.json` **永不入库**。
-- **外部二进制留档**：`D:/workspace/server/armbian/bin/openlist/` = 二进制 + 设备现役 `config.zig.json`；`_backup/` 已清空，设备侧不留 .bak。设备上跑着的版本是 10-30 晚版（1,375,832 B），10-31 版（1,374,976 B / `076cc19b`）只在 `/tmp/olz` 验过，**未替换生产**。
+- **外部二进制留档**：`D:/workspace/server/armbian/bin/openlist/` = 二进制（= 设备现役 `935ab9fc`，10-31 版）+ 设备现役 `config.zig.json`；`_backup/` 已清空，设备侧不留 .bak。换二进制走设备脚本规定的流程：传 `openlist.new` → `chmod 755` → `openlist_start.sh stop` → `mv -f` → `openlist_start.sh`。
 - 磁盘紧张是老问题（D 盘曾 100%）；npm pack 的 23MB 前端包用完立刻删。一次性脚本已清理（commit 97a4b7d2）；素材暂存 `D:/workspace/_olz-staging/2026-10-24-cleanup/`。

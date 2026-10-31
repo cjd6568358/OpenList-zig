@@ -11,12 +11,14 @@
 //!   --port <n>            override scheme.http_port
 //!   --log-level <level>   debug | info | warn | error | off
 //!   --version             print the version and exit
+//!   version               subcommand form of --version (Go `cmd/version.go`)
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 const config = @import("config.zig");
 const driver = @import("driver.zig");
+const frontend_mod = @import("frontend.zig");
 const log = @import("log.zig");
 const http = @import("http.zig");
 const api = @import("api.zig");
@@ -44,6 +46,8 @@ const Options = struct {
     log_level: ?log.Level = null,
     /// 非 null 时走管理命令分支，**不**启动 HTTP 服务（对齐 Go 的 CLI 子命令）。
     admin: ?AdminCmd = null,
+    /// `openlist version`：打印六行版本块后退出（对齐 Go `cmd/version.go`）。
+    print_version: bool = false,
 };
 
 /// 0.17 changed the entry point: instead of a zero-argument `main` plus global
@@ -66,9 +70,19 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
     const opts = parseArgs(init) catch |e| {
+        if (e == error.UnknownCommand) {
+            std.debug.print("unknown command — a bare config path must end with .json\n\n", .{});
+            std.debug.print(USAGE, .{});
+            std.process.exit(2);
+        }
         std.debug.print("bad arguments: {s}\n", .{@errorName(e)});
         return e;
     };
+
+    if (opts.print_version) {
+        printVersion();
+        std.process.exit(0);
+    }
 
     // 管理命令（`openlist admin …`）：只读写 config.json，**不**起 HTTP 服务。
     // 对齐 Go `cmd/admin.go` —— 它也是 bootstrap.Init() 后直接改库再退出。
@@ -621,6 +635,9 @@ fn parseArgs(init: std.process.Init) !Options {
     const items = positionals.slice();
     if (i < items.len and std.mem.eql(u8, items[i], "server")) {
         i += 1; // 与默认行为一致：起服务
+    } else if (i < items.len and std.mem.eql(u8, items[i], "version")) {
+        i += 1;
+        out.print_version = true;
     } else if (i < items.len and std.mem.eql(u8, items[i], "admin")) {
         i += 1;
         out.admin = blk: {
@@ -646,8 +663,41 @@ fn parseArgs(init: std.process.Init) !Options {
             break :blk AdminCmd.info;
         };
     }
-    if (i < items.len) out.config_path = items[i];
+    // 剩下的 positional 是 config 路径（旧行为 `openlist [config]`）。
+    // 但**必须是 `*.json`**：早先任何裸词都被当成 config 路径，于是
+    // `openlist version`（Go 有这个名字的子命令）被解释成「用名为 version 的
+    // 配置起服务」—— 它不报错，而是照默认值起了一个监听 5244 的实例、
+    // 还在 cwd 下建了 data/ 目录。打错的子命令应该报错，不该静默起服务。
+    if (i < items.len) {
+        const p = items[i];
+        if (!std.mem.endsWith(u8, p, ".json")) return error.UnknownCommand;
+        out.config_path = p;
+    }
     return out;
+}
+
+/// `openlist version` —— 对齐 Go `cmd/version.go` 的六行输出。
+///
+/// 三处如实写 `unknown`：Go 用 ldflags 注入 `BuiltAt`/`GitAuthor`/`GitCommit`，
+/// Zig 构建没有这一步；硬塞一个构建时间还会破坏「同源逐字节可复现」这条铁律
+/// （打包机与本机产物的 sha256 必须一致）。`WebVersion` 取内嵌外壳的版本 ——
+/// 那才是这个二进制实际交付的前端版本。
+fn printVersion() void {
+    std.debug.print(
+        \\Built At: unknown
+        \\Zig Version: {s} {s}/{s}
+        \\Author: unknown
+        \\Commit ID: unknown
+        \\Version: {s}
+        \\WebVersion: {s}
+        \\
+    , .{
+        builtin.zig_version_string,
+        @tagName(builtin.os.tag),
+        @tagName(builtin.cpu.arch),
+        version,
+        frontend_mod.embedded_shell_version,
+    });
 }
 
 const USAGE =
@@ -657,6 +707,7 @@ const USAGE =
     \\
     \\Commands:
     \\  server                   start the server (default)
+    \\  version                  print version information and exit
     \\  admin                    show the admin user's info and password hints
     \\  admin random             reset the admin password to a random string
     \\  admin set NEW_PASSWORD   set a new admin password
@@ -669,6 +720,9 @@ const USAGE =
     \\      --log-level <l>     debug | info | warn | error | off
     \\  -v, --version           print version and exit
     \\  -h, --help              print this help and exit
+    \\
+    \\A bare argument is taken as the config path only when it ends with .json
+    \\(`openlist my.json`); anything else is an unknown command.
     \\
     \\Environment:
     \\  OPENLIST_LOG_LEVEL      default log level when --log-level is absent
