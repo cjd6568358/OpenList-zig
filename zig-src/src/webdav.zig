@@ -57,16 +57,35 @@ pub fn handle(app: *App, req: *http.Request, res: *http.Response) !void {
     // 放行**（以 guest 身份继续），能力探测因此不需要鉴权。其余方法一律 401。
     if (eql(u8, req.method, "OPTIONS")) return options(app, req, res);
 
-    if (!try checkBasic(app, req)) {
-        // Go `WebDAVAuth`（server/webdav.go:91-93）：`c.Status(401)` + Abort
-        // —— **正文为空**，且 `WWW-Authenticate` 的 realm 是固定小写
-        // "openlist"（不随管理员用户名变化）。以前这里发的是
-        // `Basic realm="OpenList"` 加一句正文，两头都不对（虽然只影响
-        // 探测性客户端，不会让登录失败）。
-        res.setStatus(401);
-        try res.set("WWW-Authenticate", "Basic realm=\"openlist\"");
+    // Go `WebDAVAuth`（server/webdav.go:52-66）：**WebDAV 与 /api 登录共用同一份
+    // 失败计数**。以前这里只校验凭据、不计数，于是 `/dav` 成了整套限速的后门 ——
+    // `curl -u admin:猜 /dav/` 可以无限次试，5 次锁定形同虚设；而且每次失败都要
+    // 跑一遍 `twoHashPwd`（双层加盐），等于白送一个 CPU 放大面。
+    const peer = req.peer_ip;
+    if (!api.authThrottleAllow(peer)) {
+        log.warn("webdav: auth refused — account locked after too many failed attempts (from {s})", .{
+            if (peer.len == 0) "unknown" else peer,
+        });
+        res.setStatus(429); // Go 这里只有 `c.Status(429)`，正文为空
         return;
     }
+
+    switch (try checkBasic(app, req)) {
+        .ok => {},
+        .missing => {
+            // **没带凭据不算失败**：Go 的 `LoginCache.Set(ip, count+1)` 只在凭据
+            // 比对失败的分支里执行（`!ok` 分支直接 401）。不区分的话，任何扫描器
+            // 随手发一个不带 Authorization 的 PROPFIND 就能把管理员锁 5 分钟。
+            try rejectBasic(res);
+            return;
+        },
+        .invalid => {
+            api.authThrottleFailure(peer);
+            try rejectBasic(res);
+            return;
+        },
+    }
+    api.authThrottleSuccess(peer);
 
     const m = req.method;
     if (eql(u8, m, "PROPFIND")) return propfind(app, req, res);
@@ -810,24 +829,36 @@ fn webdavStatus(res: *http.Response, status: u16) !void {
     try res.write(http.statusText(status));
 }
 
-fn checkBasic(app: *App, req: *http.Request) !bool {
-    if (app.admin_hash.len == 0) return false; // setup not done
-    const h = req.header("Authorization") orelse return false;
-    if (h.len < 6 or !std.ascii.eqlIgnoreCase(h[0..6], "Basic ")) return false;
+/// Go `WebDAVAuth`（server/webdav.go:91-93）：`c.Status(401)` + Abort —— **正文
+/// 为空**，且 `WWW-Authenticate` 的 realm 是固定小写 "openlist"（不随管理员
+/// 用户名变化）。以前这里发的是 `Basic realm="OpenList"` 加一句正文，两头都不对。
+fn rejectBasic(res: *http.Response) !void {
+    res.setStatus(401);
+    try res.set("WWW-Authenticate", "Basic realm=\"openlist\"");
+}
+
+/// `checkBasic` 的三种结果。区分 `.missing` 与 `.invalid` 是**安全要求**，不是
+/// 风格问题：只有后者才记一次失败（见 `handle` 里的说明）。
+const BasicResult = enum { ok, missing, invalid };
+
+fn checkBasic(app: *App, req: *http.Request) !BasicResult {
+    if (app.admin_hash.len == 0) return .invalid; // setup not done
+    const h = req.header("Authorization") orelse return .missing;
+    if (h.len < 6 or !std.ascii.eqlIgnoreCase(h[0..6], "Basic ")) return .missing;
     const b64 = h[6..];
     const dec = std.base64.standard.Decoder;
-    const buf = try req.arena.alloc(u8, dec.calcSizeForSlice(b64) catch return false);
-    dec.decode(buf, b64) catch return false;
-    const colon = std.mem.indexOfScalar(u8, buf, ':') orelse return false;
+    const buf = try req.arena.alloc(u8, dec.calcSizeForSlice(b64) catch return .invalid);
+    dec.decode(buf, b64) catch return .invalid;
+    const colon = std.mem.indexOfScalar(u8, buf, ':') orelse return .invalid;
     const user = buf[0..colon];
     const pass = buf[colon + 1 ..];
-    if (!eql(u8, user, app.admin_user)) return false;
+    if (!eql(u8, user, app.admin_user)) return .invalid;
     // Same derivation as /api/auth/login: StaticHash first, then the salted
     // HashPwd. `admin_salt` empty (older configs / test doubles) would make
     // twoHashPwd disagree with however the hash was produced, so require it.
-    if (app.admin_salt.len == 0) return false;
-    const expect = api.twoHashPwd(req.arena, pass, app.admin_salt) catch return false;
-    return ctEqual(expect, app.admin_hash);
+    if (app.admin_salt.len == 0) return .invalid;
+    const expect = api.twoHashPwd(req.arena, pass, app.admin_salt) catch return .invalid;
+    return if (ctEqual(expect, app.admin_hash)) .ok else .invalid;
 }
 
 fn ctEqual(a: []const u8, b: []const u8) bool {
@@ -1131,3 +1162,75 @@ const Stub = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 };
+
+test "webdav: 错凭据计入失败数，到阈值后连正确凭据也 429" {
+    // 回归（复核 R1）：这里以前只校验凭据、**不计数**，于是 `/dav` 成了整套
+    // 登录限速的后门 —— `curl -u admin:猜 /dav/` 可以无限试，5 次锁定形同
+    // 虚设；而且每次失败都跑一遍 `twoHashPwd`，白送一个 CPU 放大面。
+    // Go `WebDAVAuth`（server/webdav.go:52-66）是计数的，这里对齐。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    defer api.authThrottleReset();
+
+    var app = try mkApp(a);
+    const peer = "203.0.113.55";
+    var bad = [_]model.Header{.{ .name = "Authorization", .value = "Basic YWRtaW46d3Jvbmc=" }};
+
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        var req = http.Request{
+            .arena = a,
+            .method = "PROPFIND",
+            .path = "/dav/v",
+            .target = "/dav/v",
+            .headers = &bad,
+            .peer_ip = peer,
+        };
+        var res = http.Response.init(a);
+        try handle(&app, &req, &res);
+        try testing.expectEqual(@as(u16, 401), res.status);
+    }
+
+    // 第 6 次：锁定期内，**正确**凭据也回 429（与 /api 登录的语义一致）。
+    var good = [_]model.Header{.{ .name = "Authorization", .value = "Basic YWRtaW46cGFzcw==" }};
+    var req6 = http.Request{
+        .arena = a,
+        .method = "PROPFIND",
+        .path = "/dav/v",
+        .target = "/dav/v",
+        .headers = &good,
+        .peer_ip = peer,
+    };
+    var res6 = http.Response.init(a);
+    try handle(&app, &req6, &res6);
+    try testing.expectEqual(@as(u16, 429), res6.status);
+    try testing.expectEqual(@as(usize, 0), res6.buf.len); // Go 这里正文为空
+}
+
+test "webdav: 不带凭据的 401 不计数（否则任何扫描器都能锁掉管理员）" {
+    // Go 只在凭据比对失败时 `LoginCache.Set`（`!ok` 分支直接 401）。不区分
+    // 「没带」和「带错」，随手发几个无 Authorization 的 PROPFIND 就能把管理员
+    // 锁 5 分钟 —— 比按 IP 分桶之前还糟。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    defer api.authThrottleReset();
+
+    var app = try mkApp(a);
+    const peer = "203.0.113.56";
+
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        var req = http.Request{
+            .arena = a,
+            .method = "PROPFIND",
+            .path = "/dav/v",
+            .target = "/dav/v",
+            .peer_ip = peer,
+        };
+        var res = http.Response.init(a);
+        try handle(&app, &req, &res);
+        try testing.expectEqual(@as(u16, 401), res.status); // 一直是 401，不是 429
+    }
+}
