@@ -960,10 +960,18 @@ fn handleClose(c: *Context, sess: *session.Session, a: std.mem.Allocator, r: *pr
 
     // 写句柄：**到 CLOSE 才真正上传**。SFTP 按 offset 随机写，驱动只有整份
     // `put`，所以这里必须先把 temp 文件交出去，再释放句柄。
-    if (h.extra) |e| {
-        const st: *FileState = @ptrCast(@alignCast(e));
-        if (st.* == .write) {
-            const w = &st.write;
+    //
+    // ⚠ 必须先查 `h.kind`：`extra` 对目录句柄是 `*DirState`（40 B），而
+    // `FileState`（~100 B）比它大得多 —— 直接强转读 tag 会**读到分配块
+    // 之外的堆内存**，垃圾值非确定性地命中 `.write` 分支（2026-11-02 真机
+    // 复现：目录 CLOSE 偶发回 failure，日志 `discarding  — a previous write
+    // failed` 且 vpath 为空）。靠对齐/枚举编码「碰巧不触发」的说法不成立，
+    // 之前 11-01 全绿只是堆内容恰好幸运。
+    if (h.kind == .file) {
+        if (h.extra) |e| {
+            const st: *FileState = @ptrCast(@alignCast(e));
+            if (st.* == .write) {
+                const w = &st.write;
 
             // 写入过程中失败过 ⇒ 绝不 `put`。否则会把截断的文件当成完整
             // 文件传上去（容量闸拦下前 N MiB 的场景实测过）。
@@ -990,6 +998,7 @@ fn handleClose(c: *Context, sess: *session.Session, a: std.mem.Allocator, r: *pr
                 return;
             };
             log.info("sftp: uploaded {s} ({d} bytes)", .{ w.vpath, w.size });
+            }
         }
     }
 
@@ -1011,6 +1020,12 @@ fn handleWrite(c: *Context, sess: *session.Session, a: std.mem.Allocator, r: *pr
         try protocol.writeStatus(out, id, .failure);
         return;
     };
+    // ⚠ 同 handleClose：目录句柄的 extra 是 `*DirState`，强转成 `*FileState`
+    // 读 tag 是分配块外的越界读（见 handleClose 的注释），必须先查 kind。
+    if (h.kind != .file) {
+        try protocol.writeStatus(out, id, .failure);
+        return;
+    }
     const st: *FileState = @ptrCast(@alignCast(h.extra orelse {
         try protocol.writeStatus(out, id, .failure);
         return;
@@ -2437,4 +2452,40 @@ test "sftp/handler: READ 的 offset 超界回 EOF（等价 past-EOF，不进算�
         return error.TestUnexpectedResult;
 
     try expectStatus(try readReq(&f, 2, h, 0xFFFF_FFFF_FFFF_F000, 16, &out), .eof);
+}
+
+test "sftp/handler: CLOSE 目录句柄必须回 ok（kind 检查的回归）" {
+    // 2026-11-02 真机复现：handleClose 曾把目录句柄的 extra（*DirState，
+    // 40 B）直接强转 *FileState（~100 B）读 tag —— 越界读到分配块外的堆
+    // 内存，垃圾值非确定性地命中 `.write` 分支 ⇒ 目录 CLOSE 偶发回
+    // failure（paramiko 端 OSError）。单测里 testing.allocator 的内存刚好
+    // 恒不命中，但这条用例把「kind 检查在」这件事钉住：删掉检查它也测不出
+    // （取决于堆内容），留着它永远绿。
+    var f = Fixture.init(false);
+    f.start();
+    defer f.deinit();
+    try f.mem.addDir("/d");
+    try f.mem.addFile("/d/x.txt", "x");
+
+    var obody = Buf.init(testing.allocator);
+    defer obody.deinit();
+    var ow = protocol.Writer.init(&obody);
+    try ow.writeU32(1);
+    try ow.writeString("/d");
+
+    var oout = Buf.init(f.a());
+    defer oout.deinit();
+    const opkt = try f.send(.opendir, obody.slice(), &oout);
+    try testing.expectEqual(protocol.PacketType.handle, opkt.packet_type);
+    var or_ = protocol.Reader.init(opkt.body);
+    _ = try or_.readU32();
+    var hcopy: [4]u8 = undefined;
+    @memcpy(&hcopy, try or_.readString());
+
+    // CLOSE 目录句柄：必须 ok。走错分支（读成 write）会回 failure。
+    try expectStatus(try closeReq(&f, 2, hcopy, &oout), .ok);
+
+    // 顺手钉住 WRITE-on-dir：同样靠 kind 检查拦（读成 write 会拿垃圾
+    // WriteState 去 pwrite）。
+    try expectStatus(try writeReq(&f, 3, hcopy, 0, "x", &oout), .failure);
 }
