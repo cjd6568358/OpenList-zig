@@ -1342,6 +1342,13 @@ const LoginThrottle = struct {
         b.fails += 1;
         if (b.fails >= max_auth_retries) {
             b.locked_until = now + lock_duration_s;
+            // 锁定**进入**时告警一次（带来源）。拒绝路径上不再打日志：HTTP 侧
+            // 锁定期内每个请求都会被拒，逐请求打日志等于给扫描器一个「写穿
+            // 闪存」的放大面（stderr 落盘，光猫小容量 flash）；SSH 侧虽然每
+            // 次拒绝都对应一次完整握手、量级小得多，但也统一走这一条。
+            log.warn("auth: {s} locked for {d}s after {d} failed logins", .{
+                b.name(), lock_duration_s, b.fails,
+            });
         }
     }
 

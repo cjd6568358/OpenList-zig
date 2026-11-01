@@ -63,7 +63,12 @@ pub fn handle(app: *App, req: *http.Request, res: *http.Response) !void {
     // 跑一遍 `twoHashPwd`（双层加盐），等于白送一个 CPU 放大面。
     const peer = req.peer_ip;
     if (!api.authThrottleAllow(peer)) {
-        log.warn("webdav: auth refused — account locked after too many failed attempts (from {s})", .{
+        // 锁定期内**每个请求**都会走到这里：keep-alive 单连接一秒能刷出成百
+        // 上千条日志，而 `log.warn` 每条都要过全局日志锁 + 落 stderr —— 生产
+        // 在光猫上由 supervisor 收进闪存，高频扫描日增 GB 级日志能直接写穿
+        // 小容量 flash。锁定**进入**的那一下在 `api.recordFailure` 里告警一次
+        // （带来源），这里只留 debug。
+        log.debug("webdav: auth refused — account locked (from {s})", .{
             if (peer.len == 0) "unknown" else peer,
         });
         res.setStatus(429); // Go 这里只有 `c.Status(429)`，正文为空
