@@ -296,7 +296,15 @@ pub const HostKey = struct {
 /// 两道上限都是为了让「恶意/异常客户端」只能撑爆连接、不能撑爆内存：
 ///
 ///   * `max_bytes` = 4 MiB，比我们宣告的 2 MiB 接收窗口宽一倍；
-///   * `max_items` = 256，够 8 KiB 分片的客户端发满一个窗口。
+///   * `max_items` = 4096 —— **按最小可信包长反推**，不是拍脑袋。
+///
+/// ⚠ `max_items` 曾经是 256，注释写着「够 8 KiB 分片发满一个窗口」。**这个假设
+/// 是错的**：PuTTY `psftp` 的 `WRITE` 是 ~4 KiB（实测 `incoming=4134`），2 MiB
+/// 在飞窗口要 ~512 条 ⇒ 256 条在**只攒到 1 MiB** 时就撞上限，服务端直接断连，
+/// 客户端看到的是 `Software caused connection abort`。症状只在「服务端主动
+/// rekey + 大文件」时出现，单跑小文件、或者只让客户端发起 rekey 都测不出来。
+/// 4096 条 × 512 字节 = 2 MiB，覆盖到窗口的四分之一粒度；真正的内存闸是
+/// `max_bytes`，条数只是防「海量小包」把 slice 头撑爆。
 ///
 /// 超限直接报错断连。静默丢弃是更坏的选择：客户端会一直等一个永远不会来的
 /// 回复（上传卡死），而我们这边什么日志都没有。
@@ -305,7 +313,7 @@ pub const Stash = struct {
     bytes: usize = 0,
 
     pub const max_bytes: usize = 4 * 1024 * 1024;
-    pub const max_items: usize = 256;
+    pub const max_items: usize = 4096;
 
     pub fn deinit(self: *Stash, a: std.mem.Allocator) void {
         for (self.items.items) |it| a.free(it);
@@ -589,6 +597,12 @@ fn readKexPacket(t: *Transport, a: std.mem.Allocator, stash: ?*Stash) !Transport
             else => {
                 if (stash) |s| {
                     s.push(t.alloc, p.payload) catch |e| {
+                        // 两种上限共用一个错误码，不打日志就完全不知道是哪一种
+                        // 触发的 —— 实测 psftp 上传 2 MiB 撞上时，光看
+                        // `TooManyPendingPackets` 分不清是条数还是字节数。
+                        log.warn("ssh: stash overflow: items={d}/{d} bytes={d}/{d} incoming={d}", .{
+                            s.len(), Stash.max_items, s.bytes, Stash.max_bytes, p.payload.len,
+                        });
                         p.deinit(a);
                         return e;
                     };
@@ -1141,6 +1155,25 @@ test "ssh: 暂存队列有上限（超了报错而不是吃内存）" {
     while (i < 4) : (i += 1) try st.push(testing.allocator, chunk);
     try testing.expectEqual(@as(usize, 4 * 1024 * 1024), st.bytes);
     try testing.expectError(error.TooManyPendingPackets, st.push(testing.allocator, chunk));
+}
+
+test "ssh: 暂存队列容得下 psftp 的 4 KiB 分片（服务端主动 rekey 回归）" {
+    // 实测回归：`max_items` 曾经是 256，注释假设客户端按 8 KiB 分片。但 PuTTY
+    // `psftp` 的 WRITE 是 ~4 KiB（服务端日志 `incoming=4134`），2 MiB 在飞窗口
+    // 要 ~512 条 ⇒ 256 条在**只攒到 1 MiB** 时就撞上限，连接被断，客户端看到
+    // 的是 `Software caused connection abort`。只有「服务端主动 rekey + 2 MiB
+    // 上传」这一种组合能触发，小文件或客户端主动 rekey 都测不出来。
+    var st = Stash{};
+    defer st.deinit(testing.allocator);
+
+    const chunk = try testing.allocator.alloc(u8, 4134);
+    defer testing.allocator.free(chunk);
+    @memset(chunk, 0x5a);
+
+    var i: usize = 0;
+    while (i < 512) : (i += 1) try st.push(testing.allocator, chunk);
+    try testing.expectEqual(@as(usize, 512), st.len());
+    try testing.expect(st.bytes > 2 * 1024 * 1024);
 }
 
 test "ssh: 读包计数会累加，KEX 完成后归零" {
