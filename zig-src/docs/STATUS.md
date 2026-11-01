@@ -5653,3 +5653,59 @@ scp 到 `/tmp/olz-ip`，`--port 15399 --sftp-ssh 15400`，**没有碰生产**（
 —— `main.zig` 把调试端点的密钥路径写死成 `"data/ssh_host_ed25519_key"`，**相对 cwd**，
 而且**忽略**配置里的 `sftp.host_key`。改成传 `cfg.sftp_host_key`：既跟随配置，
 也不再往工作目录里扔东西。`--sftp-ssh` 本身仍只绑 `127.0.0.1`、仍打 WARN。
+
+---
+
+## 60.40 服务端主动 rekey 下 psftp 断连：stash 条数上限按错的包长假设定的
+
+§60.39 留了一句「服务端主动 rekey 只用 paramiko 验过，第三方客户端未验证」。
+补上这个验证，**当场就抓到一个真缺陷**。
+
+### 现象
+
+`tools/sftp_interop.py --kib 2048`（2 MiB 往返）在 `sftp.rekey_mb = 1` 的配置下：
+
+```
+PASS winscp: ls / put / get / rm 往返一致 | 2097152 B
+FAIL psftp:  ls / put / get / rm 往返一致 | exit=1 FATAL ERROR: Network error: Software caused connection abort
+```
+
+### 根因
+
+服务端日志只有一行 `sftp(ssh): connection ended: TooManyPendingPackets` ——
+`Stash` 的两个上限共用一个错误码，看不出是哪一个触发的。补了一行诊断日志后：
+
+```
+ssh: stash overflow: items=256/256 bytes=1058304/4194304 incoming=4134
+```
+
+**撞的是条数，不是字节数**：`max_items` 原来是 256，注释写着「够 8 KiB 分片的
+客户端发满一个窗口」。但 PuTTY `psftp` 的 `WRITE` 是 **~4 KiB**（`incoming=4134`），
+2 MiB 在飞窗口要 **~512 条** ⇒ 256 条在只攒到 **1 MiB** 时就到顶，服务端直接断连。
+
+**为什么以前测不出来**：默认 `sftp.rekey_mb = 1024` MiB，互通脚本只跑 512 KiB，
+永远到不了阈值；paramiko 那条 e2e 里客户端发起 rekey 时**已经停止发送**，stash
+几乎是空的。只有「服务端主动发起 rekey + 客户端正在大批量上传」这一个组合会踩到。
+
+### 修复
+
+* `max_items` 256 → **4096**（按 512 字节最小可信包长反推，覆盖 2 MiB 窗口；
+  真正的内存闸是 `max_bytes` 4 MiB，条数只防「海量小包」把 slice 头撑爆）；
+* `Stash.push` 失败时打出 `items/bytes/incoming` 三个数 —— 否则下次再撞还是只能
+  看到一个光秃秃的 `TooManyPendingPackets`；
+* 新增单测「暂存队列容得下 psftp 的 4 KiB 分片」（512 × 4134 B 必须装得下）。
+
+### 验证
+
+| 场景 | 结果 |
+|---|---|
+| `--kib 2048` psftp / WinSCP，连跑 3 轮 | **全 PASS**（每轮两端各 2 MiB 逐字节一致） |
+| `--kib 8192`（8 MiB）psftp / WinSCP | **全 PASS**，期间服务端主动 rekey **48 次** |
+| paramiko e2e `--expect-server-rekey` | 15/15，`rekeys=5`，3 MiB 数据未损坏 |
+| 单测 | **551 pass + 4 skip** |
+
+> 记一条方法论：**「同一个功能用第二个独立客户端再跑一遍」这次又对了**。同一个
+> rekey 逻辑，paramiko 过、psftp 挂，差别只在「KEX 期间客户端还在不在发数据」。
+
+体积（含本次修复）：**Windows 1,952,768 B / `49d0627c`**，
+**aarch64 1,447,328 B / `b7bdef70`**（均 `-Doptimize=small`）。

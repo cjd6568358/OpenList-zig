@@ -20,6 +20,7 @@
 | R7 | 低 | `tools/sftp_interop.py:207` | rclone 的 `deletefile` 返回码被丢弃；全 SKIP 时仍 exit 0 |
 | R8 | 低 | `sftp/channel.zig:189` | 服务端主动 rekey 只有 opt-in 的 e2e，无单测；`shouldRekey` 无测试 |
 | R9 | 低 | `main.zig:288` | `--sftp-ssh` 把主机密钥写死成**相对 cwd** 的 `data/ssh_host_ed25519_key`，忽略 `sftp.host_key`，从别的工作目录起服务会凭空建一个 `data/` |
+| R10 | **中** | `sftp/ssh.zig` `Stash.max_items` | 上限 256 按「8 KiB 分片」估的，而 psftp 的 WRITE 是 ~4 KiB ⇒ 服务端主动 rekey 时 2 MiB 上传在 1 MiB 处撞条数上限、直接断连（`Software caused connection abort`）。**复核时被列为「未验证」，补验证时当场发现** |
 
 ---
 
@@ -184,6 +185,7 @@ Go `server/handles/auth.go:50-52`：锁定期内**每次**请求都 `LoginCache.
 | R7 | ✅ 已修 | `sftp_interop.py`：rclone `deletefile` 检查返回码；全 SKIP 退出码改 2 |
 | R8 | ✅ 已修 | `channel.zig` 新增 2 条单测（`shouldRekey` 阈值与 `rekey_busy`、`drainStash` 顺序补投） |
 | R9 | ✅ 已修 | `main.zig`：`--sftp-ssh` 改用 `cfg.sftp_host_key`（真机验证时踩到的：写死的相对路径在 `zig-src/` 下建了个 `data/`） |
+| R10 | ✅ 已修 | `ssh.zig`：`Stash.max_items` 256 → 4096（按 4 KiB 分片反推），push 失败时打 `items/bytes/incoming`，新增 512×4134 单测。2 MiB ×3 轮、8 MiB（rekey 48 次）psftp/WinSCP 全过 |
 
 验证：**550 pass + 4 skip**，0 失败 0 泄漏（+12 条）。详见 `STATUS.md` §60.39。
 
@@ -203,7 +205,12 @@ SSH 侧接线三条全部落地。唯一没解释的是隧道上 pscp 提前放�
 
 ## 未验证项（诚实说明）
 
-- Windows 上 `peeraddr` 恒为 `null`，所以本机跑的所有单测走的都是**全局桶**路径；
-  分桶行为在 Windows 上没有端到端验证（真机 Linux 上有，但那是生产环境，本轮未动）。
-- 服务端主动 rekey 的实测只有 e2e（paramiko + 小阈值），没有第三方客户端参与；
-  即「服务端主动 rekey 时 WinSCP / psftp 是否正常」未验证。
+初版复核留下两条「未验证」，后续都已补上，其中一条当场变成 R10：
+
+- ~~Windows 上 `peeraddr` 恒为 `null`，分桶只有单测覆盖~~ → **已在真机（aarch64）
+  用两个源 IP 验过**：127.0.0.1 锁住、192.168.1.1 不受影响，同 IP 跨协议共用。
+- ~~服务端主动 rekey 只有 paramiko 验过，第三方客户端未验证~~ → **补验证时发现
+  psftp 直接断连**（R10），修好后 2 MiB ×3 轮、8 MiB（rekey 48 次）全过。
+
+仍存的不确定性：真机上那轮 pscp 提前放弃时出现过 1 次 `Remote side unexpectedly
+closed network connection`，`-v` 重跑与本地 8/8 均干净，未复现（详见 STATUS §60.39）。
