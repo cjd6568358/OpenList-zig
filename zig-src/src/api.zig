@@ -70,6 +70,7 @@ const driver = @import("driver.zig");
 const json = @import("util/json.zig");
 const rand = @import("util/random.zig");
 const urlmod = @import("util/url.zig");
+const peeraddr = @import("util/peeraddr.zig");
 const config = @import("config.zig");
 const log = @import("log.zig");
 const client_mod = @import("client.zig");
@@ -1236,65 +1237,145 @@ fn handleLoginHash(app: *App, req: *http.Request, res: *http.Response) !void {
 /// M11：登录防爆破。对齐 Go `model.LoginCache`（internal/model/user.go:33-37）：
 /// 失败计数 ≥5 锁 5 分钟、期间返回 429 `TooManyAttempts`，成功清零。
 ///
-/// ⚠️ 与 Go 的一处刻意偏差：Go 按 `c.ClientIP()` 分桶，而 Zig 0.17 的
-/// `std.Io.net.Stream` **不暴露对端地址**（`http.zig` 模块头有记录），拿不到
-/// IP ⇒ 退化为**全局**计数。单管理员部署（一台 NAS/一个管理员）下等价；
-/// 副作用是分布式来源可把管理员账户也锁 5 分钟 —— 已按 Go 同款常量取最短锁定时。
-const LoginThrottle = struct {
-    mu: std.Io.Mutex = .init,
+/// ## 按来源分桶（2026-11-01）
+///
+/// Go 用 `c.ClientIP()` 分桶。这里过去是**全局**计数 —— 因为拿不到对端地址。
+/// 全局计数的副作用很实在：任何人反复试错 5 次就能把管理员账户锁 5 分钟
+/// （HTTP 和 SSH 还会互相牵连）。现在 `util/peeraddr.zig` 在 POSIX 上能拿到
+/// IP，于是照 Go 的语义分桶；拿不到（Windows，或 socket 已断）就退回全局桶，
+/// 行为与以前一致，不会因为「没 IP」而放行任何人。
+///
+/// ⚠ 桶键**必须用纯 IP、不带端口**。上游 Go 的 HTTP 登录用的是 `c.ClientIP()`
+/// （gin 会剥掉端口，所以天然是纯 IP），**但它的 FTP 用的是
+/// `cc.RemoteAddr().String()` —— 这个带端口**，扫描器每次源端口都不同 ⇒ 每个
+/// 连接一个新桶 ⇒ 计数永远到不了阈值，限速形同虚设（`docs/STATUS.md` §9）。
+/// 也就是说这条规则不是从 HTTP 那条路径抄来的，而是从 FTP 那个坑反推出来的。
+const ThrottleBucket = struct {
+    /// `false` = 从未使用。**不能**用「key 为空」判断：全局桶的 key 本来就是
+    /// 空串，用 key_len == 0 当空闲标记会让全局桶被别人覆盖掉。
+    used: bool = false,
+    key: [peeraddr.max_len]u8 = @splat(0),
+    key_len: u8 = 0,
     fails: u32 = 0,
     locked_until: i64 = 0,
+    /// 最近一次使用（秒）。表满时淘汰最久未用的那个。
+    seen: i64 = 0,
+
+    fn name(self: *const ThrottleBucket) []const u8 {
+        return self.key[0..self.key_len];
+    }
+};
+
+/// 同时跟踪多少个来源。单管理员部署实际上只有一两个；表满了淘汰最久未用
+/// 的桶，于是「大量来源轮番爆破」最多占用这么多内存（每个桶 ~90 字节）。
+const throttle_buckets = 64;
+
+const LoginThrottle = struct {
+    mu: std.Io.Mutex = .init,
+    buckets: [throttle_buckets]ThrottleBucket = @splat(.{}),
+
+    /// 找已存在的桶，**不**新建。成功路径用它：一次成功登录不该占用一个桶位，
+    /// 否则表满时会把某个正在锁定的来源淘汰掉（等于给攻击者一次重试）。
+    fn find(self: *LoginThrottle, key: []const u8) ?*ThrottleBucket {
+        for (&self.buckets) |*b| {
+            if (b.used and b.key_len == key.len and std.mem.eql(u8, b.name(), key)) return b;
+        }
+        return null;
+    }
+
+    /// 找到 `key` 的桶；没有就占用一个空位/最久未用的位置。
+    /// 调用方必须持锁。
+    fn slot(self: *LoginThrottle, key: []const u8, now: i64) *ThrottleBucket {
+        var first_free: ?usize = null;
+        var lru: usize = 0; // 所有桶都占用时才用得上，此时它一定是 used 的
+
+        for (&self.buckets, 0..) |*b, i| {
+            if (b.used and b.key_len == key.len and std.mem.eql(u8, b.name(), key)) return b;
+            if (!b.used) {
+                if (first_free == null) first_free = i;
+            } else if (b.seen < self.buckets[lru].seen) {
+                lru = i;
+            }
+        }
+
+        const b = &self.buckets[first_free orelse lru];
+        // 键过长（理论上不会：IP 文本 ≤ 45 字节）就截断，宁可把两个来源
+        // 并进同一个桶（更严），也不能越界。
+        const n = @min(key.len, peeraddr.max_len);
+        @memcpy(b.key[0..n], key[0..n]);
+        b.key_len = @intCast(n);
+        b.used = true;
+        b.fails = 0;
+        b.locked_until = 0;
+        b.seen = now;
+        return b;
+    }
 
     /// true = 允许继续尝试；false = 处于锁定期，应回 429。
-    fn allow(self: *LoginThrottle) bool {
+    fn allow(self: *LoginThrottle, key: []const u8) bool {
         self.mu.lockUncancelable(rt.io());
         defer self.mu.unlock(rt.io());
         const now = rt.nowSeconds();
-        if (self.locked_until > now) return false;
-        if (self.locked_until != 0) {
+        const b = self.slot(key, now);
+        b.seen = now;
+        if (b.locked_until > now) {
+            // 锁定期内**每次**尝试都续期（Go `LoginCache.Expire(ip, 5min)`，
+            // server/handles/auth.go:52）。不续期的话锁定就是一个固定 5 分钟
+            // 的窗口，攻击者可以精确按节奏继续爆破；续期后越试锁得越久。
+            b.locked_until = now + lock_duration_s;
+            return false;
+        }
+        if (b.locked_until != 0) {
             // 锁定期满（Go `LoginCache.Expire` 的语义）：重新计数。
-            self.fails = 0;
-            self.locked_until = 0;
+            b.fails = 0;
+            b.locked_until = 0;
         }
         return true;
     }
 
-    fn recordFailure(self: *LoginThrottle) void {
+    fn recordFailure(self: *LoginThrottle, key: []const u8) void {
         self.mu.lockUncancelable(rt.io());
         defer self.mu.unlock(rt.io());
-        self.fails += 1;
-        if (self.fails >= max_auth_retries) {
-            self.locked_until = rt.nowSeconds() + lock_duration_s;
+        const now = rt.nowSeconds();
+        const b = self.slot(key, now);
+        b.seen = now;
+        b.fails += 1;
+        if (b.fails >= max_auth_retries) {
+            b.locked_until = now + lock_duration_s;
         }
     }
 
-    fn recordSuccess(self: *LoginThrottle) void {
+    fn recordSuccess(self: *LoginThrottle, key: []const u8) void {
         self.mu.lockUncancelable(rt.io());
         defer self.mu.unlock(rt.io());
-        self.fails = 0;
-        self.locked_until = 0;
+        // 只清已有的桶：成功登录不该新建桶（见 `find` 的注释）。
+        const b = self.find(key) orelse return;
+        b.fails = 0;
+        b.locked_until = 0;
+        b.seen = rt.nowSeconds();
     }
 };
 
-/// SSH 认证与 HTTP 登录**共用**同一份失败计数。
+/// 登录限速：`key` = 对端 IP（不带端口），空串 = 全局桶。
 ///
-/// 共用是刻意的：换个协议不能绕过限速。副作用是 SSH 爆破会顺带锁住 HTTP
-/// 登录 5 分钟 —— 单管理员部署下可接受，Go 也是同一份 `LoginCache`。
-///
-/// ⚠ 计数 key 目前是**全局**而不是按 IP：`std.Io.net.Stream` 不暴露对端地址
-/// （见 `http.zig` 模块头）。将来若拿到 IP，key 必须用**纯 IP、不带端口** ——
-/// 上游 Go 版用 `IP:端口`，扫描器每次源端口都不同，计数永远到不了阈值，
-/// 限速形同虚设（`docs/STATUS.md` §9）。
-pub fn authThrottleAllow() bool {
-    return login_throttle.allow();
+/// HTTP 登录与 SSH 认证**共用同一份计数**：换协议不能绕过限速。同一个来源
+/// 用两种协议各试 3 次，加起来照样到阈值。
+pub fn authThrottleAllow(key: []const u8) bool {
+    return login_throttle.allow(key);
 }
 
-pub fn authThrottleFailure() void {
-    login_throttle.recordFailure();
+pub fn authThrottleFailure(key: []const u8) void {
+    login_throttle.recordFailure(key);
 }
 
-pub fn authThrottleSuccess() void {
-    login_throttle.recordSuccess();
+pub fn authThrottleSuccess(key: []const u8) void {
+    login_throttle.recordSuccess(key);
+}
+
+pub fn authThrottleReset() void {
+    login_throttle.mu.lockUncancelable(rt.io());
+    defer login_throttle.mu.unlock(rt.io());
+    login_throttle.buckets = @splat(.{});
 }
 
 /// Go `model.DefaultMaxAuthRetries`。
@@ -1313,12 +1394,14 @@ fn loginCommon(app: *App, req: *http.Request, res: *http.Response, already_stati
     const v = try parseBodyJson(a, req, res) orelse return;
     const username = v.strAt("username") orelse "";
     const password = v.strAt("password") orelse "";
+    // 桶键 = 对端 IP（不带端口）；拿不到时是空串 = 全局桶。
+    const key = req.peer_ip;
     // M11：锁定期内直接 429，不进入凭据比对（Go loginHash 的检查顺序一致）。
-    if (!login_throttle.allow()) {
+    if (!login_throttle.allow(key)) {
         return res.jsonError(429, msg_too_many);
     }
     if (!std.mem.eql(u8, username, app.admin_user)) {
-        login_throttle.recordFailure();
+        login_throttle.recordFailure(key);
         return res.jsonError(401, msg_login_failed);
     }
     // Go `User.ValidatePwd` / `ValidatePwdStaticHash`（internal/model/user.go:83-94）：
@@ -1329,10 +1412,10 @@ fn loginCommon(app: *App, req: *http.Request, res: *http.Response, already_stati
     // Constant-time compare. A plain `std.mem.eql` would leak the position of
     // the first differing byte; a length check first would leak the length.
     if (!ctEqual(expect, app.admin_hash)) {
-        login_throttle.recordFailure();
+        login_throttle.recordFailure(key);
         return res.jsonError(401, msg_login_failed);
     }
-    login_throttle.recordSuccess();
+    login_throttle.recordSuccess(key);
     return issueToken(app, a, res, username);
 }
 
@@ -7238,7 +7321,145 @@ test "login/hash accepts the static hash the frontend actually sends" {
     }
     const locked = try post(&app, a, "/api/auth/login", "{\"username\":\"admin\",\"password\":\"hunter2\"}");
     try expectApiCode(locked, 429);
-    login_throttle.recordSuccess(); // 复位，避免污染同进程其他用例
+    login_throttle.recordSuccess(""); // 复位，避免污染同进程其他用例
+}
+
+test "auth/throttle: 失败计数按来源分桶，锁一个不影响另一个" {
+    // 这是「按 IP 分桶」存在的全部意义：全局计数下，任何人试错 5 次就能把
+    // 管理员锁 5 分钟。桶键必须是**纯 IP**（端口每次都变，带上就等于每个连接
+    // 一个桶 —— 上游 FTP 的 `RemoteAddr().String()` 就是这么失效的）。
+    defer authThrottleReset();
+    authThrottleReset();
+
+    const bad = "203.0.113.7";
+    var i: usize = 0;
+    while (i < max_auth_retries) : (i += 1) {
+        try testing.expect(authThrottleAllow(bad));
+        authThrottleFailure(bad);
+    }
+    try testing.expect(!authThrottleAllow(bad)); // 第 6 次：锁住
+
+    // 另一个来源、以及全局桶（空键 = 拿不到 IP 的平台）都不受影响。
+    try testing.expect(authThrottleAllow("203.0.113.8"));
+    try testing.expect(authThrottleAllow(""));
+}
+
+test "auth/throttle: 空键是独立桶，不会和「空位」混淆" {
+    // 空串既是全局桶的键，也是桶未使用时的初始状态。用 `key_len == 0` 判断
+    // 「空位」会让全局桶被第一个来源覆盖掉 —— 这条用例就是钉住 `used` 标志。
+    defer authThrottleReset();
+    authThrottleReset();
+
+    var i: usize = 0;
+    while (i < max_auth_retries) : (i += 1) {
+        try testing.expect(authThrottleAllow(""));
+        authThrottleFailure("");
+    }
+    try testing.expect(!authThrottleAllow("")); // 全局桶确实被锁
+    try testing.expect(authThrottleAllow("192.0.2.1")); // 有 IP 的来源另算
+}
+
+test "auth/throttle: 成功一次清零，之后重新攒满才锁" {
+    defer authThrottleReset();
+    authThrottleReset();
+
+    const ip = "198.51.100.4";
+    var i: usize = 0;
+    while (i < max_auth_retries - 1) : (i += 1) {
+        try testing.expect(authThrottleAllow(ip));
+        authThrottleFailure(ip);
+    }
+    authThrottleSuccess(ip);
+    // 清零后还能再失败满 5 次，第 6 次才锁 —— 证明计数真的归零了。
+    i = 0;
+    while (i < max_auth_retries) : (i += 1) {
+        try testing.expect(authThrottleAllow(ip));
+        authThrottleFailure(ip);
+    }
+    try testing.expect(!authThrottleAllow(ip));
+}
+
+test "auth/throttle: 锁定期满自动重新计数（Go `LoginCache` 过期语义）" {
+    defer authThrottleReset();
+    authThrottleReset();
+
+    const ip = "198.51.100.9";
+    var i: usize = 0;
+    while (i < max_auth_retries) : (i += 1) {
+        _ = authThrottleAllow(ip);
+        authThrottleFailure(ip);
+    }
+    try testing.expect(!authThrottleAllow(ip));
+
+    // 把锁定期拨到过去，模拟 5 分钟过去。不这样做就只能等真实的 5 分钟。
+    const now = rt.nowSeconds();
+    for (&login_throttle.buckets) |*b| {
+        if (b.used and std.mem.eql(u8, b.name(), ip)) b.locked_until = now - 1;
+    }
+    try testing.expect(authThrottleAllow(ip)); // 过期 ⇒ 放行
+    // 而且是**重新计数**，不是「剩 1 次」：再失败满 5 次才会锁。
+    i = 0;
+    while (i < max_auth_retries) : (i += 1) {
+        try testing.expect(authThrottleAllow(ip));
+        authThrottleFailure(ip);
+    }
+    try testing.expect(!authThrottleAllow(ip));
+}
+
+test "auth/throttle: 锁定期内继续尝试会续期（越试锁得越久）" {
+    // Go `LoginCache.Expire(ip, 5min)` 在锁定分支里**每次**都执行，所以持续
+    // 爆破会把锁定一直往后推。不续期的话锁定只是一个固定的 5 分钟窗口，
+    // 攻击者按节奏打就能拿到稳定的尝试配额。
+    defer authThrottleReset();
+    authThrottleReset();
+
+    const ip = "198.51.100.11";
+    var i: usize = 0;
+    while (i < max_auth_retries) : (i += 1) {
+        _ = authThrottleAllow(ip);
+        authThrottleFailure(ip);
+    }
+
+    // 把锁定期压到「只剩 100 秒」，再试一次。
+    const now = rt.nowSeconds();
+    for (&login_throttle.buckets) |*b| {
+        if (b.used and std.mem.eql(u8, b.name(), ip)) b.locked_until = now + 100;
+    }
+    try testing.expect(!authThrottleAllow(ip));
+
+    const after = rt.nowSeconds();
+    for (&login_throttle.buckets) |*b| {
+        if (b.used and std.mem.eql(u8, b.name(), ip)) {
+            // 续期到「当前 + 完整锁定时长」；±1 秒是时间戳跨秒的抖动。
+            try testing.expect(b.locked_until >= after + lock_duration_s - 1);
+            try testing.expect(b.locked_until <= after + lock_duration_s + 1);
+        }
+    }
+}
+
+test "auth/throttle: 表满淘汰最久未用的来源，内存有界" {
+    // 64 个桶、每个约 90 字节。表满了必须淘汰，否则「大量来源轮番爆破」会把
+    // 内存撑爆；同时淘汰顺序要稳定（LRU），不能随机丢掉正在锁定的桶。
+    defer authThrottleReset();
+    authThrottleReset();
+
+    var buf: [peeraddr.max_len]u8 = undefined;
+    var i: usize = 0;
+    while (i < throttle_buckets) : (i += 1) {
+        const key = try std.fmt.bufPrint(&buf, "10.0.{d}.1", .{i});
+        _ = authThrottleAllow(key);
+        authThrottleFailure(key);
+    }
+    // 第 65 个来源进来：所有桶的 `seen` 都在同一秒，LRU 取最早的那个（10.0.0.1）。
+    _ = authThrottleAllow("10.0.99.1");
+    authThrottleFailure("10.0.99.1");
+
+    // 被淘汰的来源从 0 重新计数：还能再试满 5 次。
+    i = 0;
+    while (i < max_auth_retries) : (i += 1) {
+        try testing.expect(authThrottleAllow("10.0.0.1"));
+        authThrottleFailure("10.0.0.1");
+    }
 }
 
 test "fs/get / returns the virtual root like Go" {

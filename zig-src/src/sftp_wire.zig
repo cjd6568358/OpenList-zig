@@ -28,6 +28,7 @@ const client_mod = @import("client.zig");
 const cookiejar = @import("cookiejar.zig");
 const rt = @import("rt.zig");
 const log = @import("log.zig");
+const peeraddr = @import("util/peeraddr.zig");
 const sftp = @import("sftp.zig");
 const handler = sftp.handler;
 const protocol = sftp.protocol;
@@ -324,10 +325,15 @@ fn serveStream(ctx: *handler.Context, sess: *session.Session, stream: std.Io.net
 /// `std.Io.net.IpAddress.parse` 不做域名解析，写主机名会在启动时直接失败并
 /// 说明原因，而不是静默绑错地址。
 ///
-/// 认证（RFC 4252）已接真校验，所以可以绑非 loopback；但失败计数目前是
-/// **全局**而非按 IP（`std.Io.net.Stream` 不暴露对端地址），任何人反复试错
-/// 都能把管理员账户锁 5 分钟 —— 单管理员部署下可接受，见 TODO 第 1 条。
-pub fn serveSsh(app: *api.App, address: []const u8, port: u16, host_key_path: []const u8) !void {
+/// `rekey_limit` = 服务端主动换密钥的字节阈值，0 = 不主动发起（客户端仍可
+/// 自己发起，那条路径一直支持）。
+pub fn serveSsh(
+    app: *api.App,
+    address: []const u8,
+    port: u16,
+    host_key_path: []const u8,
+    rekey_limit: u64,
+) !void {
     const io = rt.io();
     const gpa = rt.gpa();
 
@@ -342,6 +348,13 @@ pub fn serveSsh(app: *api.App, address: []const u8, port: u16, host_key_path: []
     defer listener.deinit(io);
 
     log.info("sftp(ssh): listening on {s}:{d} (host key: {s})", .{ address, port, host_key_path });
+    // 明确打出策略：rekey 阈值配错了（比如 `sftp.rekey_mb` 写成字符串）时，
+    // 症状是「服务端从不换密钥」，而这一点在日志里必须一眼可见。
+    if (rekey_limit > 0) {
+        log.info("sftp(ssh): will initiate rekey after {d} bytes", .{rekey_limit});
+    } else {
+        log.info("sftp(ssh): server-initiated rekey disabled (clients may still initiate)", .{});
+    }
 
     while (true) {
         const stream = listener.accept(io) catch |e| switch (e) {
@@ -352,7 +365,7 @@ pub fn serveSsh(app: *api.App, address: []const u8, port: u16, host_key_path: []
                 continue;
             },
         };
-        const t = std.Thread.spawn(.{}, sshConnThread, .{ app, hk, stream }) catch |e| {
+        const t = std.Thread.spawn(.{}, sshConnThread, .{ app, hk, stream, rekey_limit }) catch |e| {
             log.warn("sftp(ssh): spawn failed: {s}", .{@errorName(e)});
             stream.close(io);
             continue;
@@ -383,38 +396,46 @@ fn bridgeHandle(
 ///
 /// 用户名比对放在哈希之前，但**对外不区分**「用户名错」和「口令错」：两者都
 /// 只回 `USERAUTH_FAILURE`，客户端看到的都是 "Permission denied"。
-fn sshVerify(ctx: *anyopaque, a: std.mem.Allocator, user: []const u8, pw: []const u8) bool {
+///
+/// `peer` 是对端 IP（不带端口）。失败计数按它分桶 —— 全局计数意味着任何人都
+/// 能靠 5 次错误把管理员锁 5 分钟。拿不到 IP 时传空串，退化回全局桶。
+fn sshVerify(ctx: *anyopaque, a: std.mem.Allocator, user: []const u8, pw: []const u8, peer: []const u8) bool {
     const app: *api.App = @ptrCast(@alignCast(ctx));
     if (app.admin_hash.len == 0) return false; // 还没建管理员
 
     // 锁定期内直接拒绝，连哈希都不算（与 HTTP 登录的检查顺序一致）。
     // 必须记一条日志：否则用户输入正确口令也登不上，却没有任何线索。
-    if (!api.authThrottleAllow()) {
-        log.warn("ssh: auth refused — account locked after too many failed attempts", .{});
+    if (!api.authThrottleAllow(peer)) {
+        log.warn("ssh: auth refused — account locked after too many failed attempts (from {s})", .{if (peer.len == 0) "unknown" else peer});
         return false;
     }
 
     if (!std.mem.eql(u8, user, app.admin_user)) {
-        api.authThrottleFailure();
+        api.authThrottleFailure(peer);
         return false;
     }
     const h = api.twoHashPwd(a, pw, app.admin_salt) catch {
-        api.authThrottleFailure();
+        api.authThrottleFailure(peer);
         return false;
     };
     // 与 HTTP 登录一致：用**恒定时间**比较。明文口令已经在客户端侧走完，
     // 这里比的是哈希，泄漏面比明文小得多，但没有理由和 HTTP 路径用两套。
     if (!api.ctEqual(h, app.admin_hash)) {
-        api.authThrottleFailure();
+        api.authThrottleFailure(peer);
         return false;
     }
-    api.authThrottleSuccess();
+    api.authThrottleSuccess(peer);
     return true;
 }
 
-fn sshConnThread(app: *api.App, hk: sftp.ssh.HostKey, stream: std.Io.net.Stream) void {
+fn sshConnThread(app: *api.App, hk: sftp.ssh.HostKey, stream: std.Io.net.Stream, rekey_limit: u64) void {
     const gpa = rt.gpa();
     defer stream.close(rt.io());
+
+    // 对端 IP 每条连接查一次。缓冲区放在这里（连接级），传输层与认证都只在
+    // 这条连接的生命周期内使用它。
+    var peer_buf: [peeraddr.max_len]u8 = undefined;
+    const peer = peeraddr.ipString(&peer_buf, stream) orelse "";
 
     // 与裸 SFTP 端点完全相同的装配：一个 Wire（Client + Jar）、一个 Session、
     // 一个 Context。区别只在字节从哪儿来（加密 channel vs 裸 TCP）。
@@ -435,9 +456,14 @@ fn sshConnThread(app: *api.App, hk: sftp.ssh.HostKey, stream: std.Io.net.Stream)
     var bridge = Bridge{ .ctx = &ctx, .sess = &sess };
 
     const h = sftp.channel.SftpHandler{ .ctx = &bridge, .handleFn = bridgeHandle };
-    const auth = sftp.channel.Auth{ .ctx = app, .verifyFn = sshVerify };
+    const auth = sftp.channel.Auth{ .ctx = app, .verifyFn = sshVerify, .peer = peer };
 
-    sftp.channel.run(gpa, stream, hk, h, auth) catch |e| {
+    sftp.channel.run(gpa, stream, .{
+        .host_key = hk,
+        .handler = h,
+        .auth = auth,
+        .rekey_limit = rekey_limit,
+    }) catch |e| {
         if (e != error.ConnectionClosed and e != error.BrokenPipe) {
             log.debug("sftp(ssh): connection ended: {s}", .{@errorName(e)});
         }

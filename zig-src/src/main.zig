@@ -282,8 +282,15 @@ pub fn main(init: std.process.Init) !void {
     // 默认（两者都没有）完全不监听 —— 与 WebDAV 常开不同，SSH 端点暴露面
     // 更大，不该在用户没明确要求时自己开。
     if (opts.sftp_ssh_port) |p| {
+        // 调试端点不主动发起 rekey：客户端自己会。少一条只有在这里才会
+        // 走到的路径，出问题时更好排查。
+        //
+        // 主机密钥用 `cfg.sftp_host_key` 而不是写死 `data/ssh_host_ed25519_key`：
+        // 写死的那个是**相对 cwd** 的，从别的工作目录起服务会在那儿凭空建一个
+        // `data/`（11-01 真机验证时踩到，`zig-src/data/` 就是这么冒出来的），
+        // 而且会忽略配置里指定的 `sftp.host_key`。
         if (std.Thread.spawn(.{}, sftp_wire.serveSsh, .{
-            &app, "127.0.0.1", p, "data/ssh_host_ed25519_key",
+            &app, "127.0.0.1", p, cfg.sftp_host_key, 0,
         })) |t| {
             t.detach();
         } else |e| {
@@ -295,8 +302,10 @@ pub fn main(init: std.process.Init) !void {
             break :sftp;
         }
         const sport: u16 = @intCast(cfg.sftp_port);
+        // 负值当 0（关），防止配置写成 -1 后转成 u64 变成天文数字。
+        const rekey_limit: u64 = if (cfg.sftp_rekey_mb > 0) @as(u64, @intCast(cfg.sftp_rekey_mb)) * 1024 * 1024 else 0;
         if (std.Thread.spawn(.{}, sftp_wire.serveSsh, .{
-            &app, cfg.sftp_address, sport, cfg.sftp_host_key,
+            &app, cfg.sftp_address, sport, cfg.sftp_host_key, rekey_limit,
         })) |t| {
             t.detach();
         } else |e| {

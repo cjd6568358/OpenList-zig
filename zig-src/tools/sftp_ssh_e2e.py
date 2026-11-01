@@ -11,7 +11,11 @@
   `waitForWindow` 的等待路径，是窗口流控唯一能自动回归的地方；
 * 客户端主动重协商（rekey）后会话必须照常可用 —— OpenSSH 大约每 1 GB 或
   1 小时会自己发起一次，服务端不接就是「大文件传到一半掉线」。连做两次是为了
-  抓「上次的 KEXINIT 存放在短命 allocator 里」这类悬垂引用。
+  抓「上次的 KEXINIT 存放在短命 allocator 里」这类悬垂引用；
+* **服务端主动** rekey（`sftp.rekey_mb` 阈值）：客户端不动，服务端自己换密钥。
+  这条路径要处理「两边同时发起」和「KEX 期间客户端继续发 CHANNEL_DATA」，
+  是最容易写出「上传随机卡住」的地方；
+* 断点续传：以 `r+b`（不带 TRUNC）打开已存在的文件，按 offset 覆盖写。
 
 依赖：**paramiko**（唯一一个需要第三方包的回归工具；其余探针都刻意零依赖）。
 安装到隔离环境：
@@ -54,6 +58,27 @@ def md5(path):
     return hashlib.md5(open(path, "rb").read()).hexdigest()
 
 
+def count_rekeys(transport):
+    """数「对端发来 KEXINIT」的次数 —— 客户端没主动要求、却收到 KEXINIT，
+    只可能是服务端发起的重协商。
+
+    注意这里**不能**给实例属性 `transport._negotiate_keys` 赋值：paramiko 在
+    `__init__` 里就把 `_handler_table` 建成 `{MSG_KEXINIT: self._negotiate_keys}`
+    （存的是 bound method），分发表里留的是老引用，事后改实例属性完全无效 ——
+    计数会一直是 0，看起来像「服务端没 rekey」。官方注释写明这张表就是为了
+    per-instance 改写而搬到 init 里的，所以这里替换表里那一项。
+    """
+    counter = {"n": 0}
+    orig = transport._handler_table[paramiko.common.MSG_KEXINIT]
+
+    def wrapper(m):
+        counter["n"] += 1
+        return orig(m)
+
+    transport._handler_table[paramiko.common.MSG_KEXINIT] = wrapper
+    return counter
+
+
 def connect(host, port, user, pw):
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -69,6 +94,8 @@ def main():
     ap.add_argument("--user", default="admin")
     ap.add_argument("--password", required=True, help="管理员口令")
     ap.add_argument("--dir", default="/local", help="要列出的目录（挂载点）")
+    ap.add_argument("--expect-server-rekey", action="store_true",
+                    help="服务端配了很小的 sftp.rekey_mb，断言它会主动换密钥")
     args = ap.parse_args()
 
     work = tempfile.mkdtemp(prefix="olz-sftp-e2e-")
@@ -119,6 +146,44 @@ def main():
     got2 = os.path.join(work, "got2.bin")
     sftp.get(args.dir + "/e2e_big.bin", got2)
     check("rekey 后 get 300KiB 仍然一致", md5(got2) == md5(big))
+
+    # ---- 1c) 断点续传：不带 TRUNC 打开已存在的文件，按 offset 覆盖 ----
+    # 服务端必须先把现有内容拉进 temp 再接受 WRITE，否则 offset 之前的那段
+    # 会变成空洞：文件「上传成功」，内容却缺一块，而且客户端拿不到任何错误。
+    try:
+        p = args.dir + "/e2e_resume.bin"
+        with sftp.open(p, "wb") as fh:
+            fh.write(b"0123456789")
+        with sftp.open(p, "r+b") as fh:
+            fh.seek(10)
+            fh.write(b"abc")
+        with sftp.open(p, "rb") as fh:
+            content = fh.read()
+        check("断点续传保留原内容", content == b"0123456789abc", repr(content))
+        sftp.remove(p)
+    except Exception as e:  # noqa: BLE001
+        check("断点续传保留原内容", False, f"{type(e).__name__}: {e}")
+
+    # ---- 1d) 服务端主动 rekey ----
+    # 只有服务端配了小阈值（`sftp.rekey_mb`）才会发生。这里传一大段数据，
+    # 期间不调用 `renegotiate_keys()` —— 计数 >0 就是服务端发起的。
+    if args.expect_server_rekey:
+        try:
+            tr = c.get_transport()
+            counter = count_rekeys(tr)
+            payload = os.urandom(3 * 1024 * 1024)
+            p = args.dir + "/e2e_rekey.bin"
+            with sftp.open(p, "wb") as fh:
+                for i in range(0, len(payload), 32768):
+                    fh.write(payload[i:i + 32768])
+            back = os.path.join(work, "rekey_back.bin")
+            sftp.get(p, back)
+            same = open(back, "rb").read() == payload
+            check("服务端主动发起 rekey", counter["n"] > 0, f"rekeys={counter['n']}")
+            check("服务端 rekey 期间数据未损坏", same, f"{os.path.getsize(back)} B")
+            sftp.remove(p)
+        except Exception as e:  # noqa: BLE001
+            check("服务端主动发起 rekey", False, f"{type(e).__name__}: {e}")
 
     for name in ("e2e_big.bin", "e2e_small.txt"):
         try:

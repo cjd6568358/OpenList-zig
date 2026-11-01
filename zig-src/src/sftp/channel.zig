@@ -95,13 +95,20 @@ pub const SftpHandler = struct {
 ///
 /// channel 层只关心「过没过」，不该知道 `twoHashPwd` 的存在 —— 口令哈希形态
 /// 属于账户层的事，SSH 和 HTTP 登录必须用**同一套**实现，否则迟早漂移。
+///
+/// `peer` 是这条连接的对端 IP（不带端口），拿不到时为空串。它从这里传进去
+/// 而不是让实现方自己去取：socket 只在传输层手里，而且**必须有值可传** ——
+/// 失败计数按来源分桶，拿不到 IP 就只能退化成全局桶（任何人 5 次错误就能把
+/// 管理员锁 5 分钟）。
 pub const Auth = struct {
     ctx: *anyopaque,
     /// 返回 true = 凭据有效。实现方负责用户名比对、哈希比对、失败计数。
-    verifyFn: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator, user: []const u8, pw: []const u8) bool,
+    verifyFn: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator, user: []const u8, pw: []const u8, peer: []const u8) bool,
+    /// 对端 IP，空串 = 未知。每条连接一份，见 `sftp_wire.sshConnThread`。
+    peer: []const u8 = "",
 
     pub fn verify(self: Auth, alloc: std.mem.Allocator, user: []const u8, pw: []const u8) bool {
-        return self.verifyFn(self.ctx, alloc, user, pw);
+        return self.verifyFn(self.ctx, alloc, user, pw, self.peer);
     }
 };
 
@@ -126,6 +133,35 @@ pub const Conn = struct {
     /// 也可能含好几个。
     acc: Buf,
 
+    /// 服务端主动 rekey 时，KEX 期间收到的非 KEX 包暂存到这里（见
+    /// `ssh.Transport.stash`）。NEWKEYS 完成后由 `drainStash` 补投。
+    ///
+    /// ⚠ 指针在 `loop()` 里才挂到 `t.stash` 上：`init` 是**按值返回**的，
+    /// 在那里取 `&self.stash` 拿到的是临时对象的地址，函数一返回就悬垂。
+    stash: ssh.Stash = .{},
+
+    /// 服务端主动发起重协商的字节阈值（进出合计），0 = 不主动发起。
+    ///
+    /// 关掉也是合法的：OpenSSH 默认就会在 1 GB / 1 小时后自己发起
+    /// （客户端主动路径已支持）。这个阈值是给「客户端不动、但我们想强制
+    /// 换密钥」的部署用的。
+    rekey_limit: u64 = 0,
+
+    /// 正在换密钥：别在上一次的 KEX 里再触发一次。
+    rekey_busy: bool = false,
+
+    /// 已经发出 `EOF`+`CLOSE`，正在等对端回 `CLOSE`（RFC 4254 §5.3 的关闭
+    /// 是**双向握手**：收到 close 的一方要回 close）。
+    ///
+    /// ⚠ 发完就关 socket 会踩 Windows 的「有未读数据还 close ⇒ 直接 RST」，
+    /// 客户端看到的随机报错是 `Software caused connection abort` /
+    /// `Remote side unexpectedly closed network connection`：**文件已经传完、
+    /// rm 也成功了，最后 quit 那一下报错**。实测 psftp 12 次里挂 5 次。
+    closing: bool = false,
+
+    /// 等对端 `CLOSE` 期间丢弃的包数。对端赖着不发就兜底返回，不无限读。
+    closing_discards: u32 = 0,
+
     pub fn init(alloc: std.mem.Allocator, t: *ssh.Transport, host_key: ssh.HostKey, handler: SftpHandler, auth: Auth) Conn {
         return .{
             .alloc = alloc,
@@ -139,10 +175,19 @@ pub const Conn = struct {
 
     pub fn deinit(self: *Conn) void {
         self.acc.deinit();
+        self.stash.deinit(self.alloc);
     }
 
     pub fn loop(self: *Conn) !void {
+        // 暂存队列的地址只能在这里取（见字段注释）。只有真的跑消息循环的
+        // 连接才需要它；单测里直接调 `onChannelOpen` 之类不需要。
+        self.t.stash = &self.stash;
+
         while (true) {
+            // 换密钥的时机挑在「刚处理完一个请求、正要去读下一个包」——
+            // 此刻我们没有半截输出，客户端也不在等我们的回复。
+            if (self.shouldRekey()) try self.serverRekey();
+
             var arena = std.heap.ArenaAllocator.init(self.alloc);
             defer arena.deinit();
             const a = arena.allocator();
@@ -164,6 +209,21 @@ pub const Conn = struct {
 
     fn dispatch(self: *Conn, a: std.mem.Allocator, p: []const u8) !void {
         log.debug("ssh: msg {d} len={d}", .{ p[0], p.len });
+
+        // 已经在等对端的 `CLOSE`：只认 CLOSE / DISCONNECT，其余丢弃。
+        // 这一步存在的意义见 `closing` 字段注释 —— 目的是把对端最后那个
+        // `CLOSE` **读掉**再关 socket，否则 Windows 会用 RST 收尾。
+        if (self.closing) {
+            switch (p[0]) {
+                MSG_CHANNEL_CLOSE, ssh.MSG_DISCONNECT => {},
+                else => {
+                    self.closing_discards += 1;
+                    if (self.closing_discards <= 256) return;
+                },
+            }
+            return error.ChannelClosed;
+        }
+
         switch (p[0]) {
             ssh.MSG_DISCONNECT => return error.PeerDisconnect,
             ssh.MSG_IGNORE, ssh.MSG_DEBUG, ssh.MSG_UNIMPLEMENTED => {},
@@ -176,8 +236,11 @@ pub const Conn = struct {
             MSG_CHANNEL_EOF => {
                 // 客户端说「不再发请求了」，收尾由我们做。PuTTY 的 pscp
                 // 就停在这一步等我们关，不回 close 它永远不退出。
+                //
+                // 但**发完不能立刻走人**：对端还要回一个 `CLOSE`。这里只
+                // 把收尾包发出去，循环继续读，读到对端的 `CLOSE`（或对端
+                // 直接断连）才真正返回 —— 见 `closing` 字段注释。
                 self.closeChannel();
-                return error.ChannelClosed;
             },
             MSG_CHANNEL_CLOSE => {
                 self.closeChannel();
@@ -202,9 +265,61 @@ pub const Conn = struct {
     /// 「序列号永不重置」，重置会让后续每个包的 MAC 都对不上。
     fn onRekey(self: *Conn, p: []const u8) !void {
         log.debug("ssh: client requested rekey", .{});
+        self.rekey_busy = true;
+        defer self.rekey_busy = false;
+
         const kr = try ssh.rekey(self.t, self.host_key, self.alloc, p);
         kr.deinit(self.alloc);
-        log.info("ssh: rekey ok", .{});
+        log.info("ssh: rekey ok (client-initiated)", .{});
+        try self.drainStash();
+    }
+
+    /// 该不该由**我们**发起重协商。
+    ///
+    /// 两个条件都必要：配置了阈值、且不在 KEX 中间。没有 `rekey_busy` 的话，
+    /// 客户端 KEX 期间堆到 `acc` 里的包被补投时有可能再次触发，形成递归。
+    fn shouldRekey(self: *const Conn) bool {
+        if (self.rekey_busy or self.rekey_limit == 0) return false;
+        return self.t.bytesSinceKex() >= self.rekey_limit;
+    }
+
+    /// 服务端主动发起重协商（RFC 4253 §9）。
+    ///
+    /// 与客户端主动的唯一区别：KEXINIT 由我们**先**发（`ssh.kex` 的第一步就是
+    /// 发自己的 KEXINIT），然后才读对端的。这里必须处理「两边同时发起」的
+    /// 竞争 —— 对端可能已经发过 KEXINIT，也可能还在发 `CHANNEL_DATA`；后者
+    /// 由 `t.stash` 收下来，KEX 完成后再补投。
+    fn serverRekey(self: *Conn) !void {
+        log.info("ssh: initiating rekey after {d} bytes", .{self.t.bytesSinceKex()});
+        self.rekey_busy = true;
+        defer self.rekey_busy = false;
+
+        const kr = try ssh.kex(self.t, self.host_key, self.alloc);
+        kr.deinit(self.alloc);
+        log.info("ssh: rekey ok (server-initiated)", .{});
+        try self.drainStash();
+    }
+
+    /// 把 KEX 期间暂存的包按原顺序补投给消息处理逻辑。
+    ///
+    /// 每个包用一个独立的 arena：它们的生命周期与正常循环里读到的包一致，
+    /// 处理完就整块释放。返回的错误语义也和主循环相同（`ChannelClosed` /
+    /// `PeerDisconnect` 都表示连接该收尾了）。
+    ///
+    /// ⚠ 返回类型写死 `anyerror`：`drainStash → dispatch → onChannelData →
+    /// sendData → waitForWindow → onRekey → drainStash` 是一个环，全靠推断
+    /// 错误集的话 `-Osmall`（`ReleaseSmall`）会报 "dependency loop"。显式写
+    /// 出来就断了这条推断链。
+    fn drainStash(self: *Conn) anyerror!void {
+        while (self.stash.popFront()) |payload| {
+            defer self.alloc.free(payload);
+
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+
+            log.debug("ssh: replaying stashed msg {d} (len={d})", .{ payload[0], payload.len });
+            try self.dispatch(arena.allocator(), payload);
+        }
     }
 
     fn unimplemented(self: *Conn, a: std.mem.Allocator) !void {
@@ -224,7 +339,12 @@ pub const Conn = struct {
     /// （OpenSSH 自己会发 `CLOSE`，所以只测 OpenSSH 发现不了。）
     ///
     /// 发不出去不算错误：对端已经走了，连接本来就要关。
+    ///
+    /// 幂等：`closing` 已经是 true 就直接返回 —— 收到对端的 `CLOSE` 时不能再
+    /// 回一个（§5.3 只要求「还没发的那个」回）。
     fn closeChannel(self: *Conn) void {
+        if (self.closing) return;
+        self.closing = true;
         var b = Buf.init(self.alloc);
         defer b.deinit();
         for ([_]u8{ MSG_CHANNEL_EOF, MSG_CHANNEL_CLOSE }) |msg| {
@@ -526,14 +646,18 @@ pub const Conn = struct {
     }
 };
 
-/// 一条完整连接的入口：握手 → 消息循环。
-pub fn run(
-    alloc: std.mem.Allocator,
-    stream: std.Io.net.Stream,
+/// 一条连接需要的全部外部依赖 + 策略。用结构体而不是继续加形参：
+/// 每加一个可选行为就多一个位置参数，调用点迟早传错顺序。
+pub const ServerConfig = struct {
     host_key: ssh.HostKey,
     handler: SftpHandler,
     auth: Auth,
-) !void {
+    /// 服务端主动 rekey 的字节阈值，0 = 不主动发起。见 `Conn.rekey_limit`。
+    rekey_limit: u64 = 0,
+};
+
+/// 一条完整连接的入口：握手 → 消息循环。
+pub fn run(alloc: std.mem.Allocator, stream: std.Io.net.Stream, config: ServerConfig) !void {
     const io = rt.io();
     var rbuf: [32 * 1024]u8 = undefined;
     var srd = stream.reader(io, &rbuf);
@@ -548,9 +672,10 @@ pub fn run(
     };
     defer t.deinit();
 
-    try ssh.handshake(&t, host_key, alloc);
+    try ssh.handshake(&t, config.host_key, alloc);
 
-    var c = Conn.init(alloc, &t, host_key, handler, auth);
+    var c = Conn.init(alloc, &t, config.host_key, config.handler, config.auth);
+    c.rekey_limit = config.rekey_limit;
     defer c.deinit();
     try c.loop();
 }
@@ -581,7 +706,7 @@ fn stubHandle(
     _: *Buf,
 ) anyerror!void {}
 
-fn stubVerify(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) bool {
+fn stubVerify(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8) bool {
     return true;
 }
 
@@ -670,4 +795,130 @@ test "ssh/channel: 收尾必须发 EOF + CLOSE 两个包" {
 
     try testing.expectEqual(MSG_CHANNEL_CLOSE, w[first_total + 5]);
     try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, w[first_total + 6 ..][0..4], .big));
+}
+
+test "ssh/channel: 收到 EOF 后要继续读到对端的 CLOSE 才能收尾" {
+    // 只发 EOF+CLOSE 就关 socket 会在 Windows 上收尾成 RST（对端还排着一个
+    // `CLOSE` 没被读走，close 时内核直接 reset）。客户端看到的是**随机**报错：
+    // `Software caused connection abort` / `Remote side unexpectedly closed
+    // network connection` —— 文件传完了、rm 也成功了，最后 quit 那一下报错。
+    // 实测 PuTTY psftp 12 次里挂 5 次，靠 `tools/sftp_interop.py` 才发现。
+    var rd = std.Io.Reader.fixed(&.{});
+    var out = std.Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+
+    var t = ssh.Transport{ .alloc = testing.allocator, .rd = &rd, .wr = &out.writer };
+    defer t.deinit();
+
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 9);
+    var hk = try ssh.HostKey.fromSeed(testing.allocator, seed);
+    defer hk.deinit(testing.allocator);
+
+    var c = Conn.init(testing.allocator, &t, hk, .{
+        .ctx = undefined,
+        .handleFn = stubHandle,
+    }, .{
+        .ctx = undefined,
+        .verifyFn = stubVerify,
+    });
+    defer c.deinit();
+    c.remote_id = 7;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // ① 收到 EOF：发收尾包，但**不**结束会话。
+    try c.dispatch(a, &.{ MSG_CHANNEL_EOF, 0, 0, 0, 0 });
+    try testing.expect(c.closing);
+    try testing.expect(out.written().len > 0);
+    const sent = out.written().len;
+
+    // ② 对端在 CLOSE 之前又发了个包：丢弃，既不转发也不报错。
+    try c.dispatch(a, &.{ MSG_CHANNEL_DATA, 0, 0, 0, 0, 0, 0, 0, 0 });
+    try testing.expectEqual(@as(u32, 1), c.closing_discards);
+    try testing.expectEqual(sent, out.written().len);
+
+    // ③ 对端的 CLOSE 到了：收尾返回，且**不能**再回一个 CLOSE。
+    try testing.expectError(error.ChannelClosed, c.dispatch(a, &.{ MSG_CHANNEL_CLOSE, 0, 0, 0, 0 }));
+    try testing.expectEqual(sent, out.written().len);
+}
+
+test "ssh/channel: 只有到达字节阈值、且不在 KEX 中，才由服务端发起 rekey" {
+    var rd = std.Io.Reader.fixed(&.{});
+    var out = std.Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+
+    var t = ssh.Transport{ .alloc = testing.allocator, .rd = &rd, .wr = &out.writer };
+    defer t.deinit();
+
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 3);
+    var hk = try ssh.HostKey.fromSeed(testing.allocator, seed);
+    defer hk.deinit(testing.allocator);
+
+    var c = Conn.init(testing.allocator, &t, hk, .{
+        .ctx = undefined,
+        .handleFn = stubHandle,
+    }, .{
+        .ctx = undefined,
+        .verifyFn = stubVerify,
+    });
+    defer c.deinit();
+
+    // 阈值 0 = 不主动发起（客户端仍可自己发起，那条路径一直支持）。
+    try testing.expect(!c.shouldRekey());
+
+    c.rekey_limit = 1024;
+    try testing.expect(!c.shouldRekey()); // 一个字节都没走
+    t.kex_bytes_in = 600;
+    t.kex_bytes_out = 423;
+    try testing.expect(!c.shouldRekey()); // 1023 < 1024，差一个字节也不行
+    t.kex_bytes_out = 424;
+    try testing.expect(c.shouldRekey()); // 正好 1024
+
+    // 正在 KEX 时不能再触发：补投的包会走到这里，递归发起会把连接搅乱。
+    c.rekey_busy = true;
+    try testing.expect(!c.shouldRekey());
+}
+
+test "ssh/channel: KEX 期间暂存的包按原顺序补投（EOF 先到就先进收尾态）" {
+    var rd = std.Io.Reader.fixed(&.{});
+    var out = std.Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+
+    var t = ssh.Transport{ .alloc = testing.allocator, .rd = &rd, .wr = &out.writer };
+    defer t.deinit();
+
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 4);
+    var hk = try ssh.HostKey.fromSeed(testing.allocator, seed);
+    defer hk.deinit(testing.allocator);
+
+    var c = Conn.init(testing.allocator, &t, hk, .{
+        .ctx = undefined,
+        .handleFn = stubHandle,
+    }, .{
+        .ctx = undefined,
+        .verifyFn = stubVerify,
+    });
+    defer c.deinit();
+    c.remote_id = 9;
+
+    // 服务端主动 KEX 期间，客户端还在发 `CHANNEL_DATA` / `EOF`：这些包必须
+    // 先存下来、NEWKEYS 之后按原顺序补投，直接丢就是「上传随机卡住」。
+    try c.stash.push(testing.allocator, &.{ MSG_CHANNEL_EOF, 0, 0, 0, 0 });
+    try c.stash.push(testing.allocator, &.{ MSG_CHANNEL_DATA, 0, 0, 0, 0, 0, 0, 0, 0 });
+    try testing.expectEqual(@as(usize, 2), c.stash.len());
+
+    try c.drainStash();
+
+    // 顺序正确才会是这个结果：EOF 先进收尾态并发出收尾包，随后的 DATA 被
+    // 当作「收尾后到达的包」丢弃。顺序反了的话 DATA 会被正常处理（不计数），
+    // 而 `closing` 仍会是 false。
+    try testing.expect(c.closing);
+    try testing.expectEqual(@as(usize, 0), c.stash.len());
+    try testing.expectEqual(@as(u32, 1), c.closing_discards);
+    try testing.expect(out.written().len > 0);
 }

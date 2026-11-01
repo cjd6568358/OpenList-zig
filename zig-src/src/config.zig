@@ -97,6 +97,12 @@ pub const Config = struct {
     /// 每次重启换密钥会让所有客户端弹 known_hosts 警告，所以这个文件要跟
     /// `config.json` 一样持久化。
     sftp_host_key: []const u8,
+    /// 服务端主动换密钥（rekey）的阈值，单位 MiB；0 = 不主动发起。
+    ///
+    /// RFC 4253 §9 只要求「传够量就换」，阈值由实现定。OpenSSH 客户端默认
+    /// 1 GB / 1 小时后自己发起 —— 那条路径一直支持。这一项是给**服务端**
+    /// 强制策略用的（客户端不改配置也换）。默认 1024，与 OpenSSH 同量级。
+    sftp_rekey_mb: i64,
     tls_insecure_skip_verify: bool,
     max_connections: i64,
     max_concurrency: i64,
@@ -638,6 +644,7 @@ pub fn load(alloc: std.mem.Allocator, path: []const u8) !*Config {
     if (has_address) cfg.sftp_address = str(cfg.root.getPath("sftp.address"), cfg.sftp_address);
     if (has_port) cfg.sftp_port = int(cfg.root.getPath("sftp.port"), cfg.sftp_port);
     cfg.sftp_host_key = str(cfg.root.getPath("sftp.host_key"), "data/ssh_host_ed25519_key");
+    cfg.sftp_rekey_mb = int(cfg.root.getPath("sftp.rekey_mb"), 1024);
     cfg.tls_insecure_skip_verify = boolean(cfg.root.getPath("tls_insecure_skip_verify"), false);
     cfg.max_connections = int(cfg.root.getPath("max_connections"), 0);
     cfg.max_concurrency = int(cfg.root.getPath("max_concurrency"), 64);

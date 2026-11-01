@@ -178,6 +178,21 @@ const CtrCipher = struct {
 // 主机密钥
 // ---------------------------------------------------------------------------
 
+/// 私钥文件的权限：**只给属主读写**。
+///
+/// 文件里是 32 字节 ed25519 seed —— 拿到它就能冒充这台服务器（客户端只会
+/// 看到「主机密钥已更改」，而用户通常直接按 yes）。默认 0666 & ~umask 在多数
+/// 机器上落成 0644，同组/其他用户可读，所以必须显式收紧。
+///
+/// ⚠ Windows 没有 POSIX mode：`Permissions` 在那里只有只读属性，`fromMode`
+/// 根本不存在。Windows 上要等价于 0600 得改 DACL（`SetNamedSecurityInfo`），
+/// 而部署目标（光猫 / Linux）不需要；这里退化成默认权限并在调用点记一行
+/// 日志，不假装已经保护好了。
+const key_permissions: std.Io.File.Permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode"))
+    .fromMode(0o600)
+else
+    .default_file;
+
 pub const HostKey = struct {
     kp: Ed25519.KeyPair,
     /// `string "ssh-ed25519" || string pubkey` —— KEX 里原样发送。
@@ -203,6 +218,10 @@ pub const HostKey = struct {
                 log.warn("ssh: host key file {s} is short ({d} bytes); regenerating", .{ path, n });
                 io.random(&seed);
                 writeSeed(io, path, seed);
+            } else {
+                // 老版本写出来的是 0644：文件存在时权限不会因为 createFile 的
+                // `permissions` 改变，必须显式收紧一次。
+                tightenPermissions(io, f, path);
             }
         } else |_| {
             io.random(&seed);
@@ -217,13 +236,31 @@ pub const HostKey = struct {
             // 0.17：`Dir.makePath` 改名 `createDirPath`。
             std.Io.Dir.cwd().createDirPath(io, dir) catch {};
         }
-        var f = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch |e| {
+        var f = std.Io.Dir.cwd().createFile(io, path, .{
+            .truncate = true,
+            .permissions = key_permissions,
+        }) catch |e| {
             log.warn("ssh: cannot write host key {s}: {s} (using an ephemeral key)", .{ path, @errorName(e) });
             return;
         };
         defer f.close(io);
+        tightenPermissions(io, f, path);
         f.writeStreamingAll(io, &seed) catch |e| {
             log.warn("ssh: cannot write host key {s}: {s}", .{ path, @errorName(e) });
+        };
+    }
+
+    /// 把已有文件的权限收到 0600。
+    ///
+    /// 失败不致命（文件已经能读），但要说出来：权限没收紧意味着私钥仍然对
+    /// 其他用户可读，而这正是这个函数存在的唯一理由。
+    fn tightenPermissions(io: std.Io, f: std.Io.File, path: []const u8) void {
+        if (comptime !@hasDecl(std.Io.File.Permissions, "fromMode")) {
+            log.debug("ssh: host key {s}: POSIX modes are unavailable on this platform; set the ACL by hand", .{path});
+            return;
+        }
+        f.setPermissions(io, key_permissions) catch |e| {
+            log.warn("ssh: cannot chmod 0600 {s}: {s}", .{ path, @errorName(e) });
         };
     }
 
@@ -254,6 +291,52 @@ pub const HostKey = struct {
 // 传输层
 // ---------------------------------------------------------------------------
 
+/// KEX 期间收到的非 KEX 包的暂存队列（见 `Transport.stash`）。
+///
+/// 两道上限都是为了让「恶意/异常客户端」只能撑爆连接、不能撑爆内存：
+///
+///   * `max_bytes` = 4 MiB，比我们宣告的 2 MiB 接收窗口宽一倍；
+///   * `max_items` = 256，够 8 KiB 分片的客户端发满一个窗口。
+///
+/// 超限直接报错断连。静默丢弃是更坏的选择：客户端会一直等一个永远不会来的
+/// 回复（上传卡死），而我们这边什么日志都没有。
+pub const Stash = struct {
+    items: std.ArrayListUnmanaged([]u8) = .empty,
+    bytes: usize = 0,
+
+    pub const max_bytes: usize = 4 * 1024 * 1024;
+    pub const max_items: usize = 256;
+
+    pub fn deinit(self: *Stash, a: std.mem.Allocator) void {
+        for (self.items.items) |it| a.free(it);
+        self.items.deinit(a);
+        self.* = .{};
+    }
+
+    pub fn len(self: *const Stash) usize {
+        return self.items.items.len;
+    }
+
+    /// 复制一份 payload 存起来 —— `pkt.raw` 马上就会被释放，不能只存切片。
+    pub fn push(self: *Stash, a: std.mem.Allocator, payload: []const u8) !void {
+        if (self.items.items.len >= max_items or self.bytes + payload.len > max_bytes) {
+            return error.TooManyPendingPackets;
+        }
+        const copy = try a.dupe(u8, payload);
+        errdefer a.free(copy);
+        try self.items.append(a, copy);
+        self.bytes += copy.len;
+    }
+
+    /// 取出最早的一个（所有权转移给调用方，`a.free` 释放）。
+    pub fn popFront(self: *Stash) ?[]u8 {
+        if (self.items.items.len == 0) return null;
+        const first = self.items.orderedRemove(0);
+        self.bytes -= first.len;
+        return first;
+    }
+};
+
 pub const Transport = struct {
     alloc: std.mem.Allocator,
     rd: *std.Io.Reader,
@@ -272,6 +355,29 @@ pub const Transport = struct {
     kexinit_sent: []u8 = &.{},
     kexinit_recv: []u8 = &.{},
     session_id: ?[32]u8 = null,
+
+    /// 上一次 KEX 完成之后进出的字节数（含 MAC，含长度字段）。
+    ///
+    /// 只为一个用途存在：决定**服务端**什么时候该主动换密钥。RFC 4253 §9
+    /// 只说「该换」，具体阈值由实现定（OpenSSH 默认 1 GB / 1 小时，由客户端
+    /// 发起）。没有这个计数，服务端就永远只能被动跟着客户端的节奏走。
+    kex_bytes_in: u64 = 0,
+    kex_bytes_out: u64 = 0,
+
+    /// 服务端主动 rekey 时，KEX 期间收到的**非 KEX** 包暂存到这里。
+    ///
+    /// 为什么需要：我们发出 KEXINIT 之后，客户端还没看到它，仍可能继续发
+    /// `CHANNEL_DATA`（RFC 4253 §9 只禁止「自己发完 KEXINIT 再发别的」，
+    /// 不禁止对端）。这些包必须先收下来、等 NEWKEYS 完成后再交给连接层，
+    /// 直接丢掉等于吞掉客户端的请求（表现为上传随机失败）。
+    ///
+    /// 为什么不会无限增长：我们宣告的接收窗口是 2 MiB，客户端最多再发这么多
+    /// 就会被窗口卡住。`Stash` 按字节和条数双限，超了就断开而不是吃内存。
+    stash: ?*Stash = null,
+
+    pub fn bytesSinceKex(self: *const Transport) u64 {
+        return self.kex_bytes_in + self.kex_bytes_out;
+    }
 
     pub fn deinit(self: *Transport) void {
         if (self.client_version.len > 0) self.alloc.free(self.client_version);
@@ -361,6 +467,7 @@ pub const Transport = struct {
         const padlen = body[0];
         if (padlen < 4 or @as(usize, padlen) + 1 > len) return error.BadPadding;
         self.seq_in +%= 1;
+        self.kex_bytes_in += 4 + len + (if (self.mac_in != null) @as(u64, 32) else 0);
         return .{ .raw = body, .payload = body[1 .. len - padlen] };
     }
 
@@ -393,8 +500,10 @@ pub const Transport = struct {
             if (self.enc_out) |*c| c.xor(buf);
             try self.wr.writeAll(buf);
             try self.wr.writeAll(&mac);
+            self.kex_bytes_out += total + 32;
         } else {
             try self.wr.writeAll(buf);
+            self.kex_bytes_out += total;
         }
         try self.wr.flush();
         self.seq_out +%= 1;
@@ -452,14 +561,18 @@ fn kexFailInfo(e: anyerror) KexFail {
     };
 }
 
-/// KEX 期间读包：跳过 `IGNORE` / `DEBUG` / `UNIMPLEMENTED`。
+/// KEX 期间读包：跳过 `IGNORE` / `DEBUG` / `UNIMPLEMENTED`，只返回 KEX 消息。
 ///
 /// RFC 4253 §11.3 允许这几种消息插在任何两个包之间，且它们不占用 KEX 的
 /// 消息序号。不跳过的话，一个发了 `IGNORE` 的客户端会让 KEX 直接失败。
 /// 返回整块的所有权（`OwnedPacket`）—— 首次 KEX 走的是 gpa，调用方必须释放。
-fn readKexPacket(t: *Transport, a: std.mem.Allocator) !Transport.OwnedPacket {
-    var i: usize = 0;
-    while (i < 8) : (i += 1) {
+///
+/// `stash` 非空（服务端主动 rekey）时，**非 KEX 的包**会被暂存而不是返回：
+/// 我们发出 KEXINIT 后、对端看到它之前，仍可能继续发 `CHANNEL_DATA`。这些
+/// 包必须在 NEWKEYS 之后补投，丢掉就是「上传到一半卡住」。
+fn readKexPacket(t: *Transport, a: std.mem.Allocator, stash: ?*Stash) !Transport.OwnedPacket {
+    var tries: usize = 0;
+    while (tries < 512) : (tries += 1) {
         const p = try t.readPacketOwned(a);
         if (p.payload.len == 0) {
             p.deinit(a);
@@ -471,7 +584,17 @@ fn readKexPacket(t: *Transport, a: std.mem.Allocator) !Transport.OwnedPacket {
                 p.deinit(a);
                 return error.PeerDisconnect;
             },
-            else => return p,
+            // KEXINIT / NEWKEYS + 30..49（KEX 专用消息号段，RFC 4253 §12）。
+            MSG_KEXINIT, MSG_NEWKEYS, 30...49 => return p,
+            else => {
+                if (stash) |s| {
+                    s.push(t.alloc, p.payload) catch |e| {
+                        p.deinit(a);
+                        return e;
+                    };
+                    p.deinit(a);
+                } else return p;
+            },
         }
     }
     return error.TooManyGenericPackets;
@@ -490,6 +613,7 @@ pub const KexResult = struct {
 /// 走完一次完整 KEX：协商 → ECDH → 签名 → NEWKEYS → 安装密钥。
 ///
 /// `a` 是**连接级** allocator：`k_mpint` 要活到密钥派生结束。
+/// 重协商时的非 KEX 包暂存见 `Transport.stash`。
 pub fn kex(t: *Transport, host_key: HostKey, a: std.mem.Allocator) !KexResult {
     return kexInner(t, host_key, a, null);
 }
@@ -548,7 +672,7 @@ fn kexInner(
             return e;
         };
     } else {
-        const pkt = try readKexPacket(t, a);
+        const pkt = try readKexPacket(t, a, t.stash);
         defer pkt.deinit(a);
         if (pkt.payload.len < 1 or pkt.payload[0] != MSG_KEXINIT) return error.ExpectedKexInit;
         if (t.kexinit_recv.len > 0) a.free(t.kexinit_recv);
@@ -561,7 +685,7 @@ fn kexInner(
 
     // ---- 3. 收 KEX_ECDH_INIT，拿 Q_C ----
     const q_c: []const u8 = blk: {
-        const pkt = try readKexPacket(t, a);
+        const pkt = try readKexPacket(t, a, t.stash);
         defer pkt.deinit(a);
         if (pkt.payload.len < 1 or pkt.payload[0] != MSG_KEX_ECDH_INIT) return error.ExpectedEcdhInit;
         var r = Reader{ .buf = pkt.payload[1..] };
@@ -616,7 +740,7 @@ fn kexInner(
     // ---- 7. NEWKEYS 双向 ----
     try t.sendMsg(MSG_NEWKEYS, "");
     {
-        const pkt = try readKexPacket(t, a);
+        const pkt = try readKexPacket(t, a, t.stash);
         defer pkt.deinit(a);
         if (pkt.payload.len < 1 or pkt.payload[0] != MSG_NEWKEYS) return error.ExpectedNewKeys;
     }
@@ -641,6 +765,11 @@ fn kexInner(
     t.enc_out = CtrCipher.init(key_s2c, iv_s2c);
     t.mac_out = mac_s2c;
     t.session_id = session_id;
+
+    // 计数归零：下一次「该换密钥了吗」从这一刻重新算。KEX 自身那几十个包
+    // 不该算进去，否则阈值一低就会连续 rekey 直到连接抖动。
+    t.kex_bytes_in = 0;
+    t.kex_bytes_out = 0;
 
     return .{ .h = h_hash, .session_id = session_id, .k_mpint = k_bytes };
 }
@@ -923,4 +1052,142 @@ test "ssh: KEX 失败路径不泄漏（读到的包必须释放）" {
     // 我们发出去的 KEXINIT 必须已经记在 Transport 上（否则 H 算出别的值）。
     try testing.expect(t.kexinit_sent.len > 0);
     try testing.expect(t.kexinit_recv.len > 0);
+}
+
+// ---------------------------------------------------------------------------
+// 测试：服务端主动 rekey 的暂存队列
+// ---------------------------------------------------------------------------
+
+test "ssh: KEX 期间的非 KEX 包进暂存队列，KEX 包照常返回" {
+    // 服务端主动换密钥时，客户端还没看到我们的 KEXINIT，仍可能继续发
+    // CHANNEL_DATA。这些包必须收下来（NEWKEYS 之后补投），不能丢 —— 丢了
+    // 就是「上传到一半卡住」，而且服务端没有任何日志。
+    // 反过来，KEX 消息本身不能被吞进队列，否则密钥交换永远走不完。
+    var wire = Buf.init(testing.allocator);
+    defer wire.deinit();
+
+    // 先写 CHANNEL_DATA（msg 94），再写 KEXINIT（msg 20）。
+    {
+        var sink = std.Io.Writer.Allocating.init(testing.allocator);
+        defer sink.deinit();
+        var no_in = std.Io.Reader.fixed(&.{});
+        var tw = Transport{ .alloc = testing.allocator, .rd = &no_in, .wr = &sink.writer };
+
+        var data_pkt = Buf.init(testing.allocator);
+        defer data_pkt.deinit();
+        try data_pkt.appendByte(94);
+        try putU32(&data_pkt, 7); // recipient channel
+        try putString(&data_pkt, "hello");
+        try tw.writePacket(data_pkt.slice());
+
+        var kex_pkt = Buf.init(testing.allocator);
+        defer kex_pkt.deinit();
+        try kex_pkt.appendByte(MSG_KEXINIT);
+        try kex_pkt.append(&fill(16, 0));
+        try putNameList(&kex_pkt, "curve25519-sha256");
+        try putNameList(&kex_pkt, "ssh-ed25519");
+        try putNameList(&kex_pkt, "aes128-ctr");
+        try putNameList(&kex_pkt, "aes128-ctr");
+        try putNameList(&kex_pkt, "hmac-sha2-256");
+        try putNameList(&kex_pkt, "hmac-sha2-256");
+        try putNameList(&kex_pkt, "none");
+        try putNameList(&kex_pkt, "none");
+        try putNameList(&kex_pkt, "");
+        try putNameList(&kex_pkt, "");
+        try kex_pkt.appendByte(0);
+        try putU32(&kex_pkt, 0);
+        try tw.writePacket(kex_pkt.slice());
+
+        try wire.append(sink.written());
+    }
+
+    var rd = std.Io.Reader.fixed(wire.slice());
+    var out = std.Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+
+    var st = Stash{};
+    defer st.deinit(testing.allocator);
+
+    var t = Transport{ .alloc = testing.allocator, .rd = &rd, .wr = &out.writer, .stash = &st };
+    defer t.deinit();
+
+    const pkt = try readKexPacket(&t, testing.allocator, t.stash);
+    defer pkt.deinit(testing.allocator);
+
+    try testing.expectEqual(MSG_KEXINIT, pkt.payload[0]);
+    try testing.expectEqual(@as(usize, 1), st.len());
+
+    // 补投时必须还是那条 CHANNEL_DATA，内容一字不差。
+    const replayed = st.popFront().?;
+    defer testing.allocator.free(replayed);
+    try testing.expectEqual(@as(u8, 94), replayed[0]);
+    var r = Reader{ .buf = replayed[1..] };
+    try testing.expectEqual(@as(u32, 7), try r.u32v());
+    try testing.expectEqualStrings("hello", try r.string());
+    try testing.expectEqual(@as(usize, 0), st.len());
+}
+
+test "ssh: 暂存队列有上限（超了报错而不是吃内存）" {
+    // 一个窗口最多 2 MiB 的 CHANNEL_DATA；队列按字节封顶 4 MiB，所以正常
+    // 客户端永远碰不到这个上限。恶意客户端会，那时必须断开而不是继续攒。
+    var st = Stash{};
+    defer st.deinit(testing.allocator);
+
+    const chunk = try testing.allocator.alloc(u8, 1024 * 1024);
+    defer testing.allocator.free(chunk);
+    @memset(chunk, 0xaa);
+
+    var i: usize = 0;
+    while (i < 4) : (i += 1) try st.push(testing.allocator, chunk);
+    try testing.expectEqual(@as(usize, 4 * 1024 * 1024), st.bytes);
+    try testing.expectError(error.TooManyPendingPackets, st.push(testing.allocator, chunk));
+}
+
+test "ssh: 读包计数会累加，KEX 完成后归零" {
+    // 服务端主动 rekey 的触发依据就是这两个计数。不累加 ⇒ 永远不换密钥；
+    // 不归零 ⇒ 阈值一到每轮循环都触发，连接直接抖死。
+    var rd = std.Io.Reader.fixed(&.{});
+    var out = std.Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+
+    var t = Transport{ .alloc = testing.allocator, .rd = &rd, .wr = &out.writer };
+    defer t.deinit();
+
+    try t.writePacket(&[_]u8{ 2, 0, 0, 0 });
+    const after_one = t.bytesSinceKex();
+    try testing.expect(after_one > 0);
+    try testing.expectEqual(after_one, t.kex_bytes_out);
+
+    t.kex_bytes_in = 0;
+    t.kex_bytes_out = 0;
+    try testing.expectEqual(@as(u64, 0), t.bytesSinceKex());
+}
+
+test "ssh: 主机密钥文件权限是 0600" {
+    // 文件里是 32 字节 ed25519 seed：拿到它就能冒充这台服务器。默认权限
+    // （0666 & ~umask）通常是 0644 —— 同组用户可读。这条测试同时钉住两件事：
+    // 首次生成会落盘，且落盘后的 mode 是 0600。Windows 没有 POSIX mode，
+    // 跳过。
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/host_ed25519", .{root});
+    defer testing.allocator.free(path);
+
+    var hk = try HostKey.loadOrCreate(testing.allocator, path);
+    defer hk.deinit(testing.allocator);
+
+    var f = try std.Io.Dir.cwd().openFile(rt.io(), path, .{});
+    defer f.close(rt.io());
+    const st = try f.stat(rt.io());
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.mode)) & 0o777);
+
+    // 再加载一次必须是同一把密钥（known_hosts 不能天天变）。
+    var again = try HostKey.loadOrCreate(testing.allocator, path);
+    defer again.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, hk.blob, again.blob);
 }

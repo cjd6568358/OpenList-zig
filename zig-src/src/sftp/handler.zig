@@ -151,6 +151,13 @@ const ReadState = struct {
     alloc: std.mem.Allocator,
     link: model.Link,
     size: u64,
+    /// `size` 是否可信。
+    ///
+    /// 不少驱动（分享类、部分网盘）`details()` 里 `size` 是 0 或 -1。把它当成
+    /// 真实大小会让每个 `READ` 都在 `offset >= size` 处直接回 `EOF` ——
+    /// 表现是「文件能列出来，但读出来是空的」。这类源只能按「Range 请求实际
+    /// 返回多少」判断结尾，所以这里必须区分「大小是 0」和「大小未知」。
+    size_known: bool = true,
     /// 窗口缓存：`[cache_off, cache_off + cache_len)` 的字节。
     cache: []u8 = &.{},
     cache_off: u64 = 0,
@@ -531,6 +538,10 @@ fn handleOpen(c: *Context, sess: *session.Session, a: std.mem.Allocator, r: *pro
     const flags_raw = try r.readU32();
     _ = try r.readAttrs(); // 创建时的初始属性：虚拟路径无意义，丢弃
     const flags = protocol.OpenFlags.fromInt(flags_raw);
+    // SFTP 的 OPEN 失败只回一个状态码，客户端不会告诉你它到底想要什么。
+    // 把「路径 + 原始 flags」记下来是排查写路径唯一可靠的手段 —— `wb` 与
+    // `r+b`（续传）走的是完全不同的分支。
+    log.debug("sftp: open {s} flags=0x{x}", .{ raw, flags_raw });
 
     const n = sess.resolve(raw) catch {
         try protocol.writeStatus(out, id, .no_such_file);
@@ -580,8 +591,21 @@ fn handleOpen(c: *Context, sess: *session.Session, a: std.mem.Allocator, r: *pro
         .alloc = c.alloc,
         .link = owned,
         .size = if (f.size > 0) @intCast(f.size) else 0,
+        // `size <= 0` 有两种含义：真空文件（0）和「驱动没报大小」（-1 / 未填）。
+        // 把后者当成 0 会让 READ 永远回 EOF（能列出、读出来是空的）。所以
+        // 只有正数才算「已知」，其余交给「按 Range 实际返回判断结尾」。
+        .size_known = f.size > 0,
     } };
-    if (owned.local_size > 0) st.read.size = owned.local_size;
+    if (owned.local_size > 0) {
+        st.read.size = owned.local_size;
+        st.read.size_known = true;
+    }
+    // 内存源（`text`）：字节就在手上，大小天然可信 —— 否则 `details()` 报了 0
+    // 的驱动会把这类源也判成「读完 0 字节就是 EOF」。
+    if (owned.text) |txt| {
+        st.read.size = txt.len;
+        st.read.size_known = true;
+    }
 
     const path = try sess.alloc.dupe(u8, n.path);
     const hid = sess.addHandle(path, .file) catch |e| {
@@ -599,10 +623,11 @@ fn handleOpen(c: *Context, sess: *session.Session, a: std.mem.Allocator, r: *pro
 /// 写模式 `OPEN`：在 `temp_dir` 里建一个空文件，`WRITE` 往里 pwrite，
 /// `CLOSE` 时一次 `put` 到目标驱动。
 ///
-/// **不支持断点续传**：`write` 但没有 `trunc`、且目标已存在时，明确回
-/// `op_unsupported`。真要支持得先把现有内容拉到 temp 再覆盖写 —— 那是另一条
-/// 完整的下载路径，等有需求再做。主流客户端（rclone / WinSCP / FileZilla）
-/// 上传都用 `write|creat|trunc`，不受影响。
+/// **断点续传**：`write` 但没有 `trunc`、且目标已存在时，先把现有内容拉进
+/// temp，客户端的 `WRITE` 就在这份内容上按 offset 覆盖（`preloadExisting`）。
+/// 预载失败——比如驱动不支持 Range、或现有文件超过 `max_write_bytes`——仍然
+/// 明确回 `op_unsupported`，绝不「假装续传」：客户端会从它以为的位置开始写，
+/// 前面那段就成了空洞，文件上传成功却缺一块，而且没有任何报错。
 fn openForWrite(
     c: *Context,
     sess: *session.Session,
@@ -630,10 +655,9 @@ fn openForWrite(
         try protocol.writeStatus(out, id, .failure); // O_EXCL 撞上已存在的文件
         return;
     }
-    if (!flags.trunc and exists) {
-        try protocol.writeStatus(out, id, .op_unsupported); // 续传未实现
-        return;
-    }
+    // 不带 `trunc` 打开已存在的文件 = 续写。要不要真的续，等 temp 建起来
+    // 再决定（预载失败会明确拒绝，见函数头）。
+    const want_resume = !flags.trunc and exists;
 
     // ⚠ 分配顺序是**刻意的**：所有可能失败的内存分配都排在 `createFile`
     // 之前。temp 文件一旦建起来，能收掉它的只有两条路径 —— `FileState.release`
@@ -662,11 +686,17 @@ fn openForWrite(
     // 句柄读会得到 `AccessDenied`，症状是「上传完成但 close 报权限不足」。
     const f = std.Io.Dir.cwd().createFile(rt.io(), tmp_path, .{ .truncate = true, .read = true }) catch |e| {
         log.warn("sftp: cannot create temp {s}: {s}", .{ tmp_path, @errorName(e) });
+        // 回状态失败就向上抛：那时 vpath / st 由 errdefer 收尾，这里的显式
+        // 释放一个都不会跑（也就不会有二次释放）。
+        try protocol.writeStatus(out, id, .failure);
+        // ⚠ 这四行不能省：`return` 是**正常返回**，errdefer 不会跑。
+        // 只释放 tmp_path / p 会把 vpath_owned 和 st 一起漏掉 —— 这个泄漏
+        // 是新加的「续传被拒」用例用 `testing.allocator` 抓出来的（同一套
+        // 写法在下面 resume 分支也修过）。
         c.alloc.free(tmp_path);
         sess.alloc.free(p);
-        // 回状态失败就向上抛：那时 vpath / st 由 errdefer 收尾，tmp 与 p
-        // 已经手动释放过了，不会有任何人被释放两次。
-        try protocol.writeStatus(out, id, .failure);
+        c.alloc.free(vpath_owned);
+        c.alloc.destroy(st);
         return;
     };
     // createFile 之后**不再有**可能失败的分配。这个 errdefer 只在上面那条
@@ -683,6 +713,25 @@ fn openForWrite(
         .vpath = vpath_owned,
         .append = flags.append,
     } };
+
+    // 续写：把现有内容预载进 temp。放在 `st.*` 初始化之后，失败路径只需要
+    // 复刻 createFile 失败那套清理（先回状态、再手动释放 tmp_path / p）。
+    if (want_resume) {
+        st.write.size = preloadExisting(c, &dctx, t, f, c.max_write_bytes) catch |e| {
+            log.warn("sftp: cannot resume {s}: {s}", .{ vpath, @errorName(e) });
+            // 顺序与 createFile 失败分支一致：回状态失败就向上抛，由 errdefer
+            // 收尾 fd / temp / vpath / st，这里的显式释放一个都不会跑。
+            try protocol.writeStatus(out, id, .op_unsupported);
+            // 正常返回 ⇒ errdefer 不跑 ⇒ 这一份也得手动收干净。
+            f.close(rt.io());
+            std.Io.Dir.cwd().deleteFile(rt.io(), tmp_path) catch {};
+            c.alloc.free(tmp_path);
+            sess.alloc.free(p);
+            c.alloc.free(vpath_owned);
+            c.alloc.destroy(st);
+            return;
+        };
+    }
 
     const hid = sess.addHandle(p, .file) catch |e| {
         // 先回状态、再释放：回状态失败时走 error 返回，由 errdefer 收尾
@@ -701,7 +750,65 @@ fn openForWrite(
     sess.setExtra(hid, st, FileState.release);
 }
 
+/// 断点续传：把目标上已有的内容预载进 temp 文件，返回预载的字节数。
+///
+/// 不带 `trunc` 打开已存在的文件，语义是「保留原内容、只覆盖我写的那段」
+/// （draft-ietf-secsh-filexfer-02 §6.3）。不预载就直接收 `WRITE`，客户端从
+/// 它以为的续传点开始写，前面那段就是空洞 —— 上传「成功」但内容缺一块。
+///
+/// 任何一步不成立（驱动不给 link、不支持 Range、现有文件超过写入上限、
+/// 上游比声明的短）都返回错误，由调用方明确拒绝，而不是猜。
+fn preloadExisting(
+    c: *Context,
+    dctx: *driver.Ctx,
+    t: Target,
+    f: std.Io.File,
+    limit: u64,
+) !u64 {
+    const det = try t.driver.details(dctx, t.rel);
+    if (det.is_dir) return error.NotSupported;
+    // ⚠ `size == 0` 有两种含义：真空文件，和「驱动不报大小」（`handleOpen` 里
+    // 的判定就是 `size > 0` 才算已知）。当成空文件并返回 0 会**假装续传成功**：
+    // 客户端接着从它以为的 offset 写，前面那段就是空洞 —— 正是本函数要避免的
+    // 「上传成功却缺一块」。区分不了就明确拒绝，客户端会退回 trunc 重传。
+    if (det.size <= 0) return error.NotSupported;
+    const size: u64 = @intCast(det.size);
+    // 整份内容都要落在 temp 里，所以和普通上传吃同一道容量闸。
+    if (limit > 0 and size > limit) return error.NotSupported;
+
+    const lk = try t.driver.link(dctx, t.rel, .{});
+    const owned = try dupLink(c.alloc, lk);
+    defer freeLink(c.alloc, owned);
+
+    // 内存源：字节就在手上，不必绕 fetcher（它未必认得 `text` 形式的 link）。
+    if (owned.text) |txt| {
+        if (txt.len < size) return error.NotSupported;
+        try std.Io.File.writePositionalAll(f, rt.io(), txt[0..@intCast(size)], 0);
+        return size;
+    }
+
+    const fetcher = c.fetcher orelse return error.NotSupported;
+
+    var off: u64 = 0;
+    while (off < size) {
+        // 每块一个 arena：把整份文件挂在请求 arena 上会直接吃光内存 ——
+        // 断点续传的典型场景恰恰是大文件。
+        var arena = std.heap.ArenaAllocator.init(c.alloc);
+        defer arena.deinit();
+
+        const want: u32 = @intCast(@min(@as(u64, read_window), size - off));
+        const got = try fetcher.fetch(arena.allocator(), owned, off, want);
+        // 上游比声明的短（或直接回空）：这份内容不完整，续写上去就是残缺文件。
+        if (got.len == 0) return error.NotSupported;
+
+        try std.Io.File.writePositionalAll(f, rt.io(), got, off);
+        off += got.len;
+    }
+    return off;
+}
+
 fn handleRead(c: *Context, sess: *session.Session, a: std.mem.Allocator, r: *protocol.Reader, out: *Buf) !void {
+    _ = a; // 读路径的缓冲挂在连接级（`ReadState` 的窗口缓存），不用请求 arena
     const id = try r.readU32();
     const handle = try r.readString();
     const offset = try r.readU64();
@@ -729,23 +836,42 @@ fn handleRead(c: *Context, sess: *session.Session, a: std.mem.Allocator, r: *pro
         },
     };
 
-    if (offset >= rs.size) {
+    if (rs.size_known and offset >= rs.size) {
         try protocol.writeStatus(out, id, .eof);
         return;
     }
     var n: u64 = want;
     if (n > max_read_len) n = max_read_len;
-    if (offset + n > rs.size) n = rs.size - offset;
+    if (rs.size_known and offset + n > rs.size) n = rs.size - offset;
 
-    const data = readAt(c, a, rs, offset, @intCast(n)) catch |e| {
-        try protocol.writeStatus(out, id, statusFor(e));
-        return;
+    const data = readAt(c, rs, offset, @intCast(n)) catch |e| switch (e) {
+        // 大小未知的源唯一可靠的结尾信号：Range 请求返回 0 字节。
+        // 回 `EOF` 而不是 `FAILURE`，客户端才会正常收尾。
+        error.EndOfStream => {
+            try protocol.writeStatus(out, id, .eof);
+            return;
+        },
+        // ⚠ `OutOfRange` 只在**大小未知**时才算 EOF。大小已知时它是「上游没给
+        // 够字节」（`readAt` 末尾那条），必须回 FAILURE —— 当成 EOF 的话客户端
+        // 会认为文件就这么长，下载出一个残缺文件而且没有任何错误。
+        error.OutOfRange => {
+            if (rs.size_known) {
+                try protocol.writeStatus(out, id, statusFor(e));
+            } else {
+                try protocol.writeStatus(out, id, .eof);
+            }
+            return;
+        },
+        else => {
+            try protocol.writeStatus(out, id, statusFor(e));
+            return;
+        },
     };
     try protocol.writeData(out, id, data);
 }
 
 /// 从 `st` 的窗口缓存里取 `[offset, offset+len)`。未命中时拉一整个窗口。
-fn readAt(c: *Context, a: std.mem.Allocator, st: *ReadState, offset: u64, len: usize) ![]const u8 {
+fn readAt(c: *Context, st: *ReadState, offset: u64, len: usize) ![]const u8 {
     // 内存源：直接切片，不经过缓存（`text` 已经是连接级内存）。
     if (st.link.text) |t| {
         const start: usize = @intCast(offset);
@@ -761,9 +887,9 @@ fn readAt(c: *Context, a: std.mem.Allocator, st: *ReadState, offset: u64, len: u
     }
 
     const f = c.fetcher orelse return error.NotSupported;
-    // 拉一整个窗口，但不超过文件末尾。
+    // 拉一整个窗口，但不超过文件末尾（大小未知时不夹）。
     var win: u64 = read_window;
-    if (offset + win > st.size) win = st.size - offset;
+    if (st.size_known and offset + win > st.size) win = st.size - offset;
     if (win < len) win = len;
 
     const got = try f.fetch(c.alloc, st.link, offset, @intCast(win));
@@ -772,9 +898,15 @@ fn readAt(c: *Context, a: std.mem.Allocator, st: *ReadState, offset: u64, len: u
     st.cache_off = offset;
     st.cache_len = got.len;
 
-    if (got.len < len) return error.OutOfRange;
-    _ = a;
-    return got[0..len];
+    if (got.len >= len) return got[0..len];
+    // 短读 = 到文件末尾了。大小未知的源只能靠这个判断结尾，所以这里**不能**
+    // 报错：报错会让客户端看到 FAILURE，而正确行为是给它剩余的那几个字节，
+    // 下一轮 READ 再拿到长度 0 → EOF。
+    if (!st.size_known) {
+        if (got.len == 0) return error.EndOfStream;
+        return got[0..got.len];
+    }
+    return error.OutOfRange;
 }
 
 fn handleClose(c: *Context, sess: *session.Session, a: std.mem.Allocator, r: *protocol.Reader, out: *Buf) !void {
@@ -1178,6 +1310,11 @@ const MemDriver = struct {
     last_remove_is_dir: ?bool = null,
     /// true 时 `link` 返回 `url`（逼 handler 走 fetcher），否则返回 `text`。
     use_url: bool = false,
+    /// true 时 `details()` 报 `size = 0`，模拟「驱动不告诉大小」。
+    /// `list()` 不受影响 —— 真实驱动也是这样：列表里能看见，`details` 没有。
+    report_zero_size: bool = false,
+    /// `put` 收到的路径，断言用（`null` = 还没人上传过）。
+    last_put_path: ?[]u8 = null,
 
     fn deinit(self: *MemDriver) void {
         for (self.entries.items) |e| {
@@ -1185,6 +1322,7 @@ const MemDriver = struct {
             self.alloc.free(e.data);
         }
         self.entries.deinit(self.alloc);
+        if (self.last_put_path) |p| self.alloc.free(p);
     }
 
     fn addDir(self: *MemDriver, path: []const u8) !void {
@@ -1256,7 +1394,7 @@ const MemDriver = struct {
         const e = self.find(path) orelse return error.NotFound;
         return .{
             .name = std.fs.path.basename(path),
-            .size = @intCast(e.data.len),
+            .size = if (self.report_zero_size) 0 else @as(i64, @intCast(e.data.len)),
             .is_dir = e.is_dir,
             .modified = e.modified,
         };
@@ -1315,11 +1453,32 @@ const MemDriver = struct {
     }
 
     fn putFn(ptr: *anyopaque, ctx: *driver.Ctx, dst: []const u8, src: model.Source) anyerror!void {
-        _ = ptr;
         _ = ctx;
-        _ = dst;
-        _ = src;
-        return error.NotSupported; // 写路径本轮不接
+        const self: *MemDriver = @ptrCast(@alignCast(ptr));
+        const total = src.size();
+        if (total < 0) return error.BadSource;
+
+        const buf = try self.alloc.alloc(u8, @intCast(total));
+        errdefer self.alloc.free(buf);
+        var got: usize = 0;
+        while (got < buf.len) {
+            const n = try src.readAt(got, buf[got..]);
+            if (n == 0) return error.UnexpectedEof;
+            got += n;
+        }
+
+        if (self.find(dst)) |e| {
+            if (e.is_dir) return error.NotSupported;
+            self.alloc.free(e.data);
+            e.data = buf;
+        } else {
+            const p = try self.alloc.dupe(u8, dst);
+            errdefer self.alloc.free(p);
+            try self.entries.append(self.alloc, .{ .path = p, .data = buf, .is_dir = false });
+        }
+
+        if (self.last_put_path) |old| self.alloc.free(old);
+        self.last_put_path = try self.alloc.dupe(u8, dst);
     }
 };
 
@@ -1327,6 +1486,10 @@ const MemDriver = struct {
 const MemFetcher = struct {
     mem: *MemDriver,
     calls: usize = 0,
+    /// 非空 = 只给到这么多字节，模拟「驱动报了 size，但上游少给内容」
+    /// （截断的 CDN 响应、限速返回部分正文）。用来钉住「已知大小的短读必须
+    /// 报错，不能当 EOF」。
+    truncate_at: ?usize = null,
 
     fn fetcher(self: *MemFetcher) Fetcher {
         return .{ .ctx = self, .fetchFn = fetchFn };
@@ -1337,8 +1500,9 @@ const MemFetcher = struct {
         self.calls += 1;
         const e = self.mem.find(link.url) orelse return error.NotFound;
         const start: usize = @intCast(offset);
-        if (start >= e.data.len) return error.OutOfRange;
-        const end = @min(start + len, e.data.len);
+        const limit = if (self.truncate_at) |t| @min(t, e.data.len) else e.data.len;
+        if (start >= limit) return error.OutOfRange;
+        const end = @min(start + len, limit);
         return alloc.dupe(u8, e.data[start..end]);
     }
 };
@@ -1388,6 +1552,12 @@ const Fixture = struct {
     sess: session.Session,
     c: Context,
     arena: std.heap.ArenaAllocator,
+    /// 写路径用的临时目录（绝对路径），`null` = 没配 ⇒ 写路径整体不可用。
+    ///
+    /// 类型必须是 `[:0]u8`：`realPathFileAlloc` 返回的是带哨兵的分配，
+    /// 擦成 `[]u8` 之后 `testing.allocator` 会因为「释放长度比分配长度少 1」
+    /// 直接 panic。
+    temp_dir: ?[:0]u8 = null,
 
     fn init(use_url: bool) Fixture {
         return .{
@@ -1409,10 +1579,19 @@ const Fixture = struct {
         };
     }
 
+    /// 给写路径准备一个真实临时目录。`handler` 用的是 `cwd()` + 绝对路径，
+    /// 所以这里必须拿真实路径而不是 TmpDir 的相对名。
+    fn withTempDir(self: *Fixture, tmp: *std.testing.TmpDir) !void {
+        const root = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+        self.temp_dir = root;
+        self.c.temp_dir = root;
+    }
+
     fn deinit(self: *Fixture) void {
         self.sess.deinit();
         self.mem.deinit();
         self.arena.deinit();
+        if (self.temp_dir) |d| testing.allocator.free(d);
     }
 
     fn a(self: *Fixture) std.mem.Allocator {
@@ -1929,4 +2108,241 @@ test "sftp/handler: 虚拟根可 STAT 且可 OPENDIR（列挂载点）" {
         defer out.deinit();
         try expectStatus(try f.send(.readdir, rbody.slice(), &out), .eof);
     }
+}
+
+// ---------------------------------------------------------------------------
+// 写路径 / 断点续传 / 大小未知
+// ---------------------------------------------------------------------------
+
+/// 发一个 `OPEN`，返回句柄的 4 字节拷贝（句柄在 arena 里，必须复制出来）。
+fn openHandle(
+    f: *Fixture,
+    id: u32,
+    path: []const u8,
+    flags: protocol.OpenFlags,
+    out: *Buf,
+) !?[4]u8 {
+    out.clearRetainingCapacity();
+    var body = Buf.init(testing.allocator);
+    defer body.deinit();
+    var w = protocol.Writer.init(&body);
+    try w.writeU32(id);
+    try w.writeString(path);
+    try w.writeU32(flags.toInt());
+    try w.writeAttrs(.{});
+
+    const pkt = try f.send(.open, body.slice(), out);
+    if (pkt.packet_type == .status) return null;
+    try testing.expectEqual(protocol.PacketType.handle, pkt.packet_type);
+    var r = protocol.Reader.init(pkt.body);
+    _ = try r.readU32();
+    const h = try r.readString();
+    try testing.expectEqual(@as(usize, 4), h.len);
+    var copy: [4]u8 = undefined;
+    @memcpy(&copy, h);
+    return copy;
+}
+
+fn writeReq(f: *Fixture, id: u32, handle: [4]u8, offset: u64, data: []const u8, out: *Buf) !protocol.Packet {
+    out.clearRetainingCapacity();
+    var body = Buf.init(testing.allocator);
+    defer body.deinit();
+    var w = protocol.Writer.init(&body);
+    try w.writeU32(id);
+    try w.writeString(&handle);
+    try w.writeU64(offset);
+    try w.writeString(data);
+    return f.send(.write, body.slice(), out);
+}
+
+fn readReq(f: *Fixture, id: u32, handle: [4]u8, offset: u64, len: u32, out: *Buf) !protocol.Packet {
+    out.clearRetainingCapacity();
+    var body = Buf.init(testing.allocator);
+    defer body.deinit();
+    var w = protocol.Writer.init(&body);
+    try w.writeU32(id);
+    try w.writeString(&handle);
+    try w.writeU64(offset);
+    try w.writeU32(len);
+    return f.send(.read, body.slice(), out);
+}
+
+fn closeReq(f: *Fixture, id: u32, handle: [4]u8, out: *Buf) !protocol.Packet {
+    out.clearRetainingCapacity();
+    var body = Buf.init(testing.allocator);
+    defer body.deinit();
+    var w = protocol.Writer.init(&body);
+    try w.writeU32(id);
+    try w.writeString(&handle);
+    return f.send(.close, body.slice(), out);
+}
+
+test "sftp/handler: OPEN(write|creat|trunc) → WRITE → CLOSE 内容逐字节一致" {
+    // 写路径整条链路：temp 稀疏文件 + pwrite + CLOSE 时整份 put。
+    // 之前完全没测过 —— 覆盖它的唯一办法是真客户端上传，而那种测试在 CI 里
+    // 跑不了（要起服务、要真实驱动）。
+    var f = Fixture.init(false);
+    f.start();
+    defer f.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try f.withTempDir(&tmp);
+
+    var out = Buf.init(f.a());
+    defer out.deinit();
+    const h = (try openHandle(&f, 1, "/new.txt", .{ .write = true, .creat = true, .trunc = true }, &out)) orelse
+        return error.TestUnexpectedResult;
+
+    // 两段按 offset 写，第二段从 5 开始，正好接上第一段。
+    try expectStatus(try writeReq(&f, 2, h, 0, "hello", &out), .ok);
+    try expectStatus(try writeReq(&f, 3, h, 5, " world", &out), .ok);
+    try expectStatus(try closeReq(&f, 4, h, &out), .ok);
+
+    const e = f.mem.find("/new.txt") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("hello world", e.data);
+    try testing.expectEqualStrings("/new.txt", f.mem.last_put_path.?);
+}
+
+test "sftp/handler: 不带 trunc 打开已存在文件会预载原内容（断点续传）" {
+    // 语义来自 draft-ietf-secsh-filexfer-02 §6.3：不带 TRUNC 打开就是「保留
+    // 原内容，只覆盖我写的那段」。不预载的话客户端从 offset 10 开始写，
+    // 前 10 字节就是空洞 —— 上传成功、内容缺一块、没有任何报错。
+    var f = Fixture.init(false);
+    f.start();
+    defer f.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try f.withTempDir(&tmp);
+    try f.mem.addFile("/r.bin", "0123456789");
+
+    var out = Buf.init(f.a());
+    defer out.deinit();
+    const h = (try openHandle(&f, 1, "/r.bin", .{ .write = true, .creat = true }, &out)) orelse
+        return error.TestUnexpectedResult;
+
+    try expectStatus(try writeReq(&f, 2, h, 10, "abc", &out), .ok);
+    try expectStatus(try closeReq(&f, 3, h, &out), .ok);
+
+    const e = f.mem.find("/r.bin") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("0123456789abc", e.data);
+}
+
+test "sftp/handler: 续传拿不到 link 时明确拒绝，不静默截断" {
+    // 驱动不给 link（`linkFn` 只在 `use_url` 时给 url，这里没有 fetcher 可用）
+    // ⇒ 预载不了。这时必须回 `op_unsupported`：放行的话客户端会从 offset>0
+    // 开始写，temp 是空的，传上去的文件前面一大段都是零字节。
+    var f = Fixture.init(true); // use_url = true，但没有 fetcher
+    f.start();
+    defer f.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try f.withTempDir(&tmp);
+    try f.mem.addFile("/r.bin", "0123456789");
+
+    var out = Buf.init(f.a());
+    defer out.deinit();
+    const maybe = try openHandle(&f, 1, "/r.bin", .{ .write = true, .creat = true }, &out);
+    try testing.expectEqual(@as(?[4]u8, null), maybe);
+    try expectStatus((try protocol.parse(out.slice())).?, .op_unsupported);
+
+    // 目标没被动过。
+    const e = f.mem.find("/r.bin") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("0123456789", e.data);
+}
+
+test "sftp/handler: 驱动不报 size 时按实际返回判 EOF（不是恒 EOF）" {
+    // `details().size` 是 0 / -1 的驱动（分享类、部分网盘）以前会让每个 READ
+    // 都在 `offset >= 0` 处直接回 EOF —— 表现是「文件能列出来，但读出来是
+    // 空的」。这类源只能靠 Range 请求实际返回多少来判断结尾。
+    var f = Fixture.init(true); // use_url ⇒ 走 fetcher
+    f.start();
+    defer f.deinit();
+    f.mem.report_zero_size = true;
+    try f.mem.addFile("/u.txt", "abcdef");
+
+    var mf = MemFetcher{ .mem = &f.mem };
+    f.c.fetcher = mf.fetcher();
+
+    var out = Buf.init(f.a());
+    defer out.deinit();
+    const h = (try openHandle(&f, 1, "/u.txt", .{}, &out)) orelse return error.TestUnexpectedResult;
+
+    {
+        const pkt = try readReq(&f, 2, h, 0, 64, &out);
+        try testing.expectEqual(protocol.PacketType.data, pkt.packet_type);
+        var r = protocol.Reader.init(pkt.body);
+        _ = try r.readU32();
+        try testing.expectEqualStrings("abcdef", try r.readString());
+    }
+    // 越过末尾：fetcher 报 OutOfRange ⇒ 回 EOF（不是 FAILURE）。
+    try expectStatus(try readReq(&f, 3, h, 6, 64, &out), .eof);
+}
+
+test "sftp/handler: 大小未知时窗口预算不被 size 夹成 0" {
+    // 回归细节：`readAt` 里 `win = size - offset` 在 size 未知（0）时会把窗口
+    // 夹成 0，于是 fetch(0 字节) 永远返回空 —— 与「恒 EOF」是同一个 bug 的
+    // 两种表现，修了 handleRead 却没修这里就还是读不出东西。
+    var f = Fixture.init(true);
+    f.start();
+    defer f.deinit();
+    f.mem.report_zero_size = true;
+    try f.mem.addFile("/v.bin", "0123456789");
+
+    var mf = MemFetcher{ .mem = &f.mem };
+    f.c.fetcher = mf.fetcher();
+
+    var out = Buf.init(f.a());
+    defer out.deinit();
+    const h = (try openHandle(&f, 1, "/v.bin", .{}, &out)) orelse return error.TestUnexpectedResult;
+
+    const pkt = try readReq(&f, 2, h, 4, 4, &out);
+    try testing.expectEqual(protocol.PacketType.data, pkt.packet_type);
+    var r = protocol.Reader.init(pkt.body);
+    _ = try r.readU32();
+    try testing.expectEqualStrings("4567", try r.readString());
+}
+
+test "sftp/handler: 大小已知时上游短读必须报错，不能当 EOF（静默截断）" {
+    // 驱动报了 6 字节，上游只给 3 字节（截断的 CDN 响应、限速只回半截）。
+    // 把它当 EOF 的话客户端认为「文件就这么长」，下载出一个残缺文件、零错误
+    // —— 和「上传成功但少一块」是同一类问题，只是方向反过来。
+    // 正确行为：FAILURE，让客户端明确失败；只有**大小未知**时短读才等于 EOF。
+    var f = Fixture.init(true); // use_url ⇒ 走 fetcher
+    f.start();
+    defer f.deinit();
+    try f.mem.addFile("/t.bin", "abcdef");
+
+    var mf = MemFetcher{ .mem = &f.mem, .truncate_at = 3 };
+    f.c.fetcher = mf.fetcher();
+
+    var out = Buf.init(f.a());
+    defer out.deinit();
+    const h = (try openHandle(&f, 1, "/t.bin", .{}, &out)) orelse return error.TestUnexpectedResult;
+
+    // 一次要 6 字节，只回来 3 ⇒ 不是 data、也不是 eof。
+    try expectStatus(try readReq(&f, 2, h, 0, 6, &out), .failure);
+}
+
+test "sftp/handler: 驱动不报大小时不假装续传（拒绝而不是留空洞）" {
+    // `size == 0` 无法区分「真空文件」和「驱动不报大小」。当成空文件并返回
+    // 成功，客户端接着从它以为的 offset 写，前面那段就是空洞 —— 正是续传
+    // 要避免的「上传成功却缺一块」。必须明确回 `op_unsupported`。
+    var f = Fixture.init(false);
+    f.start();
+    defer f.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try f.withTempDir(&tmp);
+    f.mem.report_zero_size = true;
+    try f.mem.addFile("/z.bin", "0123456789");
+
+    var out = Buf.init(f.a());
+    defer out.deinit();
+    const maybe = try openHandle(&f, 1, "/z.bin", .{ .write = true, .creat = true }, &out);
+    try testing.expectEqual(@as(?[4]u8, null), maybe);
+    try expectStatus((try protocol.parse(out.slice())).?, .op_unsupported);
+
+    // 目标没被动过。
+    const e = f.mem.find("/z.bin") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("0123456789", e.data);
 }

@@ -29,6 +29,7 @@ const builtin = @import("builtin");
 const Buf = @import("util/buf.zig").Buf;
 const List = @import("util/buf.zig").List;
 const url = @import("util/url.zig");
+const peeraddr = @import("util/peeraddr.zig");
 const model = @import("model.zig");
 const log = @import("log.zig");
 const rt = @import("rt.zig");
@@ -218,6 +219,15 @@ pub const Request = struct {
     host: []const u8 = "",
     /// Set when the request arrived with a valid session cookie / bearer token.
     user: []const u8 = "",
+    /// 对端 IP（**不带端口**），拿不到时为空串。
+    ///
+    /// 只用于把认证失败计数按来源分桶：全局计数意味着任何人都能把管理员
+    /// 账户锁 5 分钟。端口必须排除 —— 扫描器每次源端口都不同，带上端口
+    /// 就等于每个连接一个桶，限速彻底失效（`docs/STATUS.md` §9）。
+    ///
+    /// 生命周期：每条连接一份，指向 `serveConn` 栈上的缓冲；请求处理期间
+    /// 一直有效，处理器不得把它存起来。
+    peer_ip: []const u8 = "",
 
     pub fn header(self: *const Request, name: []const u8) ?[]const u8 {
         for (self.headers) |h| {
@@ -675,12 +685,18 @@ pub const Server = struct {
         const rd = &srd.interface;
 
         var served: u32 = 0;
+
+        // 对端 IP 每条连接只查一次（一次 syscall），之后每个请求共享。
+        // 拿不到就是空串 —— 认证失败计数会退化到全局桶，而不是拒绝服务。
+        var peer_buf: [peeraddr.max_len]u8 = undefined;
+        const peer_ip = peeraddr.ipString(&peer_buf, stream) orelse "";
+
         while (served < self.opts.max_keepalive) : (served += 1) {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
             const a = arena.allocator();
 
-            var req = Request{ .arena = a };
+            var req = Request{ .arena = a, .peer_ip = peer_ip };
             const parsed = self.readRequest(rd, a, &req) catch |e| switch (e) {
                 error.ConnectionClosed => return,
                 error.HeaderTooLarge => {
