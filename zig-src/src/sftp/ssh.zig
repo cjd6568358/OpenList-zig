@@ -1353,7 +1353,14 @@ test "ssh: 主机密钥文件权限是 0600" {
     var f = try std.Io.Dir.cwd().openFile(rt.io(), path, .{});
     defer f.close(rt.io());
     const st = try f.stat(rt.io());
-    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.mode)) & 0o777);
+    // ⚠ 0.17 的 `Io.File.Stat` 没有 `mode` 字段，POSIX 权限在 `permissions`
+    // （`enum(mode_t)`）里，取位用 `@intFromEnum` —— 与 `drivers/local.zig`
+    // 的 mkdir_perm 测试同一写法。曾经这里写 `st.mode`：Windows 上被上面的
+    // comptime 跳过（函数体后半段不分析）永远测不出来，**Linux 上一编译就
+    // 炸**——打包机的测试闸门从 d41acfcc 起就是这么断的，直到 2026-11-02
+    // 重建时才暴露。
+    const mode: u32 = @intCast(@intFromEnum(st.permissions));
+    try testing.expectEqual(@as(u32, 0o600), mode & 0o777);
 
     // 再加载一次必须是同一把密钥（known_hosts 不能天天变）。
     var again = try HostKey.loadOrCreate(testing.allocator, path);
