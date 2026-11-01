@@ -1146,8 +1146,14 @@ fn resolveBindAddress(name: []const u8, port: u16) !std.Io.net.IpAddress {
     return found orelse error.UnknownHostName;
 }
 
-fn applyTimeouts(stream: std.Io.net.Stream, seconds: u32) void {
-    if (seconds == 0) return;
+/// Apply socket-level read/write timeouts.
+///
+/// `seconds == 0` **clears** a previously applied timeout (Linux: zero timeval
+/// = disabled). The SSH path relies on that: a short pre-auth budget is
+/// applied on accept and removed once the client authenticates, restoring
+/// OpenSSH-style unlimited idle for interactive sessions. For this file's own
+/// callers on fresh sockets, "clear" and the previous "skip" behave the same.
+pub fn applyTimeouts(stream: std.Io.net.Stream, seconds: u32) void {
     // `comptime` so the branch is not analysed on Windows, where
     // `std.posix.setsockopt` is a compile error by design.
     if (comptime builtin.os.tag == .windows) return;

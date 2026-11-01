@@ -579,15 +579,30 @@ fn kexFailInfo(e: anyerror) KexFail {
 /// 我们发出 KEXINIT 后、对端看到它之前，仍可能继续发 `CHANNEL_DATA`。这些
 /// 包必须在 NEWKEYS 之后补投，丢掉就是「上传到一半卡住」。
 fn readKexPacket(t: *Transport, a: std.mem.Allocator, stash: ?*Stash) !Transport.OwnedPacket {
+    // 「杂项预算」只数需要跳过的包（空包 / IGNORE / DEBUG / UNIMPLEMENTED）。
+    //
+    // ⚠ 进暂存队列的包**不占预算**：Stash 自带条数 + 字节两道上限，就是干
+    // 这个的。曾经的写法把 stash 的包也计入 512 次循环预算，而合法最坏值
+    // 恰好是 ~512 条（psftp 的 4 KiB WRITE × 2 MiB 在飞窗口）—— 预算正好
+    // 压死它自己论证过的场景：高 BDP 链路上客户端在处理我们的 KEXINIT
+    // 之前已经把整整一个窗口的数据发在飞，第 513 个包（KEXINIT）永远读
+    // 不到，连接被断，客户端看到的又是 `Software caused connection abort`。
+    // 局域网 BDP 小，48 次 rekey 全 PASS 也测不出来。
     var tries: usize = 0;
-    while (tries < 512) : (tries += 1) {
+    while (true) {
         const p = try t.readPacketOwned(a);
         if (p.payload.len == 0) {
             p.deinit(a);
+            tries += 1;
+            if (tries >= 512) return error.TooManyGenericPackets;
             continue;
         }
         switch (p.payload[0]) {
-            MSG_IGNORE, MSG_DEBUG, MSG_UNIMPLEMENTED => p.deinit(a),
+            MSG_IGNORE, MSG_DEBUG, MSG_UNIMPLEMENTED => {
+                p.deinit(a);
+                tries += 1;
+                if (tries >= 512) return error.TooManyGenericPackets;
+            },
             MSG_DISCONNECT => {
                 p.deinit(a);
                 return error.PeerDisconnect;
@@ -611,7 +626,6 @@ fn readKexPacket(t: *Transport, a: std.mem.Allocator, stash: ?*Stash) !Transport
             },
         }
     }
-    return error.TooManyGenericPackets;
 }
 
 pub const KexResult = struct {
@@ -669,8 +683,12 @@ fn kexInner(
         try b.appendByte(0); // first_kex_packet_follows
         try putU32(&b, 0);
 
+        // 先 dupe 后 free：dupe 失败（OOM）时字段仍指向旧值，`Transport.deinit`
+        // 还能正常释放；先 free 的话失败路径上字段就是悬垂，deinit 二次释放
+        // —— 重协商让这条路径的执行频率不再是可以忽略的。
+        const new_sent = try a.dupe(u8, b.slice());
         if (t.kexinit_sent.len > 0) a.free(t.kexinit_sent);
-        t.kexinit_sent = try a.dupe(u8, b.slice());
+        t.kexinit_sent = new_sent;
         try t.writePacket(b.slice());
     }
 
@@ -679,8 +697,9 @@ fn kexInner(
     // KEX 才从线上读 —— 读到的包归本作用域，用完要释放（首次 KEX 用的
     // allocator 是连接级的 gpa，不释放就是每条连接一个泄漏）。
     if (pending_client_kexinit) |p| {
+        const new_recv = try a.dupe(u8, p);
         if (t.kexinit_recv.len > 0) a.free(t.kexinit_recv);
-        t.kexinit_recv = try a.dupe(u8, p);
+        t.kexinit_recv = new_recv;
         checkKexInit(p) catch |e| {
             t.rejectKex(e);
             return e;
@@ -689,8 +708,9 @@ fn kexInner(
         const pkt = try readKexPacket(t, a, t.stash);
         defer pkt.deinit(a);
         if (pkt.payload.len < 1 or pkt.payload[0] != MSG_KEXINIT) return error.ExpectedKexInit;
+        const new_recv = try a.dupe(u8, pkt.payload);
         if (t.kexinit_recv.len > 0) a.free(t.kexinit_recv);
-        t.kexinit_recv = try a.dupe(u8, pkt.payload);
+        t.kexinit_recv = new_recv;
         checkKexInit(pkt.payload) catch |e| {
             t.rejectKex(e);
             return e;
@@ -716,9 +736,16 @@ fn kexInner(
     const shared = X25519.scalarmult(eph.secret_key, q_c_arr) catch return error.BadEcdhKey;
 
     var k_mpint = Buf.init(a);
-    errdefer k_mpint.deinit();
+    // ⚠ `toOwned()` 是**复制**不是移交（`Buf.toOwned` 内部就是 dupe）：原件
+    // 永远要自己释放。挂 `errdefer` 的话，成功路径就是每次 KEX 漏一份
+    // （首握 + 每次重协商），ECDH 之后失败还会漏掉 `k_bytes` 这个孤儿。
+    defer k_mpint.deinit();
     try putMpint(&k_mpint, &shared);
     const k_bytes = try k_mpint.toOwned();
+    // 成功后所有权归 `KexResult`（调用方 `deinit`）；这之后任何一步失败
+    // （签名 / 写包 / 等对端 NEWKEYS 时对端断连 —— 扫描器常见路径）都要
+    // 把它交出来，否则就是泄漏。
+    errdefer a.free(k_bytes);
 
     // ---- 5. H = SHA256(V_C || V_S || I_C || I_S || K_S || Q_C || Q_S || K) ----
     var hb = Buf.init(a);
@@ -1139,6 +1166,115 @@ test "ssh: KEX 期间的非 KEX 包进暂存队列，KEX 包照常返回" {
     try testing.expectEqual(@as(u32, 7), try r.u32v());
     try testing.expectEqualStrings("hello", try r.string());
     try testing.expectEqual(@as(usize, 0), st.len());
+}
+
+/// 测试用：往 `tw` 写一条完整的、协商能通过的 KEXINIT。
+fn appendKexinitPacket(tw: *Transport) !void {
+    var kex_pkt = Buf.init(testing.allocator);
+    defer kex_pkt.deinit();
+    try kex_pkt.appendByte(MSG_KEXINIT);
+    try kex_pkt.append(&fill(16, 0));
+    try putNameList(&kex_pkt, "curve25519-sha256");
+    try putNameList(&kex_pkt, "ssh-ed25519");
+    try putNameList(&kex_pkt, "aes128-ctr");
+    try putNameList(&kex_pkt, "aes128-ctr");
+    try putNameList(&kex_pkt, "hmac-sha2-256");
+    try putNameList(&kex_pkt, "hmac-sha2-256");
+    try putNameList(&kex_pkt, "none");
+    try putNameList(&kex_pkt, "none");
+    try putNameList(&kex_pkt, "");
+    try putNameList(&kex_pkt, "");
+    try kex_pkt.appendByte(0);
+    try putU32(&kex_pkt, 0);
+    try tw.writePacket(kex_pkt.slice());
+}
+
+test "ssh: 暂存的包不占杂项预算（512 预算压死合法窗口的回归）" {
+    // 曾经 readKexPacket 把进 stash 的包也计入 512 次循环预算，而合法最坏值
+    // （psftp 的 4 KiB WRITE × 2 MiB 在飞窗口）≈ 512 条：预算正好卡死它自己
+    // 论证过的场景 —— 高 BDP 链路上客户端的 KEXINIT 排在第 513 个之后，
+    // 永远读不到，连接被断。修法：stash 的包只受自己的双上限约束，预算只数
+    // IGNORE / DEBUG 之类的杂项包。这里放 600 条数据包再放 KEXINIT：旧代码
+    // 在第 512 条时就报 TooManyGenericPackets，新代码必须把 KEXINIT 读到。
+    var wire = Buf.init(testing.allocator);
+    defer wire.deinit();
+
+    {
+        var sink = std.Io.Writer.Allocating.init(testing.allocator);
+        defer sink.deinit();
+        var no_in = std.Io.Reader.fixed(&.{});
+        var tw = Transport{ .alloc = testing.allocator, .rd = &no_in, .wr = &sink.writer };
+
+        var data_pkt = Buf.init(testing.allocator);
+        defer data_pkt.deinit();
+        try data_pkt.appendByte(94);
+        try putU32(&data_pkt, 7);
+        try putString(&data_pkt, "hello");
+        var i: usize = 0;
+        while (i < 600) : (i += 1) try tw.writePacket(data_pkt.slice());
+
+        try appendKexinitPacket(&tw);
+
+        try wire.append(sink.written());
+    }
+
+    var rd = std.Io.Reader.fixed(wire.slice());
+    var out = std.Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+
+    var st = Stash{};
+    defer st.deinit(testing.allocator);
+
+    var t = Transport{ .alloc = testing.allocator, .rd = &rd, .wr = &out.writer, .stash = &st };
+    defer t.deinit();
+
+    const pkt = try readKexPacket(&t, testing.allocator, t.stash);
+    defer pkt.deinit(testing.allocator);
+    try testing.expectEqual(MSG_KEXINIT, pkt.payload[0]);
+    try testing.expectEqual(@as(usize, 600), st.len());
+}
+
+test "ssh: ECDH 之后断连不泄漏（toOwned 的孤儿缓冲）" {
+    // 客户端发完 KEX_ECDH_INIT 就断线：kex 会走到「等对端 NEWKEYS」才失败。
+    // 这时 `k_mpint.toOwned()` 已经复制出 `k_bytes` —— 曾经那里只挂了
+    // `errdefer k_mpint.deinit()`，而 toOwned 是复制不是移交：原件在成功路径
+    // 每次 KEX 漏一份，失败路径还漏掉 `k_bytes` 这个孤儿（约 34 B，但每次
+    // KEX 都漏）。钉住失败路径这一种；成功路径那份只能靠完整握手（e2e 脚本）
+    // 才测得到。用 testing.allocator，漏了就在测试结束时炸出来。
+    var wire = Buf.init(testing.allocator);
+    defer wire.deinit();
+
+    {
+        var sink = std.Io.Writer.Allocating.init(testing.allocator);
+        defer sink.deinit();
+        var no_in = std.Io.Reader.fixed(&.{});
+        var tw = Transport{ .alloc = testing.allocator, .rd = &no_in, .wr = &sink.writer };
+
+        try appendKexinitPacket(&tw);
+
+        // KEX_ECDH_INIT（msg 30）：Q_C 是任意 32 字节 —— X25519 对任意
+        // u 坐标都能算出共享秘密（只有低阶点报错，0x11 重复不在那个集合里）。
+        var ecdh = Buf.init(testing.allocator);
+        defer ecdh.deinit();
+        try ecdh.appendByte(MSG_KEX_ECDH_INIT);
+        try putString(&ecdh, &fill(32, 0x11));
+        try tw.writePacket(ecdh.slice());
+
+        try wire.append(sink.written());
+    }
+
+    var rd = std.Io.Reader.fixed(wire.slice());
+    var out = std.Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+
+    var t = Transport{ .alloc = testing.allocator, .rd = &rd, .wr = &out.writer };
+    defer t.deinit();
+
+    var hk = try HostKey.fromSeed(testing.allocator, fill(32, 9));
+    defer hk.deinit(testing.allocator);
+
+    // 走完 KEXINIT / ECDH / 签名 / 发 NEWKEYS，在「等对端 NEWKEYS」时 EOF。
+    try testing.expectError(error.ConnectionClosed, kex(&t, hk, testing.allocator));
 }
 
 test "ssh: 暂存队列有上限（超了报错而不是吃内存）" {

@@ -10,7 +10,9 @@
 //! 先发 `USERAUTH` 就能直接发 `CHANNEL_OPEN`（RFC 4253 没有强制顺序）。
 //! `onChannelOpen` / `onChannelRequest` / `onChannelData` 三处都查这个
 //! 标志 —— 少任何一处，认证就只是我们自己写的一个字段，端点等于对全网开放。
-//! 所以这里**可以**绑非 loopback，但失败计数目前是全局的，见 `sftp_wire.zig`。
+//! 所以这里**可以**绑非 loopback：认证接了真校验，失败计数按**对端 IP 分桶**
+//! 并与 HTTP/WebDAV 共用（`sftp_wire.sshVerify`，2026-11-01 起），不再是全局
+//! 一个桶（见 `util/peeraddr.zig`）。
 //!
 //! ## 为什么 channel 只支持一个
 //!
@@ -44,6 +46,7 @@ const std = @import("std");
 const ssh = @import("ssh.zig");
 const protocol = @import("protocol.zig");
 const Buf = @import("../util/buf.zig").Buf;
+const http = @import("../http.zig");
 const log = @import("../log.zig");
 const rt = @import("../rt.zig");
 
@@ -72,6 +75,10 @@ const window_low: u32 = window_size / 2;
 const local_max_packet: u32 = 32 * 1024;
 /// 等 `WINDOW_ADJUST` 时最多处理多少个包。超过就放弃等待、照发。
 const window_wait_max: usize = 64;
+
+/// 未认证连接的读写超时（秒）。认证通过后撤掉 —— 交互式会话可以合法地
+/// 静默几分钟，超时只该管「连上来却不认证」的扫描器（见 `run` 的注释）。
+const pre_auth_timeout_s: u32 = 30;
 
 /// SFTP 层的入口：一个完整包进，回复字节出。
 ///
@@ -161,6 +168,10 @@ pub const Conn = struct {
 
     /// 等对端 `CLOSE` 期间丢弃的包数。对端赖着不发就兜底返回，不无限读。
     closing_discards: u32 = 0,
+
+    /// 底层 socket。`run()` 才有它；单测直接构造 Conn 时为 null（不碰超时）。
+    /// 认证通过后用它撤掉 pre-auth 超时，见 `onUserauth`。
+    stream: ?std.Io.net.Stream = null,
 
     pub fn init(alloc: std.mem.Allocator, t: *ssh.Transport, host_key: ssh.HostKey, handler: SftpHandler, auth: Auth) Conn {
         return .{
@@ -385,6 +396,9 @@ pub const Conn = struct {
             if (self.auth.verify(a, user, pw)) {
                 log.info("ssh: password auth ok (user={s})", .{user});
                 self.authenticated = true;
+                // 撤掉 pre-auth 超时（见 `run` 的注释）：从现在起这是一条
+                // 已认证的会话，空闲多久都合法 —— 与 OpenSSH 的默认行为一致。
+                if (self.stream) |s| http.applyTimeouts(s, 0);
                 var b = Buf.init(a);
                 try b.appendByte(MSG_USERAUTH_SUCCESS);
                 try self.t.writePacket(b.slice());
@@ -544,6 +558,15 @@ pub const Conn = struct {
             };
             if (out.len > 0) try self.sendData(a, out.slice());
 
+            // 嵌套 rekey 的兑底：`drainStash → dispatch → onChannelData →
+            // sendData → waitForWindow → onRekey → drainStash` 是一个环（见
+            // `drainStash` 的注释），内层可能已经把 acc（含外层**尚未消费**的
+            // 当前包）消费掉。到这里 acc.len < pkt.consumed 说明当前包已被
+            // 内层处理、游标失效 —— 继续 `acc.len - pkt.consumed` 就是 usize
+            // 下溢（生产 ReleaseSmall 无检查），后面的切片直接越界。能走到
+            // 这一步的客户端必然违反了 RFC 4253 §9（在自己的 KEXINIT 与
+            // NEWKEYS 之间还在发 DATA），断开是正确处置。
+            if (self.acc.len < pkt.consumed) return error.ProtocolCorrupt;
             const rest = self.acc.len - pkt.consumed;
             std.mem.copyForwards(u8, self.acc.data[0..rest], self.acc.data[pkt.consumed..self.acc.len]);
             self.acc.len = rest;
@@ -659,6 +682,12 @@ pub const ServerConfig = struct {
 /// 一条完整连接的入口：握手 → 消息循环。
 pub fn run(alloc: std.mem.Allocator, stream: std.Io.net.Stream, config: ServerConfig) !void {
     const io = rt.io();
+    // pre-auth 超时（P0-A）：未认证的连接此前**完全没有超时** —— 扫描器只要
+    // TCP 连上、一个字节不发（或 KEX 发一半卡住），就占死一个线程加整套
+    // Wire/Session 状态；叠加 accept 无上限，公网可以低成本拖死同进程的
+    // HTTP。HTTP 侧一直有这套（`read_timeout_s`），这里给 SSH 补上。认证
+    // 通过后在 `onUserauth` 里撤掉，恢复与 OpenSSH 一致的「空闲不限时」。
+    http.applyTimeouts(stream, pre_auth_timeout_s);
     var rbuf: [32 * 1024]u8 = undefined;
     var srd = stream.reader(io, &rbuf);
 
@@ -676,6 +705,7 @@ pub fn run(alloc: std.mem.Allocator, stream: std.Io.net.Stream, config: ServerCo
 
     var c = Conn.init(alloc, &t, config.host_key, config.handler, config.auth);
     c.rekey_limit = config.rekey_limit;
+    c.stream = stream;
     defer c.deinit();
     try c.loop();
 }

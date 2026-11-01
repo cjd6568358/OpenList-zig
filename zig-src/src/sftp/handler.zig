@@ -114,6 +114,14 @@ const readdir_page: usize = 64;
 /// `READ` 单次最多返回多少字节。留 1 KiB 余量给 id / 长度前缀 / 字符串头。
 const max_read_len: usize = protocol.max_packet_len - 1024;
 
+/// `READ` / `WRITE` 的 offset 上界（2^48 = 256 TiB），超过任何真实文件。
+/// offset 是客户端可控的 u64：不设上界的话，`at + data.len`（容量闸）、
+/// `offset + len`（缓存命中判断）、fetchHttp 的 `offset + len - 1`（Range 头）
+/// 这类未检查加法在安全构建里直接 panic 整个进程；生产是 ReleaseSmall
+/// （无检查），回绕后容量闸比较被绕过、`w.size` 记成回绕值 —— 行为全靠
+/// 下游 OS 错误兜底。
+const max_file_offset: u64 = 1 << 48;
+
 // ---------------------------------------------------------------------------
 // 句柄私有状态
 // ---------------------------------------------------------------------------
@@ -474,20 +482,29 @@ fn registerDir(
     out: *Buf,
 ) !void {
     const st = try c.alloc.create(DirState);
+    // 只 destroy 结构体本身；entries 由调用方的 errdefer 收（各失败路径的
+    // 归属见下方注释）。setExtra 放在最后，之后没有失败路径。
+    errdefer c.alloc.destroy(st);
     st.* = .{ .alloc = c.alloc, .entries = entries };
 
     const p = try sess.alloc.dupe(u8, path);
     const hid = sess.addHandle(p, .dir) catch |e| {
-        // addHandle 失败时已经接管并释放了 p
-        DirState.release(st, c.alloc);
+        // addHandle 失败时已经接管并释放了 p。先回状态、再释放（与
+        // `openForWrite` 的编排一致）：回状态失败时走 error 返回，st 由
+        // errdefer 收、entries 由调用方的 errdefer 收；先 release 的话
+        // 两边都会被释放两遍。
         try protocol.writeStatus(out, id, statusFor(e));
+        DirState.release(st, c.alloc);
         return;
     };
-    sess.setExtra(hid, st, DirState.release);
 
     var hbuf: [4]u8 = undefined;
     std.mem.writeInt(u32, &hbuf, hid, .big);
     try protocol.writeHandle(out, id, &hbuf);
+    // 回完状态才把 st 交给会话（同 `openForWrite`）：writeHandle 失败时
+    // errdefer 只 destroy 结构体，entries 由调用方收，会话里只留一个
+    // 没有 extra 的句柄。
+    sess.setExtra(hid, st, DirState.release);
 }
 
 fn handleReadDir(sess: *session.Session, a: std.mem.Allocator, r: *protocol.Reader, out: *Buf) !void {
@@ -587,6 +604,11 @@ fn handleOpen(c: *Context, sess: *session.Session, a: std.mem.Allocator, r: *pro
     }
 
     const st = try c.alloc.create(FileState);
+    // st 的 errdefer：setExtra 之前任何一步失败都由它收（link 由上面的
+    // errdefer 收）。setExtra 放在最后一条语句，之后没有失败路径 ——
+    // errdefer 与 `FileState.release` 不会同时跑到同一个 st 上（同
+    // `openForWrite` 的编排，见它末尾的注释）。
+    errdefer c.alloc.destroy(st);
     st.* = .{ .read = .{
         .alloc = c.alloc,
         .link = owned,
@@ -609,15 +631,21 @@ fn handleOpen(c: *Context, sess: *session.Session, a: std.mem.Allocator, r: *pro
 
     const path = try sess.alloc.dupe(u8, n.path);
     const hid = sess.addHandle(path, .file) catch |e| {
-        FileState.release(st, c.alloc);
+        // 先回状态、再释放（与 `openForWrite` 的编排一致）：回状态失败时走
+        // error 返回，由 errdefer 收掉 st 与 link；先 release 的话，这里和
+        // errdefer 会把同一份内存释放两遍（512 句柄打满 + 回状态 OOM 即可
+        // 确定性触发，testing.allocator 当场抓出来）。
         try protocol.writeStatus(out, id, statusFor(e));
+        FileState.release(st, c.alloc);
         return;
     };
-    sess.setExtra(hid, st, FileState.release);
 
     var hbuf: [4]u8 = undefined;
     std.mem.writeInt(u32, &hbuf, hid, .big);
     try protocol.writeHandle(out, id, &hbuf);
+    // 回完状态才把 st 交给会话：这之后没有失败路径；writeHandle 失败时
+    // errdefer 收尾，会话里只留一个没有 extra 的句柄，关掉即可。
+    sess.setExtra(hid, st, FileState.release);
 }
 
 /// 写模式 `OPEN`：在 `temp_dir` 里建一个空文件，`WRITE` 往里 pwrite，
@@ -836,6 +864,14 @@ fn handleRead(c: *Context, sess: *session.Session, a: std.mem.Allocator, r: *pro
         },
     };
 
+    // 越过任何可能的真实文件末尾（2^48）⇒ 等价 past-EOF，直接回 EOF。
+    // 同时把客户端可控的 u64 钳住：后面 `offset + n`、`offset + win`、
+    // fetchHttp 的 `offset + len - 1` 才不会回绕（见 `max_file_offset`）。
+    if (offset > max_file_offset) {
+        try protocol.writeStatus(out, id, .eof);
+        return;
+    }
+
     if (rs.size_known and offset >= rs.size) {
         try protocol.writeStatus(out, id, .eof);
         return;
@@ -988,6 +1024,16 @@ fn handleWrite(c: *Context, sess: *session.Session, a: std.mem.Allocator, r: *pr
     };
 
     const at: u64 = if (w.append) w.size else offset;
+
+    // 显式 offset 超过任何真实文件（2^48）：直接失败并置 failed。不钳的话
+    // `at + data.len` 会回绕（见 `max_file_offset`）—— 容量闸失效、
+    // `w.size` 记错；置了 failed，后续 CLOSE 会丢弃 temp，不会把垃圾传上去。
+    if (!w.append and offset > max_file_offset) {
+        log.warn("sftp: write offset {d} over max_file_offset {d}", .{ offset, max_file_offset });
+        w.failed = true;
+        try protocol.writeStatus(out, id, .failure);
+        return;
+    }
 
     // 容量闸：与 `fs/put` / 分片回退路径同一笔账。超限立刻失败，不等把
     // tmpfs 写满 —— 写满时错误会变成 ENOSPC，客户端只看到含糊的 I/O 错误。
@@ -2345,4 +2391,50 @@ test "sftp/handler: 驱动不报大小时不假装续传（拒绝而不是留空
     // 目标没被动过。
     const e = f.mem.find("/z.bin") orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("0123456789", e.data);
+}
+
+test "sftp/handler: WRITE 的 offset 超界直接失败（u64 回绕防线）" {
+    // `at + data.len` 曾经不做上界检查：安全构建里 panic 整个进程；生产是
+    // ReleaseSmall（无检查），回绕后容量闸的比较被绕过、`w.size` 记成回绕值。
+    // 2^48 = 256 TiB 超过任何真实文件。超界必须失败**并置 failed** —— 客户端
+    // 之后仍会发 CLOSE，不置 failed 的话（空的）temp 会被当成完整文件传上去。
+    var f = Fixture.init(false);
+    f.start();
+    defer f.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try f.withTempDir(&tmp);
+
+    var out = Buf.init(f.a());
+    defer out.deinit();
+    const h = (try openHandle(&f, 1, "/w.bin", .{ .write = true, .creat = true, .trunc = true }, &out)) orelse
+        return error.TestUnexpectedResult;
+
+    try expectStatus(try writeReq(&f, 2, h, 0xFFFF_FFFF_FFFF_F000, "x", &out), .failure);
+    // 失败已记账：CLOSE 也必须失败，而不是把 temp 里的东西传上去。
+    try expectStatus(try closeReq(&f, 3, h, &out), .failure);
+    try testing.expect(f.mem.find("/w.bin") == null);
+}
+
+test "sftp/handler: READ 的 offset 超界回 EOF（等价 past-EOF，不进算术）" {
+    // 钳在 READ 入口，而不是让 2^64 附近的 offset 流进后面的未检查加法
+    // （缓存命中判断的 `offset + len`、fetchHttp 的 `offset + len - 1`）。
+    // 语义上「越过任何真实文件的末尾」= past-EOF ⇒ 回 EOF。这里刻意用
+    // 大小未知的源（report_zero_size）：大小已知时 `offset >= size` 的早退
+    // 就能拦住，测不出入口钳制本身。
+    var f = Fixture.init(true); // use_url ⇒ 走 fetcher
+    f.start();
+    defer f.deinit();
+    f.mem.report_zero_size = true;
+    try f.mem.addFile("/eof.txt", "abcdef");
+
+    var mf = MemFetcher{ .mem = &f.mem };
+    f.c.fetcher = mf.fetcher();
+
+    var out = Buf.init(f.a());
+    defer out.deinit();
+    const h = (try openHandle(&f, 1, "/eof.txt", .{}, &out)) orelse
+        return error.TestUnexpectedResult;
+
+    try expectStatus(try readReq(&f, 2, h, 0xFFFF_FFFF_FFFF_F000, 16, &out), .eof);
 }

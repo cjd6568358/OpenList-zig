@@ -106,7 +106,14 @@ pub const Wire = struct {
         self.app = app;
         self.alloc = alloc;
         self.jar = cookiejar.Jar.init(alloc);
-        self.cli = client_mod.Client.init(alloc, .{}, &self.jar);
+        // 响应体上限（P1）：SFTP 的 Range 拉取一次最多一个读窗口（1 MiB），
+        // 4 MiB 给足余量。不设的话，上游忽略 Range 回 200 时整份文件会先
+        // 进内存 —— 以前只是注释里承认「大文件会先撜爆内存」，在光猫上就是
+        // 确定性 OOM。超限以 `error.ResponseTooLarge` 明确失败，客户端看到
+        // FAILURE，而不是把进程带走。
+        self.cli = client_mod.Client.init(alloc, .{
+            .max_response_bytes = 4 * 1024 * 1024,
+        }, &self.jar);
     }
 
     pub fn deinit(self: *Wire) void {
@@ -225,6 +232,15 @@ pub fn serveSsh(
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
+    // 连接闸门（P0-A，与 http.zig 的 `conn_sem` 同款）：满 64 条并发就停在
+    // accept 上做背压，而不是无限 spawn —— 小内存设备上后一种会被并发连接
+    // 打爆。以前 accept 无上限 × 零超时，未认证扫描器只要 TCP 连上就能各占
+    // 一个线程加全套连接状态，公网可低成本拖死同进程的 HTTP。pre-auth 超时
+    // （`channel.run` 里设置）保证占着坑的未认证连接最多活 30 秒，闸门不会
+    // 被拖死。
+    var conn_sem: std.Io.Semaphore = .{};
+    conn_sem.permits = max_ssh_connections;
+
     log.info("sftp(ssh): listening on {s}:{d} (host key: {s})", .{ address, port, host_key_path });
     // 明确打出策略：rekey 阈值配错了（比如 `sftp.rekey_mb` 写成字符串）时，
     // 症状是「服务端从不换密钥」，而这一点在日志里必须一眼可见。
@@ -243,14 +259,23 @@ pub fn serveSsh(
                 continue;
             },
         };
-        const t = std.Thread.spawn(.{}, sshConnThread, .{ app, hk, stream, rekey_limit }) catch |e| {
+        // 先占坑再 spawn：spawn 失败要把坑还回去，否则信号量被白吃一个。
+        conn_sem.waitUncancelable(io);
+        const t = std.Thread.spawn(.{}, sshConnThread, .{ app, hk, stream, rekey_limit, &conn_sem }) catch |e| {
             log.warn("sftp(ssh): spawn failed: {s}", .{@errorName(e)});
             stream.close(io);
+            conn_sem.post(io);
             continue;
         };
         t.detach();
     }
 }
+
+/// SSH 并发连接上限。HTTP 侧的 `max_connections` 默认 0（不限、靠配置开启）；
+/// SSH 侧直接给硬默认：每条连接一套线程 + Wire/Session 状态，而 SSH 端点
+/// 面对的是公网扫描器，光猫的内存面前这个数不能再大。pre-auth 超时保证
+/// 占坑的未认证连接 30 秒内必定吐出来，正常用户几乎不可能同时占满 64 条。
+const max_ssh_connections: u32 = 64;
 
 /// `channel.SftpHandler` 的上下文：一条连接一套 `Session` + `Context`。
 const Bridge = struct {
@@ -282,9 +307,10 @@ fn sshVerify(ctx: *anyopaque, a: std.mem.Allocator, user: []const u8, pw: []cons
     if (app.admin_hash.len == 0) return false; // 还没建管理员
 
     // 锁定期内直接拒绝，连哈希都不算（与 HTTP 登录的检查顺序一致）。
-    // 必须记一条日志：否则用户输入正确口令也登不上，却没有任何线索。
+    // 锁定进入的那一下已经在 `api.recordFailure` 里告警过（带来源），
+    // 这里只留 debug —— 逐次拒绝打日志，等于给扫描器一个刷日志的放大面。
     if (!api.authThrottleAllow(peer)) {
-        log.warn("ssh: auth refused — account locked after too many failed attempts (from {s})", .{if (peer.len == 0) "unknown" else peer});
+        log.debug("ssh: auth refused — account locked (from {s})", .{if (peer.len == 0) "unknown" else peer});
         return false;
     }
 
@@ -306,9 +332,11 @@ fn sshVerify(ctx: *anyopaque, a: std.mem.Allocator, user: []const u8, pw: []cons
     return true;
 }
 
-fn sshConnThread(app: *api.App, hk: sftp.ssh.HostKey, stream: std.Io.net.Stream, rekey_limit: u64) void {
+fn sshConnThread(app: *api.App, hk: sftp.ssh.HostKey, stream: std.Io.net.Stream, rekey_limit: u64, conn_sem: *std.Io.Semaphore) void {
     const gpa = rt.gpa();
     defer stream.close(rt.io());
+    // 坑位归还：连接线程退出时释放一个并发名额（见 serveSsh 的闸门注释）。
+    defer conn_sem.post(rt.io());
 
     // 对端 IP 每条连接查一次。缓冲区放在这里（连接级），传输层与认证都只在
     // 这条连接的生命周期内使用它。
