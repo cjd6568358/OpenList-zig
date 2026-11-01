@@ -225,7 +225,12 @@ R1–R10 的落地**逐条吻合**，协议本体正确；新发现集中在边�
 **1 项 P0**（pre-auth 资源耗尽：零超时 × accept 无上限，上轮 P0-3 唯一没落地的）
 与 **8 项 P1**（`k_mpint`/`toOwned` 泄漏、512 预算压死合法 stash 窗口、嵌套 rekey
 acc 下溢、`handleOpen`/`registerDir` 双释放、offset u64 回绕、200 全量下载无上限、
-锁定期日志可刷穿闪存、kexinit dupe 顺序），已全部修复并加 4 条回归单测。
+锁定期日志可刷穿闪存、kexinit dupe 顺序），已全部修复并加回归单测。真机验证
+阶段又抓到两条并当天闭环：**目录句柄 CLOSE 堆越界**（本报告附记下方的
+「P2-A」定级被证明是错的——`*DirState` 强转 `*FileState` 读 tag 是分配块外的
+越界读，是否触发取决于堆历史；补 `h.kind` 检查）与 **0600 测试 Linux 编译炸**
+（`Io.File.Stat` 无 `mode` 字段；打包机测试闸门自 d41acfcc 起实际是断的，
+11-01 的三个构建都没过这道闸）。
 
 **特别相关的一条**：R10 修的 `max_items` 256 → 4096 曾被 `readKexPacket` 的
 512 次循环预算架空——stash 的包也计入预算，而合法最坏值恰 ~512 条（psftp
@@ -233,6 +238,7 @@ acc 下溢、`handleOpen`/`registerDir` 双释放、offset u64 回绕、200 全�
 修法是 stash 分支不占预算、预算只数杂项包，并有「600 条数据包后 KEXINIT 仍读得到」
 的单测钉住。
 
-完整清单、修复方式与验证：`STATUS.md` §60.42。
+完整清单、修复方式与验证：`STATUS.md` §60.42（终态 560/560 Linux 原生、
+隔离实例 e2e 15/15、已切生产 `8fac3896`）。
 
 > AI生成

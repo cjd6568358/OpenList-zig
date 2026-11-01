@@ -53,7 +53,7 @@
 |---|---|---|
 | `src/sftp/protocol.zig` | v3 线协议编解码：帧、`PacketType`/`Status`/`OpenFlags`/`AttrFlags`、`Attributes`、流式 `parse`、`writeStatus/Handle/Data/Attrs` | 16 |
 | `src/sftp/session.zig` | 句柄表（上限 512、id 不复用、重复 close 不致命）、虚拟路径纯词法归一化（`..` 越根钳制而非报错） | 13 |
-| `src/sftp/handler.zig` | 请求分发：`INIT`/`REALPATH`/`STAT`/`LSTAT`/`FSTAT`/`OPENDIR`/`READDIR`（64 条一页）/`MKDIR`/`RMDIR`/`REMOVE`/`RENAME`/`OPEN`(读写/续传)/`READ`（1 MiB 窗口缓存，offset 鉗 2^48）/`WRITE`（同鉗）/`CLOSE`/`SETSTAT` | 22 |
+| `src/sftp/handler.zig` | 请求分发：`INIT`/`REALPATH`/`STAT`/`LSTAT`/`FSTAT`/`OPENDIR`/`READDIR`（64 条一页）/`MKDIR`/`RMDIR`/`REMOVE`/`RENAME`/`OPEN`(读写/续传)/`READ`（1 MiB 窗口缓存，offset 鉗 2^48）/`WRITE`（同鉗）/`CLOSE`（目录句柄 kind 检查）/`SETSTAT` | 23 |
 | `src/sftp_wire.zig` | 生产接线：`Resolver` 包 `App.resolve`（含虚拟根列挂载点）、`Fetcher` 包 `client.zig` 的 Range 请求、`--sftp-ssh` SSH 监听（裸 TCP 调试端点已于 11-01 删除） | — |
 | `src/sftp/ssh.zig` | SSH-2 传输层：版本交换、KEXINIT、`curve25519-sha256`、`ssh-ed25519` host key、二进制包协议、`aes128-ctr`+`hmac-sha2-256`、NEWKEYS 密钥派生、双向 rekey（含 stash） | 17 |
 | `src/sftp/channel.zig` | 连接层（RFC 4254）+ 认证（RFC 4252）+ SFTP 桥接：单 channel、`subsystem sftp`、窗口补给、`max_packet` 分片、服务端主动 rekey 触发、pre-auth 超时（认证后撤） | 6 |
@@ -127,7 +127,12 @@ fetcher，不起服务、不联网）：`Resolver`（路径 → 驱动 + 相对�
   8 项 P1（`k_mpint`/`toOwned` 泄漏、512 预算压死合法 stash 窗口、嵌套 rekey
   acc 下溢守卫、`handleOpen`/`registerDir` 双释放、offset u64 回绕鉗 2^48、
   200 全量下载接 `max_response_bytes`、锁定期日志限频、kexinit dupe 顺序）。
-  单测 **555 pass + 4 skip**。
+  真机验证又抓到两条并当天闭环：**目录句柄 CLOSE 堆越界**（`handleClose`/
+  `handleWrite` 补 `h.kind` 检查，此前 P2 定级错判）与 **0600 测试 Linux
+  编译炸**（打包机测试闸门自 d41acfcc 起是断的，11-01 三个构建都没过闸）。
+  终态：打包机 Linux 原生 **560/560**，隔离实例 e2e 15/15 + 互通 2 MiB
+  + pre-auth 超时 30 s；**已切生产**（1,443,624 B / `8fac3896`，2026-11-02
+  01:48，pid 9809，14 挂载全 200）。
 
 剩余：
 

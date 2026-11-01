@@ -17,9 +17,9 @@
 >
 > | 项 | 值 |
 > |---|---|
-> | 单元测试（本机 Windows zig 0.17.0，全量） | **555 pass + 4 skip**（559 总；历史打包机基线 451/451 见 §54.1） |
+> | 单元测试 | **打包机 Linux 原生 560/560（0 跳过）**；本机 Windows 556 pass + 4 skip（Linux-only 用例）；历史打包机基线 451/451 见 §54.1 |
 > | SFTP 服务端（SSH-2 + SFTP v3，`sftp.enable` 默认 false） | 五层落地：断点续传 / 双向 rekey / 按 IP 分桶限速（与 HTTP 共用）/ pre-auth 超时 + 64 并发上限；三客户端互通 + paramiko e2e；`--sftp-plain` 已删（§60.41） |
-> | 交叉编译（aarch64-linux-musl，`-Doptimize=small`） | 通过；最近一次产物 **1,447,328 B / `b7bdef70`**（§60.40；§60.42 修复后未重建） |
+> | 交叉编译（aarch64-linux-musl，`-Doptimize=small`） | 通过；当前产物 **1,443,624 B / `8fac3896`**（2026-11-02，§60.42 修复后重建，已切生产） |
 > | 真机 e2e（光猫，13 挂载点） | **464 通过 / 0 失败 / 1 跳过**（跳过 = 坚果云根目录 403 服务商规则；2026-10-18 基线，本轮未重跑全量 e2e） |
 > | 真机无凭据回归（`driver_matrix.py`） | 默认产物 **27/27**；点名产物（+3 变体）**14/14** |
 > | 注册驱动 | **15 个注册项 / 12 个实现**（Quark+UC 共用 quarkuc.zig，thunder 出 3 个 factory），12/12 真机覆盖；**另 3 个变体（`123 Open`/`QuarkOpen`/`115 Open`）编译期可选**，见 §53 |
@@ -35,8 +35,8 @@
 - **验收标准**：驱动全部写完 + 编译 + 真机验证。
 - **当前状态**：**15 个注册项 / 12 个实现**，全部真机覆盖；另 3 个变体
   （`123 Open`/`QuarkOpen`/`115 Open`）为**编译期可选**（§53）；单元测试
-  **555 pass + 4 skip**、交叉编译通过；SFTP 服务端五层落地（§60.30–§60.42）；
-  真机 e2e（13 挂载）**464/0/1**。详见顶部基线表。
+  **560/560**（打包机 Linux 原生）、交叉编译通过；SFTP 服务端五层落地
+  （§60.30–§60.42）；真机 e2e（13 挂载）**464/0/1**。详见顶部基线表。
 
 ## 2. 驱动清单（15 个注册项 / 12 个驱动实现 + 3 个编译期可选变体）
 
@@ -5738,7 +5738,9 @@ fetcher，不起服务、不联网、不用密钥），探针验证的是同一�
 ## 60.42 复审 13 个本地提交后的修复（2026-11-02）
 
 对 10-31 SFTP 审计落地以来的 13 个本地提交（rekey 演进 + WebDAV 限速 + 收尾）
-做了一轮三路子代理复审 + 主控逐条核验，然后一次修掉 **1 项 P0、8 项 P1**。
+做了一轮三路子代理复审 + 主控逐条核验，然后一次修掉 **1 项 P0、8 项 P1**；
+后续真机验证又抓到两条（目录句柄 CLOSE 堆越界 + 0600 测试的 Linux 编译
+炸，见下），合计 **1 P0 + 10 P1** 当天闭环。
 结论先行：协议本体（rekey 状态机、续传语义、限速分桶、删除 `--sftp-plain`）
 复核为**正确**，短板全部集中在边界与所有权。
 
@@ -5756,7 +5758,7 @@ HTTP —— 上轮审计的原始动机，`d41acfcc` 的按 IP 分桶只覆盖 U
 * `serveSsh` 加 64 并发信号量闸门（与 `http.zig` 的 `conn_sem` 同款背压），
   spawn 失败归还坑位；pre-auth 超时保证占坑的未认证连接 30 秒内吐出来。
 
-### P1（8 项）
+### P1（8 项，另两条见「真机验证抓到两条新问题」）
 
 | # | 问题 | 修法 |
 |---|---|---|
@@ -5769,9 +5771,33 @@ HTTP —— 上轮审计的原始动机，`d41acfcc` 的按 IP 分桶只覆盖 U
 | 7 | WebDAV 锁定期**每个请求**一条 WARN（Go 对应分支零日志）：keep-alive 扫描一秒可刷成百上千条，stderr 落闪存可写穿小容量 flash | 锁定**进入**时在 `recordFailure` 告警一次（带来源），拒绝路径降 debug（HTTP/SSH 两侧统一） |
 | 8 | kexinit 先 free 后 `try dupe`（三处）：OOM 路径字段悬垂 ⇒ `Transport.deinit` 二次释放；服务端主动 rekey 让这条路径频率上升 | 先 dupe 进局部、成功后再 free 旧值 |
 
+### 真机验证抓到两条新问题（当天闭环）
+
+复审修复构建后先上光猫隔离实例（`/tmp/olz`，端口 15399/15400，`sftp.rekey_mb=1`）
+跑回归，又抓到两条，当场修掉：
+
+**① 目录句柄 CLOSE 的堆越界（上轮被降级为 P2「靠对齐巧合不触发」，结论错了）**
+paramiko e2e 在 `listdir` 的 CLOSE 上**非确定性**报 OSError，服务端日志
+`sftp: discarding  — a previous write failed`（vpath 为空）。根因：
+`handleClose` 把目录句柄的 extra（`*DirState`，40 B）直接 `@ptrCast` 成
+`*FileState`（~100 B）读 union tag —— **FileState 比 DirState 大，tag 读的是
+分配块之外的堆内存**，垃圾值命中 `.write` 分支、垃圾 `w.failed` 判真 ⇒ 目录
+CLOSE 回 failure。11-01 全绿只是堆内容恰好幸运。修法：`handleClose` /
+`handleWrite` 入口显式查 `h.kind`（与 `handleRead` / `handleReadDir` 既有检查
+对齐）+ 回归用例。**教训：越界读的「不可达」论证必须算结构体大小，不能只看
+对齐。**
+
+**② 0600 测试在 Linux 上编译不过 ⇒ 打包机测试闸门自 d41acfcc 起就是断的**
+`Io.File.Stat` 没有 `mode` 字段（POSIX 权限在 `permissions: enum(mode_t)`），
+该测试 Windows 上被 comptime 跳过（函数体后半段不分析）永远测不出，Linux 上
+一编译就炸。**推论：11-01 的三个生产构建（`9e8a43b0`/`b7bdef70`/`b7082785`）
+都没过打包机测试闸门**（二进制存在但不可能跑过 `zig build test`）。修法：
+`@intCast(@intFromEnum(st.permissions))`（与 `drivers/local.zig` 同一写法）。
+修复后 560/560 在打包机 Linux 原生全绿（0 跳过），0600 测试**首次真正执行**。
+
 ### 验证
 
-**555 pass + 4 skip**（559 总，+4 条）：
+**打包机 Linux 原生 560/560（0 跳过）；本机 Windows 556 pass + 4 skip**（+5 条）：
 
 | 新增用例 | 钉住什么 |
 |---|---|
@@ -5779,23 +5805,33 @@ HTTP —— 上轮审计的原始动机，`d41acfcc` 的按 IP 分桶只覆盖 U
 | `ssh: ECDH 之后断连不泄漏` | `toOwned` 的孤儿缓冲（testing.allocator 当场抓；成功路径那份只能靠完整握手） |
 | `sftp/handler: WRITE 的 offset 超界直接失败` | 回绕防线 + failed 置位（CLOSE 也失败，不上传垃圾） |
 | `sftp/handler: READ 的 offset 超界回 EOF` | 入口钳制（用大小未知的源才测得出，大小已知被早退掩盖） |
+| `sftp/handler: CLOSE 目录句柄必须回 ok` | kind 检查在位（单测堆内容恒不命中，但删掉检查也测不出——留着永远绿） |
 
-P2 收尾池（未动，下一轮）：`handleClose/handleWrite` 显式 kind 检查 + 补
-CLOSE-on-dir 用例、host key tmp+rename 原子写、默认监听地址 0.0.0.0 →
-loopback、SSH 监听 `reuse_address` 平台条件化、READDIR 超长名单自适应截页、
-webdav `ctEqual` 收编为调 `api.ctEqual`、IPv4-mapped IPv6 解映射、未认证
-rekey 节流、sftp 段热加载冷生效记档、`sftp_ssh_e2e.py` docstring 清理提交。
+**真机隔离实例**（`rekey_mb=1`）：paramiko e2e **15/15**（含服务端主动
+rekey ×5、3 MiB 逐字节、断点续传、认证闸门）；psftp / WinSCP 2 MiB 互通
+全过；**pre-auth 超时实测 30.0 s 断开**；HTTP 端点全 200。
 
-体积未重建（生产切换按用户节奏，下一轮切换时更新基线表的产物行）。
+**生产切换（2026-11-02 01:48）**：aarch64 **1,443,624 B / `8fac3896`**，
+流程照旧（`.new` → 备份 `/tmp/openlist.prev` → stop(21360) → 同盘 `mv -f`
+→ start，pid **9809** attempt 1）。`mount(s)` = **14**、`/` `/dav`
+`settings` 全 200、进程 1 个不带 `(deleted)`；`ThunderExpert` #19
+`userinfo_expired` 为部署前既有；验证后已删备份。留档（本机
+`D:/workspace/server/armbian/bin/openlist/`）已同步。
+
+P2 收尾池（未动，下一轮）：host key tmp+rename 原子写、默认监听地址
+0.0.0.0 → loopback、SSH 监听 `reuse_address` 平台条件化、READDIR 超长名单
+自适应截页、webdav `ctEqual` 收编为调 `api.ctEqual`、IPv4-mapped IPv6 解
+映射、未认证 rekey 节流、sftp 段热加载冷生效记档。（原池中的
+`handleClose/handleWrite` kind 检查已随本节「问题①」提前完成。）
 
 ### 文档侧同步更正
 
 * §60.39 验证计数笔误：549/+11 → **550/+12**（终值 551 一直是对的）；
 * §60.39.7 的「`--sftp-ssh` 仍打 WARN」张冠李戴（打 WARN 的是已删除的
   `--sftp-plain`）；
-* `TODO.md`：§5 测试数表回填（handler 22 / ssh 17 / channel 6）、「上游用
+* `TODO.md`：§5 测试数表回填（handler 23 / ssh 17 / channel 6）、「上游用
   `IP:端口`」旧表述随 §60.39.5 更正、头部日期；
-* 顶部基线表从 10-22 的 451 刷新到当前（555 + 4 skip、SFTP 子系统行、§60.40
-  的最近产物）。
+* 顶部基线表从 10-22 的 451 刷新到当前（560/560、SFTP 子系统行、当前产物
+  `8fac3896` 已切生产）。
 
 > AI生成
