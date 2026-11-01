@@ -28,9 +28,9 @@
 
 ## 构建
 
-- Zig 0.17.0：`C:\Program Files\zig-x86_64-windows-0.17.0\zig.exe`；**基线 550 pass + 4 skip**（`zig-src` 下跑）。
+- Zig 0.17.0：`C:\Program Files\zig-x86_64-windows-0.17.0\zig.exe`；**基线 551 pass + 4 skip**（`zig-src` 下跑）。
 - 必须：① `tools/ziglib_patch.py "<toolchain>/lib" C:/zigcache/olz-ziglib`（已就绪，`grep -c "openlist-zig patch"` = 2）；② 用 **`ZIG_LIB_DIR=C:/zigcache/olz-ziglib`**（`--zig-lib-dir` 0.17 不认）；③ `ZIG_GLOBAL_CACHE_DIR`/`ZIG_LOCAL_CACHE_DIR` → `C:/zigcache/olz`。
-- **🔴 裸调 `zig build`（漏 ZIG_LIB_DIR）= 静默丢 TLS 补丁**：不报错，部署后 Quark/UC 消失（14→12）。尺寸判据代码一变即失效（**11-01 生产 aarch64 1,447,328 B `b7bdef70`**，win 1,952,768 B `49d0627c`）；**最终判据：部署后 grep `mount(s) published` = 14**。
+- **🔴 裸调 `zig build`（漏 ZIG_LIB_DIR）= 静默丢 TLS 补丁**：不报错，部署后 Quark/UC 消失（14→12）。尺寸判据代码一变即失效（**11-01 生产 aarch64 1,442,536 B `b7082785`**，win 1,945,088 B `74d87640`）；**最终判据：部署后 grep `mount(s) published` = 14**。
 - ⚠ `zig build` 吞 "All tests passed" 且末尾打误导性 `failed command`（退出码 0）；**跑测试一律带 `--summary all`**，判据是 `N pass, M skip`。裸跑 `.zig-cache/o/*/test.exe` 必崩（`--listen=-` 是 server 模式）——正常现象。裸 `zig test src/tests.zig` 编译不过（缺 `build_options`）。
 - 单测一律 `std.testing.allocator`；**D 盘满会假报 NoSpaceLeft/泄漏**。写盘只写 `/tmp`；工具链 cache 只读。
 - **Zig 0.17 坑**：裸 `assert` 移除 → `std.debug.assert`；`**` 数组重复非法 → 定长数组 + `@memset`；驱动新方法必须放进 struct；`_ = self;` 在 self 已用时是编译错误。
@@ -92,8 +92,8 @@
 - **11-01 五项**：①失败计数按 IP 分桶（`util/peeraddr.zig`，POSIX `getpeername` **只取 IP 不带端口**，Windows 明确 null 回退全局桶；64 桶 LRU，HTTP/SSH 共用）；②断点续传（OPEN 无 trunc 且文件已存在 ⇒ `preloadExisting` 把原内容拉进 temp，上游短读直接报错）；③`size_known`（驱动没报 size 时按 Range 实际返回判 EOF）；④服务端主动 rekey（`sftp.rekey_mb` 默认 1024；KEX 期间对端包进 Stash，NEWKEYS 后补投）；⑤host key 0600。
 - **收尾握手缺陷**（STATUS §60.38）：收到 `CHANNEL_EOF` 发完 EOF+CLOSE 就关 socket ⇒ 对端回的 CLOSE 没读走，Winsock 用 **RST** 收尾 ⇒ psftp quit 随机报 abort（文件其实已传完）。按 RFC 4254 §5.3 双向握手（等对端 CLOSE 再关，`closeChannel` 幂等）后 15/15。
 - **复核后的三条硬规则**（STATUS §60.39）：①**已知大小**的上游短读必须回 `FAILURE`，只有 `size_known == false` 才把短读当 EOF（否则下载静默截断）；②续传时 `details().size <= 0` 一律拒绝（`size == 0` 无法区分真空/未知，当成空文件会留空洞）；③`size_known` 的判据是 `size > 0`，两处必须一致。
-- 回归：`tools/sftp_ssh_e2e.py`（paramiko，含双向 rekey / 续传 / 3 MiB 完整性）、`tools/sftp_interop.py`（psftp / WinSCP / rclone 逐字节比对，`--kib` 可调）、`tools/sftp_probe.py`（零依赖裸协议，走 `--sftp-plain`）。
-- `--sftp-plain` **保留**：只存在于 CLI、绑 127.0.0.1、启动打 WARN，是唯一零依赖探针入口；要删连探针一起删。
+- 回归：`tools/sftp_ssh_e2e.py`（paramiko，含双向 rekey / 续传 / 3 MiB 完整性）、`tools/sftp_interop.py`（psftp / WinSCP / rclone 逐字节比对，`--kib` 可调；全 SKIP 时退出码 2）。
+- `--sftp-plain` **已删除**（11-01 用户决定）：无认证端点不该留在二进制里。连带删 `servePlain`/`connThread`/`serveStream`（120 行）+ `tools/sftp_probe.py`。handler 分发本来有纯单测，SSH 侧靠 `sftp_ssh_e2e.py` + `sftp_interop.py`。
 - **不做前端开关**：仓库无前端产物 + `setting/save` 写 `zig.*` 而 SFTP 读 `sftp.*` + 监听器是 detached 线程里的 accept 死循环（无 stop 句柄）。
 
 ## 文档与留档
