@@ -13,13 +13,13 @@
 >   需要原文用 `git show 7356589e:<path>` 取回（见 §38.5）。
 > - **待办以 `TODO.md` 为准**；功能边界见 §22。
 >
-> **当前基线（2026-10-22，构建 `c90dd73e9bd2dfe6…`；含三个编译期可选变体收尾）**
+> **当前基线（2026-11-02；SFTP 子系统已落地并复审修复，见 §60.30–§60.42）**
 >
 > | 项 | 值 |
 > |---|---|
-> | 单元测试（打包机 10.0.0.4，全量驱动） | **451 / 451 通过** |
-> | 交叉编译（aarch64-linux-musl，`-lc -fstrip`） | 通过，产物 **1,320,952 B** |
-> | 本机构建（Windows zig 0.17.0） | ✅ 与打包机**逐字节相同**（§54.1）；本机测试 448 pass + 3 skip（Linux-only） |
+> | 单元测试（本机 Windows zig 0.17.0，全量） | **555 pass + 4 skip**（559 总；历史打包机基线 451/451 见 §54.1） |
+> | SFTP 服务端（SSH-2 + SFTP v3，`sftp.enable` 默认 false） | 五层落地：断点续传 / 双向 rekey / 按 IP 分桶限速（与 HTTP 共用）/ pre-auth 超时 + 64 并发上限；三客户端互通 + paramiko e2e；`--sftp-plain` 已删（§60.41） |
+> | 交叉编译（aarch64-linux-musl，`-Doptimize=small`） | 通过；最近一次产物 **1,447,328 B / `b7bdef70`**（§60.40；§60.42 修复后未重建） |
 > | 真机 e2e（光猫，13 挂载点） | **464 通过 / 0 失败 / 1 跳过**（跳过 = 坚果云根目录 403 服务商规则；2026-10-18 基线，本轮未重跑全量 e2e） |
 > | 真机无凭据回归（`driver_matrix.py`） | 默认产物 **27/27**；点名产物（+3 变体）**14/14** |
 > | 注册驱动 | **15 个注册项 / 12 个实现**（Quark+UC 共用 quarkuc.zig，thunder 出 3 个 factory），12/12 真机覆盖；**另 3 个变体（`123 Open`/`QuarkOpen`/`115 Open`）编译期可选**，见 §53 |
@@ -35,7 +35,8 @@
 - **验收标准**：驱动全部写完 + 编译 + 真机验证。
 - **当前状态**：**15 个注册项 / 12 个实现**，全部真机覆盖；另 3 个变体
   （`123 Open`/`QuarkOpen`/`115 Open`）为**编译期可选**（§53）；单元测试
-  **451/451**、交叉编译通过；真机 e2e（13 挂载）**464/0/1**。详见顶部基线表。
+  **555 pass + 4 skip**、交叉编译通过；SFTP 服务端五层落地（§60.30–§60.42）；
+  真机 e2e（13 挂载）**464/0/1**。详见顶部基线表。
 
 ## 2. 驱动清单（15 个注册项 / 12 个驱动实现 + 3 个编译期可选变体）
 
@@ -5594,7 +5595,7 @@ Go 上游是**计数**的（`server/webdav.go:52-66`：锁定期 429、失败 `S
 
 ### 验证
 
-**549 pass + 4 skip**，0 失败 0 泄漏（本轮 +11 条）：
+**550 pass + 4 skip**，0 失败 0 泄漏（本轮 +12 条）：
 
 | 新增用例 | 钉住什么 |
 |---|---|
@@ -5731,3 +5732,70 @@ fetcher，不起服务、不联网、不用密钥），探针验证的是同一�
 `tools/sftp_interop.py`（psftp / WinSCP / rclone 逐字节）。
 
 验证：**551 pass + 4 skip**（与删除前一致，说明没有测试依赖这条路径）。
+
+---
+
+## 60.42 复审 13 个本地提交后的修复（2026-11-02）
+
+对 10-31 SFTP 审计落地以来的 13 个本地提交（rekey 演进 + WebDAV 限速 + 收尾）
+做了一轮三路子代理复审 + 主控逐条核验，然后一次修掉 **1 项 P0、8 项 P1**。
+结论先行：协议本体（rekey 状态机、续传语义、限速分桶、删除 `--sftp-plain`）
+复核为**正确**，短板全部集中在边界与所有权。
+
+### P0：pre-auth 资源耗尽（上轮 P0-3 唯一没落地的）
+
+未认证连接此前**完全没有超时**，accept 也无上限：扫描器 TCP 连上、一个字节
+不发，就占死一个线程 + 整套 Wire/Session 状态，公网可低成本拖死同进程的
+HTTP —— 上轮审计的原始动机，`d41acfcc` 的按 IP 分桶只覆盖 USERAUTH 之后，
+管不到这一段。修法（全部复用 HTTP 侧现成件）：
+
+* `channel.run` 入口套 `http.applyTimeouts(stream, 30)`（pub 化；`0` 的语义
+  从「跳过」改为「清除」，对本文件自己的调用方行为不变）；
+* `onUserauth` 成功后撤掉超时 —— 已认证会话空闲不限时，与 OpenSSH 默认一致
+  （刻意保守：不引入认证后的空闲上限，那是行为变更）；
+* `serveSsh` 加 64 并发信号量闸门（与 `http.zig` 的 `conn_sem` 同款背压），
+  spawn 失败归还坑位；pre-auth 超时保证占坑的未认证连接 30 秒内吐出来。
+
+### P1（8 项）
+
+| # | 问题 | 修法 |
+|---|---|---|
+| 1 | `k_mpint.toOwned()` 是**复制**不是移交：成功路径每次 KEX 漏 256 B，ECDH 之后失败路径（扫描器常见）再漏 34 B 孤儿 | `defer k_mpint.deinit()` + `errdefer a.free(k_bytes)` |
+| 2 | `readKexPacket` 的 512 次循环预算把进 stash 的包也计入，而合法最坏值恰好 ~512 条（psftp 4 KiB WRITE × 2 MiB 在飞窗口）—— 高 BDP 链路上 R10 同症状复活，局域网测不出 | stash 分支不占预算，预算只数杂项包（IGNORE/DEBUG/UNIMPLEMENTED/空包） |
+| 3 | 嵌套 rekey（`drainStash → … → onRekey → drainStash` 环）会把外层**尚未消费**的 acc 消费掉，`acc.len - pkt.consumed` usize 下溢，ReleaseSmall 无检查 ⇒ OOB 切片 | 游标失效即 `ProtocolCorrupt` 断开（触发需认证 + 违反 RFC 4253 §9） |
+| 4 | `handleOpen` 读路径 / `registerDir`：`addHandle` 失败时先 release 再回状态，回状态再失败 ⇒ 外层 errdefer **二次释放**（512 句柄打满 + arena OOM 确定触发）；顺带修掉同一编排下「回 HANDLE 失败时 setExtra 已挂」的隐患 | 照 `openForWrite` 的编排：先回状态再释放、`setExtra` 挪到最后一条、补 st 的 errdefer |
+| 5 | READ/WRITE 的客户端可控 u64 offset 无上界：`at + data.len` 安全构建 panic 整进程、ReleaseSmall 回绕绕过容量闸并污染 `w.size` | 入口钳 2^48（256 TiB）：READ 回 EOF（等价 past-EOF）、WRITE 失败并置 failed（CLOSE 丢弃 temp） |
+| 6 | Wire 的 Client 未接 `max_response_bytes`：上游忽略 Range 回 200 时整份文件先进内存，光猫上确定性 OOM（以前只是注释里认账） | 4 MiB 上限（读窗口 1 MiB 的 4 倍余量），超限 `ResponseTooLarge` 明确失败 |
+| 7 | WebDAV 锁定期**每个请求**一条 WARN（Go 对应分支零日志）：keep-alive 扫描一秒可刷成百上千条，stderr 落闪存可写穿小容量 flash | 锁定**进入**时在 `recordFailure` 告警一次（带来源），拒绝路径降 debug（HTTP/SSH 两侧统一） |
+| 8 | kexinit 先 free 后 `try dupe`（三处）：OOM 路径字段悬垂 ⇒ `Transport.deinit` 二次释放；服务端主动 rekey 让这条路径频率上升 | 先 dupe 进局部、成功后再 free 旧值 |
+
+### 验证
+
+**555 pass + 4 skip**（559 总，+4 条）：
+
+| 新增用例 | 钉住什么 |
+|---|---|
+| `ssh: 暂存的包不占杂项预算` | 600 条数据包之后 KEXINIT 仍读得到（旧代码第 512 条就断连） |
+| `ssh: ECDH 之后断连不泄漏` | `toOwned` 的孤儿缓冲（testing.allocator 当场抓；成功路径那份只能靠完整握手） |
+| `sftp/handler: WRITE 的 offset 超界直接失败` | 回绕防线 + failed 置位（CLOSE 也失败，不上传垃圾） |
+| `sftp/handler: READ 的 offset 超界回 EOF` | 入口钳制（用大小未知的源才测得出，大小已知被早退掩盖） |
+
+P2 收尾池（未动，下一轮）：`handleClose/handleWrite` 显式 kind 检查 + 补
+CLOSE-on-dir 用例、host key tmp+rename 原子写、默认监听地址 0.0.0.0 →
+loopback、SSH 监听 `reuse_address` 平台条件化、READDIR 超长名单自适应截页、
+webdav `ctEqual` 收编为调 `api.ctEqual`、IPv4-mapped IPv6 解映射、未认证
+rekey 节流、sftp 段热加载冷生效记档、`sftp_ssh_e2e.py` docstring 清理提交。
+
+体积未重建（生产切换按用户节奏，下一轮切换时更新基线表的产物行）。
+
+### 文档侧同步更正
+
+* §60.39 验证计数笔误：549/+11 → **550/+12**（终值 551 一直是对的）；
+* §60.39.7 的「`--sftp-ssh` 仍打 WARN」张冠李戴（打 WARN 的是已删除的
+  `--sftp-plain`）；
+* `TODO.md`：§5 测试数表回填（handler 22 / ssh 17 / channel 6）、「上游用
+  `IP:端口`」旧表述随 §60.39.5 更正、头部日期；
+* 顶部基线表从 10-22 的 451 刷新到当前（555 + 4 skip、SFTP 子系统行、§60.40
+  的最近产物）。
+
+> AI生成

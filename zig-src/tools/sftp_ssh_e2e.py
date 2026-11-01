@@ -1,9 +1,8 @@
 #!/usr/bin/env python
 """SFTP 端到端回归（SSH 层）：认证闸门 + 真实客户端的 ls / get / put。
 
-`tools/sftp_probe.py` 走的是**裸** SFTP 端口（`--sftp-plain`，没有 SSH），
-覆盖不到传输层与连接层。这个脚本走**真的 SSH-2** 端口（`--sftp-ssh` 或
-`sftp.enable = true`），用来回归那些「单测覆盖不到、手工又容易漏」的东西：
+这个脚本走**真的 SSH-2** 端口（`--sftp-ssh` 或 `sftp.enable = true`），
+覆盖传输层、连接层与收发流控 —— 那些「单测覆盖不到、手工又容易漏」的东西：
 
 * 未认证直接开 channel 必须被拒（`channel.zig` 的 P0 闸门）；
 * 错口令必须被拒；
@@ -17,8 +16,8 @@
   是最容易写出「上传随机卡住」的地方；
 * 断点续传：以 `r+b`（不带 TRUNC）打开已存在的文件，按 offset 覆盖写。
 
-依赖：**paramiko**（唯一一个需要第三方包的回归工具；其余探针都刻意零依赖）。
-安装到隔离环境：
+依赖：**paramiko**（本脚本必需；`sftp_interop.py` 只在不给 `--hostkey` 时用它
+取指纹，属于可选）。安装到隔离环境：
 
     <python> -m venv <env> && <env>/Scripts/pip install paramiko
 

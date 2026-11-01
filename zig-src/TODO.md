@@ -1,8 +1,8 @@
 # TODO — openlist-zig 待办清单
 
-> 最后更新：2026-10-31（回退路径容量闸 + 1 GiB 分片直传真机验收，见
-> `docs/STATUS.md` §58）。历史与事故记录一律在 `docs/STATUS.md`，这里只放
-> **还没做的事**。
+> 最后更新：2026-11-02（复审 13 个本地提交后的修复：pre-auth 超时 +
+> 连接上限 + 内存/算术防线，见 `docs/STATUS.md` §60.42）。历史与事故记录
+> 一律在 `docs/STATUS.md`，这里只放**还没做的事**。
 
 ---
 
@@ -53,10 +53,10 @@
 |---|---|---|
 | `src/sftp/protocol.zig` | v3 线协议编解码：帧、`PacketType`/`Status`/`OpenFlags`/`AttrFlags`、`Attributes`、流式 `parse`、`writeStatus/Handle/Data/Attrs` | 16 |
 | `src/sftp/session.zig` | 句柄表（上限 512、id 不复用、重复 close 不致命）、虚拟路径纯词法归一化（`..` 越根钳制而非报错） | 13 |
-| `src/sftp/handler.zig` | 请求分发：`INIT`/`REALPATH`/`STAT`/`LSTAT`/`FSTAT`/`OPENDIR`/`READDIR`（64 条一页）/`MKDIR`/`RMDIR`/`REMOVE`/`RENAME`/`OPEN`(读写/续传)/`READ`（1 MiB 窗口缓存）/`WRITE`/`CLOSE`/`SETSTAT` | 18 |
+| `src/sftp/handler.zig` | 请求分发：`INIT`/`REALPATH`/`STAT`/`LSTAT`/`FSTAT`/`OPENDIR`/`READDIR`（64 条一页）/`MKDIR`/`RMDIR`/`REMOVE`/`RENAME`/`OPEN`(读写/续传)/`READ`（1 MiB 窗口缓存，offset 鉗 2^48）/`WRITE`（同鉗）/`CLOSE`/`SETSTAT` | 22 |
 | `src/sftp_wire.zig` | 生产接线：`Resolver` 包 `App.resolve`（含虚拟根列挂载点）、`Fetcher` 包 `client.zig` 的 Range 请求、`--sftp-ssh` SSH 监听（裸 TCP 调试端点已于 11-01 删除） | — |
-| `src/sftp/ssh.zig` | SSH-2 传输层：版本交换、KEXINIT、`curve25519-sha256`、`ssh-ed25519` host key、二进制包协议、`aes128-ctr`+`hmac-sha2-256`、NEWKEYS 密钥派生、双向 rekey（含 stash） | 14 |
-| `src/sftp/channel.zig` | 连接层（RFC 4254）+ 认证（RFC 4252）+ SFTP 桥接：单 channel、`subsystem sftp`、窗口补给、`max_packet` 分片、服务端主动 rekey 触发 | 3 |
+| `src/sftp/ssh.zig` | SSH-2 传输层：版本交换、KEXINIT、`curve25519-sha256`、`ssh-ed25519` host key、二进制包协议、`aes128-ctr`+`hmac-sha2-256`、NEWKEYS 密钥派生、双向 rekey（含 stash） | 17 |
+| `src/sftp/channel.zig` | 连接层（RFC 4254）+ 认证（RFC 4252）+ SFTP 桥接：单 channel、`subsystem sftp`、窗口补给、`max_packet` 分片、服务端主动 rekey 触发、pre-auth 超时（认证后撤） | 6 |
 | `src/util/peeraddr.zig` | 对端 IP 提取（POSIX `getpeername`，**只取 IP 不带端口**；Windows 无对应 API ⇒ null） | 4 |
 | `src/sftp.zig` | 模块入口，汇总四层 | — |
 | `tools/sftp_ssh_e2e.py` | 走真 SSH 的端到端：认证闸门、大文件往返、rekey（双向）、断点续传 | — |
@@ -122,6 +122,12 @@ fetcher，不起服务、不联网）：`Resolver`（路径 → 驱动 + 相对�
   ④锁定期内继续尝试会续期（对齐 Go `Expire`）、成功登录不再新建桶；
   ⑤更正「上游用 `IP:端口`」的错误归因（FTP 带端口，HTTP 是纯 IP，上游 SFTP
   无 `LoginCache`）。单测 **550 pass + 4 skip**。
+* **复审修复**（2026-11-02，见 §60.42）：三路子代理复审 13 个本地提交后修掉
+  1 项 P0（pre-auth 资源耗尽：30 s 超时 + 64 并发上限，认证后撤超时）与
+  8 项 P1（`k_mpint`/`toOwned` 泄漏、512 预算压死合法 stash 窗口、嵌套 rekey
+  acc 下溢守卫、`handleOpen`/`registerDir` 双释放、offset u64 回绕鉗 2^48、
+  200 全量下载接 `max_response_bytes`、锁定期日志限频、kexinit dupe 顺序）。
+  单测 **555 pass + 4 skip**。
 
 剩余：
 
@@ -147,8 +153,10 @@ Zig 实证）、`aes*` / `chacha20` / `hmac` / `sha2` 齐全。**不引 libssh /
 前者要 OpenSSL 或 mbedTLS 静态链（+1.2~3 MB），后者的 TLS 服务端引擎与 SSH
 无关，唯一能替的 RSA 已被 `std.crypto.ff` 覆盖。
 
-⚠ 实现认证时失败计数 key **必须用纯 IP、不带端口** —— 上游 Go 版用 `IP:端口`，
-扫描器每次源端口都不同，限速形同虚设（见 `docs/STATUS.md` §9）。
+⚠ 失败计数 key **必须用纯 IP、不带端口**。上游 Go 的 HTTP 登录用 `c.ClientIP()`
+（纯 IP），只有 FTP 侧带端口（`server/ftp.go:116`），上游 SFTP 没有 `LoginCache` ——
+2026-11-01 复核更正了早期「上游用 `IP:端口`」的错误归因，详见
+`docs/STATUS.md` §60.39.5。
 
 ## 6. 导入工具用法
 
@@ -227,3 +235,5 @@ python tools/import_go_config.py <backup.json> <out_config.json> \
 8. **`/api/*` 未注册路径返回真实 501 JSON**（不是 200+HTML）；要真实状态码时
    不能直接用 `res.jsonError`（它恒写 200）—— 先 `jsonError` 再覆盖
    `res.status`，或手写信封。
+
+> AI生成
