@@ -5466,10 +5466,9 @@ v3，不是缺陷。
   `zig.*` 而 SFTP 读根上的 `sftp.*`，不是同一张表；就算存进去也不生效 ——
   监听器是 `accept` 死循环跑在 detached 线程里，没有 stop 句柄。三样都缺，
   不是「加个复选框」的事。
-* **删 `--sftp-plain`**：TODO 原话是互通落地后删。它确实是个无认证端点，
-  但只存在于 CLI（不在配置文件里）、固定绑 `127.0.0.1`、启动打 WARN，且是
-  `tools/sftp_probe.py`（唯一零第三方依赖探针）的唯一入口。**保留**，删的话
-  连探针一起删。
+* **删 `--sftp-plain`**：TODO 原话是互通落地后删。当时**保留**了（无认证端点，
+  但只存在于 CLI、固定绑 `127.0.0.1`、启动打 WARN，且是 `tools/sftp_probe.py`
+  的唯一入口）。**2026-11-01 用户决定删除**，见 §60.41。
 
 ### 60.38 收尾握手：发完 `EOF`+`CLOSE` 就关 socket ⇒ 对端收到 RST
 
@@ -5709,3 +5708,26 @@ ssh: stash overflow: items=256/256 bytes=1058304/4194304 incoming=4134
 
 体积（含本次修复）：**Windows 1,952,768 B / `49d0627c`**，
 **aarch64 1,447,328 B / `b7bdef70`**（均 `-Doptimize=small`）。
+
+---
+
+## 60.41 删除 `--sftp-plain`（2026-11-01，用户要求）
+
+§60.37 末尾当时选择「保留」，理由是它只存在于 CLI、固定绑 `127.0.0.1`、启动打
+WARN，且是 `tools/sftp_probe.py` 的唯一入口。用户 11-01 决定删除 —— 结论也对：
+**无认证的端点不该长期留在二进制里**，哪怕默认不监听。
+
+删除范围：
+
+| 位置 | 删掉什么 |
+|---|---|
+| `main.zig` | `Options.sftp_plain_port` 字段、`--sftp-plain` 参数解析、启动分支、`--help` 里那一行 |
+| `sftp_wire.zig` | `servePlain`、`connThread`、`serveStream`（共 120 行）—— 后两个只被它调用 |
+| `tools/sftp_probe.py` | 整个文件（零依赖裸协议探针，只配它用） |
+
+**覆盖没有减少**：`handler.zig` 的分发逻辑本来就有纯单测（内存驱动 + 内存
+fetcher，不起服务、不联网、不用密钥），探针验证的是同一条链路；SSH 侧有
+`tools/sftp_ssh_e2e.py`（paramiko，含双向 rekey / 续传 / 3 MiB 完整性）和
+`tools/sftp_interop.py`（psftp / WinSCP / rclone 逐字节）。
+
+验证：**551 pass + 4 skip**（与删除前一致，说明没有测试依赖这条路径）。

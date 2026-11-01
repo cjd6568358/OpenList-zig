@@ -50,10 +50,6 @@ const Options = struct {
     admin: ?AdminCmd = null,
     /// `openlist version`：打印六行版本块后退出（对齐 Go `cmd/version.go`）。
     print_version: bool = false,
-    /// `--sftp-plain <port>`：在 `127.0.0.1:<port>` 上跑一个**无认证**的 SFTP
-    /// 端点，只用于在 SSH 层落地前验证协议/分发链路（`tools/sftp_probe.py`）。
-    /// 默认 null = 不监听。
-    sftp_plain_port: ?u16 = null,
     /// `--sftp-ssh <port>`：在 `127.0.0.1:<port>` 上跑 SSH-2 + SFTP。
     /// 认证已接真校验（管理员口令），但这个开关固定绑 loopback，正式用法走
     /// 配置的 `sftp.enable`。见 `sftp_wire.serveSsh`。
@@ -264,18 +260,6 @@ pub fn main(init: std.process.Init) !void {
     // ⚠ SFTP 是**附加**端点，不是主服务：下面每一条失败路径都只能「记一条
     // 日志后跳过」，绝不能 `return`（那会跳过 `server.run()`，把 HTTP 一起
     // 拖死 —— 配置里端口写错就成了「整个程序起不来」）。
-    if (opts.sftp_plain_port) |p| {
-        // 线程持有 `&app`。main 在 `server.run()` 里阻塞到进程退出，app 的
-        // 生命周期覆盖它；进程退出时这个 detached 线程可能仍在跑，但那时
-        // 整个进程正在被回收。这不是优雅关停，是刻意取舍 —— 一个调试端点
-        // 不值得为它引入一套关停握手。
-        if (std.Thread.spawn(.{}, sftp_wire.servePlain, .{ &app, p })) |t| {
-            t.detach();
-        } else |e| {
-            log.err("sftp(plain): cannot start on port {d}: {s}", .{ p, @errorName(e) });
-        }
-    }
-
     // SFTP 服务端。两种开启方式，**命令行优先**：
     //   1. `--sftp-ssh <port>`：调试/临时用，固定绑 127.0.0.1；
     //   2. 配置 `sftp.enable = true`：正式用法，地址/端口/主机密钥都从配置读。
@@ -679,9 +663,6 @@ fn parseArgs(init: std.process.Init) !Options {
         } else if (std.mem.eql(u8, arg, "--log-level")) {
             const l = args.next() orelse return error.MissingValue;
             out.log_level = log.Level.parse(l);
-        } else if (std.mem.eql(u8, arg, "--sftp-plain")) {
-            const p = args.next() orelse return error.MissingValue;
-            out.sftp_plain_port = std.fmt.parseInt(u16, p, 10) catch return error.BadPort;
         } else if (std.mem.eql(u8, arg, "--sftp-ssh")) {
             const p = args.next() orelse return error.MissingValue;
             out.sftp_ssh_port = std.fmt.parseInt(u16, p, 10) catch return error.BadPort;
@@ -788,7 +769,6 @@ const USAGE =
     \\      --data <dir>        use <dir>/config.json
     \\      --port <n>          override scheme.http_port
     \\      --log-level <l>     debug | info | warn | error | off
-    \\      --sftp-plain <n>    DEBUG ONLY: unauthenticated SFTP on 127.0.0.1:<n>
     \\      --sftp-ssh <n>      SSH-2 + SFTP on 127.0.0.1:<n> (admin password)
     \\  -v, --version           print version and exit
     \\  -h, --help              print this help and exit

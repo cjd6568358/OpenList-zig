@@ -1,25 +1,23 @@
 //! SFTP 的生产接线：把 `api.App` / `client.zig` 适配成 `handler` 的两个窄接口，
-//! 并提供一个**仅供调试**的裸 TCP 监听。
+//! 并把 SSH-2 传输层、单 channel 与 SFTP 分发串起来。
 //!
-//! ## 两个端点
+//! ## 唯一的端点
 //!
-//! * `serveSsh`（正式）：SSH-2 传输层（`sftp/ssh.zig`）+ 单 channel
-//!   （`sftp/channel.zig`）+ SFTP 分发（`sftp/handler.zig`）。认证已接
-//!   `sshVerify`，可以绑非 loopback。
-//! * `servePlain`（调试）：**没有 SSH、没有认证**，客户端直接说 SFTP。
-//!   它存在的唯一理由是能在不信任传输层的时候单独验证「协议 + 会话 +
-//!   分发」在真实挂载上的行为，`tools/sftp_probe.py` 就是配它的客户端。
-//!   传输层已经落地，这个端点只等一次清理（见 TODO）。
+//! `serveSsh`：SSH-2 传输层（`sftp/ssh.zig`）+ 单 channel（`sftp/channel.zig`）
+//! + SFTP 分发（`sftp/handler.zig`）。认证走 `sshVerify`（管理员口令，与 HTTP
+//! 登录共用同一份失败计数），所以可以绑非 loopback。
 //!
-//! ## 裸监听的安全边界（必须看清楚）
+//! ## 曾经的 `--sftp-plain`（2026-11-01 已删除）
 //!
-//! 裸 SFTP **没有认证**：谁能连上端口，谁就是管理员。因此：
+//! 那是一个**无认证**的裸 SFTP 监听，只绑 `127.0.0.1`、只存在于 CLI，专门用来
+//! 在不信任传输层的时候单独验证「协议 + 会话 + 分发」。SSH 层落地、互通回归
+//! （`tools/sftp_interop.py` + `tools/sftp_ssh_e2e.py`）跑通之后它就没有存在
+//! 理由了：**无认证的端点不该长期留在二进制里**，哪怕默认不监听。
 //!
-//!   * 只绑 `127.0.0.1`，不绑 `0.0.0.0` —— 局域网也连不上；
-//!   * 必须显式 `--sftp-plain <port>` 才启动，默认完全不监听；
-//!   * 日志里每次启动都打一行警告，避免有人把它当成正式功能。
-//!
-//! 这三条是硬约束，不是建议。SSH 层落地后这个监听应当直接删掉。
+//! 它连带删掉的还有 `connThread` / `serveStream`（那条路径专用的裸字节循环）
+//! 和 `tools/sftp_probe.py`（只配它用的零依赖探针）。handler 的分发逻辑本来
+//! 就有纯单测（内存驱动 + 内存 fetcher，不起服务、不联网），探针带来的覆盖是
+//! 重复的。
 
 const std = @import("std");
 const api = @import("api.zig");
@@ -196,127 +194,7 @@ fn fetchHttp(self: *Wire, alloc: std.mem.Allocator, link: model.Link, offset: u6
 }
 
 // ---------------------------------------------------------------------------
-// 裸 TCP 监听（仅调试）
-// ---------------------------------------------------------------------------
-
-/// 在 `127.0.0.1:port` 上跑一个**无认证**的 SFTP 端点。见文件头的安全边界。
-pub fn servePlain(app: *api.App, port: u16) !void {
-    const io = rt.io();
-    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
-    var listener = try addr.listen(io, .{ .reuse_address = true });
-    defer listener.deinit(io);
-
-    log.warn("sftp(plain): listening on 127.0.0.1:{d} — NO AUTHENTICATION, debug only", .{port});
-
-    while (true) {
-        const stream = listener.accept(io) catch |e| switch (e) {
-            error.ConnectionAborted => continue,
-            error.SocketNotListening => return,
-            else => {
-                log.warn("sftp(plain): accept failed: {s}", .{@errorName(e)});
-                continue;
-            },
-        };
-        const t = std.Thread.spawn(.{}, connThread, .{ app, stream }) catch |e| {
-            log.warn("sftp(plain): spawn failed: {s}", .{@errorName(e)});
-            stream.close(io);
-            continue;
-        };
-        t.detach();
-    }
-}
-
-fn connThread(app: *api.App, stream: std.Io.net.Stream) void {
-    const gpa = rt.gpa();
-    defer stream.close(rt.io());
-
-    var wire: Wire = undefined;
-    wire.initInPlace(app, gpa);
-    defer wire.deinit();
-
-    var sess = session.Session.init(gpa);
-    defer sess.deinit();
-
-    var ctx = handler.Context{
-        .alloc = gpa,
-        .resolver = resolverFor(app),
-        .fetcher = wire.fetcher(),
-        .temp_dir = app.mp_dir,
-        .max_write_bytes = app.mp_max_bytes,
-    };
-
-    serveStream(&ctx, &sess, stream) catch |e| {
-        if (e != error.ConnectionClosed and e != error.BrokenPipe) {
-            log.debug("sftp(plain): connection ended: {s}", .{@errorName(e)});
-        }
-    };
-}
-
-/// 一条连接上的读写循环。抽成独立函数是为了将来 SSH 层能复用它 ——
-/// 届时只需要把 `stream` 换成一个「已解密的字节流」。
-fn serveStream(ctx: *handler.Context, sess: *session.Session, stream: std.Io.net.Stream) !void {
-    const io = rt.io();
-    const gpa = rt.gpa();
-
-    var rbuf: [16 * 1024]u8 = undefined;
-    var srd = stream.reader(io, &rbuf);
-    const rd = &srd.interface;
-
-    var wbuf: [16 * 1024]u8 = undefined;
-    var swr = stream.writer(io, &wbuf);
-    const wr = &swr.interface;
-
-    // 累积缓冲：一个 TCP 分段可能只含半个包，也可能含好几个。
-    var acc = Buf.init(gpa);
-    defer acc.deinit();
-
-    var chunk: [16 * 1024]u8 = undefined;
-
-    while (true) {
-        // 先把缓冲里能解的包全部处理掉，再去读 socket。
-        while (true) {
-            const maybe = protocol.parse(acc.slice()) catch |e| {
-                log.debug("sftp(plain): bad packet: {s}", .{@errorName(e)});
-                return e;
-            };
-            const pkt = maybe orelse break;
-
-            var arena = std.heap.ArenaAllocator.init(gpa);
-            defer arena.deinit();
-            var out = Buf.init(gpa);
-            defer out.deinit();
-
-            handler.dispatch(ctx, sess, arena.allocator(), pkt, &out) catch |e| {
-                log.debug("sftp(plain): dispatch failed: {s}", .{@errorName(e)});
-                return e;
-            };
-            if (out.len > 0) {
-                try wr.writeAll(out.slice());
-                try wr.flush();
-            }
-
-            // 消费掉这个包：把剩余字节前移。
-            const rest = acc.len - pkt.consumed;
-            std.mem.copyForwards(u8, acc.data[0..rest], acc.data[pkt.consumed..acc.len]);
-            acc.len = rest;
-        }
-
-        // ⚠ 这里必须用 `readVec`（有多少拿多少），**不能**用 `readSliceShort`：
-        // 后者的语义是「读满整个 buffer，除非 EOF」。传 16 KiB 的缓冲就意味
-        // 着它会一直等到 16 KiB —— 而客户端发完一个 INIT 包（9 字节）就在等
-        // 回复，双方当场死锁。这个 bug 在探针上表现为「连上了但 INIT 超时」。
-        var iov = [_][]u8{&chunk};
-        const n = rd.readVec(&iov) catch |e| switch (e) {
-            error.EndOfStream => return error.ConnectionClosed,
-            else => return error.ReadFailed,
-        };
-        if (n == 0) return error.ConnectionClosed;
-        try acc.append(chunk[0..n]);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SSH 监听（传输层已验证；认证与 channel 待接）
+// SSH 监听（传输层 + 认证 + channel）
 // ---------------------------------------------------------------------------
 
 /// 在 `address:port` 上跑 SSH-2 + SFTP。

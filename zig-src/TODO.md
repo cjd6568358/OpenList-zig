@@ -54,12 +54,11 @@
 | `src/sftp/protocol.zig` | v3 线协议编解码：帧、`PacketType`/`Status`/`OpenFlags`/`AttrFlags`、`Attributes`、流式 `parse`、`writeStatus/Handle/Data/Attrs` | 16 |
 | `src/sftp/session.zig` | 句柄表（上限 512、id 不复用、重复 close 不致命）、虚拟路径纯词法归一化（`..` 越根钳制而非报错） | 13 |
 | `src/sftp/handler.zig` | 请求分发：`INIT`/`REALPATH`/`STAT`/`LSTAT`/`FSTAT`/`OPENDIR`/`READDIR`（64 条一页）/`MKDIR`/`RMDIR`/`REMOVE`/`RENAME`/`OPEN`(读写/续传)/`READ`（1 MiB 窗口缓存）/`WRITE`/`CLOSE`/`SETSTAT` | 18 |
-| `src/sftp_wire.zig` | 生产接线：`Resolver` 包 `App.resolve`（含虚拟根列挂载点）、`Fetcher` 包 `client.zig` 的 Range 请求、`--sftp-plain` 裸 TCP 监听（仅 127.0.0.1、无认证）、`--sftp-ssh` SSH 监听 | — |
+| `src/sftp_wire.zig` | 生产接线：`Resolver` 包 `App.resolve`（含虚拟根列挂载点）、`Fetcher` 包 `client.zig` 的 Range 请求、`--sftp-ssh` SSH 监听（裸 TCP 调试端点已于 11-01 删除） | — |
 | `src/sftp/ssh.zig` | SSH-2 传输层：版本交换、KEXINIT、`curve25519-sha256`、`ssh-ed25519` host key、二进制包协议、`aes128-ctr`+`hmac-sha2-256`、NEWKEYS 密钥派生、双向 rekey（含 stash） | 14 |
 | `src/sftp/channel.zig` | 连接层（RFC 4254）+ 认证（RFC 4252）+ SFTP 桥接：单 channel、`subsystem sftp`、窗口补给、`max_packet` 分片、服务端主动 rekey 触发 | 3 |
 | `src/util/peeraddr.zig` | 对端 IP 提取（POSIX `getpeername`，**只取 IP 不带端口**；Windows 无对应 API ⇒ null） | 4 |
 | `src/sftp.zig` | 模块入口，汇总四层 | — |
-| `tools/sftp_probe.py` | 裸 SFTP 探针（不依赖 SSH / paramiko），端到端验证协议 → 分发 → 真实驱动 | — |
 | `tools/sftp_ssh_e2e.py` | 走真 SSH 的端到端：认证闸门、大文件往返、rekey（双向）、断点续传 | — |
 | `tools/sftp_interop.py` | 第三方客户端互通：PuTTY `psftp` / WinSCP / `rclone` 各跑一遍 ls/put/get/rm 并逐字节比对 | — |
 
@@ -134,10 +133,11 @@ fetcher，不起服务、不联网）：`Resolver`（路径 → 驱动 + 相对�
    `accept` 死循环跑在 detached 线程里，没有 stop 句柄，运行时起停要先解决
    「怎么唤醒阻塞中的 accept」。等前端构建进发布物再做，见 §60.37 末尾。
 
-> `--sftp-plain`（无认证、固定绑 `127.0.0.1`、启动打 WARN）**保留**：TODO 原
-> 来说互通落地后就删，但它是 `tools/sftp_probe.py`（唯一零第三方依赖的探针）
-> 的唯一入口，且只存在于 CLI、不在配置文件里，不存在「线上误开」的路径。
-> 要删的话连探针一起删，说一声即可。
+> `--sftp-plain` **已删除**（2026-11-01，用户要求）：无认证的裸 SFTP 端点不该
+> 长期留在二进制里，哪怕默认不监听、只绑 loopback。连带删掉 `servePlain` /
+> `connThread` / `serveStream` 和 `tools/sftp_probe.py`。handler 的分发逻辑本来
+> 就有纯单测（内存驱动 + 内存 fetcher），探针带来的覆盖是重复的；SSH 侧的回归
+> 靠 `sftp_ssh_e2e.py`（paramiko）+ `sftp_interop.py`（psftp / WinSCP / rclone）。
 
 密码学**不需要任何 C 库**（2026-10-31 核对 `lib/std/crypto/`）：
 `std.crypto.dh.X25519`（KEX）、`25519/ed25519.zig`（host key）、
