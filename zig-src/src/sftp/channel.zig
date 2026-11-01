@@ -29,6 +29,16 @@
 //! 个包还没等到就退回「照发并告警」，宁可违反窗口也不能把连接挂死。
 //! 等待期间收到的 `CHANNEL_DATA` 追加进 `acc`，交给外层循环处理，不递归
 //! 分发。
+//!
+//! ## 重协商（rekey）
+//!
+//! 客户端在传够一定数据量或时间后（OpenSSH 默认 1 GB / 1 h）会自己发一个新的
+//! `KEXINIT` 要求换密钥。这一步在 `onRekey` 里就地完成：`ssh.rekey` 走一遍
+//! 完整的 KEX，**只换密钥**，channel 状态、窗口、`acc` 里半个 SFTP 包全部保留。
+//! 两个细节都是「错了不报错、只表现为随机断连」的那种：
+//!
+//!   - 序列号**不重置**（RFC 4253 §7.3），重置会让之后每个包的 MAC 都对不上；
+//!   - `session_id` **沿用首次的 H**（§7.2），取新的会让派生出的密钥不一致。
 
 const std = @import("std");
 const ssh = @import("ssh.zig");
@@ -98,6 +108,8 @@ pub const Auth = struct {
 pub const Conn = struct {
     alloc: std.mem.Allocator,
     t: *ssh.Transport,
+    /// 重协商时要用它重新签名 —— 客户端可能在传输中途发起（RFC 4253 §9）。
+    host_key: ssh.HostKey,
     handler: SftpHandler,
     auth: Auth,
 
@@ -114,8 +126,15 @@ pub const Conn = struct {
     /// 也可能含好几个。
     acc: Buf,
 
-    pub fn init(alloc: std.mem.Allocator, t: *ssh.Transport, handler: SftpHandler, auth: Auth) Conn {
-        return .{ .alloc = alloc, .t = t, .handler = handler, .auth = auth, .acc = Buf.init(alloc) };
+    pub fn init(alloc: std.mem.Allocator, t: *ssh.Transport, host_key: ssh.HostKey, handler: SftpHandler, auth: Auth) Conn {
+        return .{
+            .alloc = alloc,
+            .t = t,
+            .host_key = host_key,
+            .handler = handler,
+            .auth = auth,
+            .acc = Buf.init(alloc),
+        };
     }
 
     pub fn deinit(self: *Conn) void {
@@ -144,6 +163,7 @@ pub const Conn = struct {
     }
 
     fn dispatch(self: *Conn, a: std.mem.Allocator, p: []const u8) !void {
+        log.debug("ssh: msg {d} len={d}", .{ p[0], p.len });
         switch (p[0]) {
             ssh.MSG_DISCONNECT => return error.PeerDisconnect,
             ssh.MSG_IGNORE, ssh.MSG_DEBUG, ssh.MSG_UNIMPLEMENTED => {},
@@ -153,15 +173,38 @@ pub const Conn = struct {
             MSG_CHANNEL_REQUEST => try self.onChannelRequest(a, p),
             MSG_CHANNEL_DATA => try self.onChannelData(a, p),
             MSG_CHANNEL_WINDOW_ADJUST => try self.onWindowAdjust(p),
-            MSG_CHANNEL_EOF => {},
-            MSG_CHANNEL_CLOSE => return error.ChannelClosed,
-            // TODO(rekey)：客户端在长传输后（OpenSSH 约 1 GB / 1 h）会主动
-            // 发起重协商。现在只回 UNIMPLEMENTED，客户端随即断连 —— 大文件
-            // 传输会在中途掉线。要支持得把 `ssh.kex` 接进这个循环，并且
-            // **沿用首次的 session_id**（RFC 4253 §7.2）。
-            ssh.MSG_KEXINIT => try self.unimplemented(a),
+            MSG_CHANNEL_EOF => {
+                // 客户端说「不再发请求了」，收尾由我们做。PuTTY 的 pscp
+                // 就停在这一步等我们关，不回 close 它永远不退出。
+                self.closeChannel();
+                return error.ChannelClosed;
+            },
+            MSG_CHANNEL_CLOSE => {
+                self.closeChannel();
+                return error.ChannelClosed;
+            },
+            // 客户端在长传输后（OpenSSH 约 1 GB / 1 h）会主动发起重协商。
+            // 不接这一步的话，客户端要么收到 UNIMPLEMENTED 后断连，要么在
+            // 收不到我们的 KEXINIT 时超时 —— 症状都是「大文件传到一半掉线」。
+            ssh.MSG_KEXINIT => try self.onRekey(p),
             else => try self.unimplemented(a),
         }
+    }
+
+    /// 客户端主动重协商密钥（RFC 4253 §9）。
+    ///
+    /// ⚠ 用 `self.alloc` 而**不是**本轮循环的 arena：`kex` 会把双方的 KEXINIT
+    /// 原样 dup 到连接级内存（下一次重协商还要拿它们算 H），arena 在下一轮
+    /// 循环就被释放了，留着就是个悬垂 slice。
+    ///
+    /// 通道状态（窗口、channel 号、`acc` 里半个 SFTP 包）一律不动：重协商只
+    /// 换密钥，不动会话。`seq_in` / `seq_out` 也不重置 —— RFC 4253 §7.3 明确
+    /// 「序列号永不重置」，重置会让后续每个包的 MAC 都对不上。
+    fn onRekey(self: *Conn, p: []const u8) !void {
+        log.debug("ssh: client requested rekey", .{});
+        const kr = try ssh.rekey(self.t, self.host_key, self.alloc, p);
+        kr.deinit(self.alloc);
+        log.info("ssh: rekey ok", .{});
     }
 
     fn unimplemented(self: *Conn, a: std.mem.Allocator) !void {
@@ -171,11 +214,35 @@ pub const Conn = struct {
         try self.t.writePacket(b.slice());
     }
 
+    /// 收尾：给客户端发 `EOF` + `CLOSE` 两个包。
+    ///
+    /// RFC 4254 §5.3：`EOF` 表示「我不会再发了」，本身不要求回应；channel 的
+    /// 真正结束靠 `CLOSE`，而**收到 close 的一方必须回一个 close**。
+    ///
+    /// 两个包都要发：PuTTY 的 pscp 传完后只发 `EOF` 就等着我们关，不回
+    /// `CLOSE` 它会一直挂着 —— 进度条 100%、文件逐字节正确，但命令不退出。
+    /// （OpenSSH 自己会发 `CLOSE`，所以只测 OpenSSH 发现不了。）
+    ///
+    /// 发不出去不算错误：对端已经走了，连接本来就要关。
+    fn closeChannel(self: *Conn) void {
+        var b = Buf.init(self.alloc);
+        defer b.deinit();
+        for ([_]u8{ MSG_CHANNEL_EOF, MSG_CHANNEL_CLOSE }) |msg| {
+            b.clearRetainingCapacity();
+            b.appendByte(msg) catch return;
+            ssh.putU32(&b, self.remote_id) catch return;
+            self.t.writePacket(b.slice()) catch |e| {
+                log.debug("ssh: cannot send channel msg {d}: {s}", .{ msg, @errorName(e) });
+                return;
+            };
+        }
+    }
+
     fn onServiceRequest(self: *Conn, a: std.mem.Allocator, p: []const u8) !void {
         var r = ssh.Reader{ .buf = p[1..] };
         const name = try r.string();
         if (!std.mem.eql(u8, name, "ssh-userauth")) {
-            try ssh.sendDisconnect(self.t, 7, "service not available"); // SSH_DISCONNECT_SERVICE_NOT_AVAILABLE
+            try ssh.sendDisconnect(self.t, ssh.DISCONNECT_SERVICE_NOT_AVAILABLE, "service not available");
             return error.PeerDisconnect;
         }
         var b = Buf.init(a);
@@ -407,9 +474,19 @@ pub const Conn = struct {
                     if (ch != self.local_id) return error.BadChannel;
                     try self.feedData(a, data);
                 },
-                MSG_CHANNEL_EOF => {},
-                MSG_CHANNEL_CLOSE => return error.ChannelClosed,
+                MSG_CHANNEL_EOF => {
+                    self.closeChannel();
+                    return error.ChannelClosed;
+                },
+                MSG_CHANNEL_CLOSE => {
+                    self.closeChannel();
+                    return error.ChannelClosed;
+                },
                 ssh.MSG_DISCONNECT => return error.PeerDisconnect,
+                // 等窗口期间客户端也可能发起重协商。这里不处理的话，我们会
+                // 静默丢掉它的 KEXINIT，随后把 KEX_ECDH_INIT 也当无关包扔掉，
+                // 客户端就一直等我们的 KEXINIT 直到超时。
+                ssh.MSG_KEXINIT => try self.onRekey(p),
                 else => {},
             }
         }
@@ -473,7 +550,7 @@ pub fn run(
 
     try ssh.handshake(&t, host_key, alloc);
 
-    var c = Conn.init(alloc, &t, handler, auth);
+    var c = Conn.init(alloc, &t, host_key, handler, auth);
     defer c.deinit();
     try c.loop();
 }
@@ -530,7 +607,12 @@ test "ssh/channel: 未认证的 CHANNEL_OPEN 必须被拒" {
         .rd = &rd,
         .wr = &out.writer,
     };
-    var c = Conn.init(testing.allocator, &t, .{
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 7);
+    var hk = try ssh.HostKey.fromSeed(testing.allocator, seed);
+    defer hk.deinit(testing.allocator);
+
+    var c = Conn.init(testing.allocator, &t, hk, .{
         .ctx = undefined,
         .handleFn = stubHandle,
     }, .{
@@ -547,4 +629,45 @@ test "ssh/channel: 未认证的 CHANNEL_OPEN 必须被拒" {
     try testing.expect(w.len > 5);
     try testing.expectEqual(MSG_CHANNEL_OPEN_FAILURE, w[5]);
     try testing.expectEqual(@as(u32, 0), c.local_id); // 没有通道被建立
+}
+
+test "ssh/channel: 收尾必须发 EOF + CLOSE 两个包" {
+    // PuTTY 的 pscp 传完后只发一个 `CHANNEL_EOF` 就停在那里等我们关
+    // （RFC 4254 §5.3 里 EOF 不要求回应，真正结束靠 close）。只发 CLOSE 或者
+    // 干脆断 TCP，pscp 都会挂到超时 —— 文件内容已经完全正确、进度条 100%，
+    // 只是命令不返回。OpenSSH 自己会发 close，所以这条洞只能用第二个客户端
+    // 实现才暴露得出来，这里用单测把它钉住。
+    var rd = std.Io.Reader.fixed(&.{});
+    var out = std.Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+
+    var t = ssh.Transport{ .alloc = testing.allocator, .rd = &rd, .wr = &out.writer };
+    defer t.deinit();
+
+    var seed: [32]u8 = undefined;
+    @memset(&seed, 7);
+    var hk = try ssh.HostKey.fromSeed(testing.allocator, seed);
+    defer hk.deinit(testing.allocator);
+
+    var c = Conn.init(testing.allocator, &t, hk, .{
+        .ctx = undefined,
+        .handleFn = stubHandle,
+    }, .{
+        .ctx = undefined,
+        .verifyFn = stubVerify,
+    });
+    defer c.deinit();
+    c.remote_id = 7; // 客户端的 channel 号：close 要发给它
+
+    c.closeChannel();
+
+    const w = out.written();
+    try testing.expect(w.len > 16);
+    const first_total = @as(usize, std.mem.readInt(u32, w[0..4], .big)) + 4;
+
+    try testing.expectEqual(MSG_CHANNEL_EOF, w[5]);
+    try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, w[6..10], .big));
+
+    try testing.expectEqual(MSG_CHANNEL_CLOSE, w[first_total + 5]);
+    try testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, w[first_total + 6 ..][0..4], .big));
 }

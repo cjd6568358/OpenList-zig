@@ -90,6 +90,10 @@ fetcher，不起服务、不联网）：`Resolver`（路径 → 驱动 + 相对�
   写全部挂载）、三处 P1（SFTP 启动失败拖垮 HTTP、`sftp.port` 恒压过 `listen`、
   `openForWrite` 的 fd/temp 泄漏），并把发送窗口从「不足时照发」改成「同步等
   `WINDOW_ADJUST`」。单测 520 pass + 3 skip。
+* **重协商 + 第二个客户端实现**（2026-11-01，见 §60.35）：客户端主动 rekey
+  已接（连续两次，之后 300 KiB `get` 仍逐字节一致）；PuTTY `pscp` 列目录 /
+  下载 / 上传全部通过 —— 它暴露了一个 OpenSSH 测不出的收尾缺陷（只发 `EOF`
+  就等服务端关，我们不回 `CLOSE` 就永远不退出）。单测 525 pass + 3 skip。
 
 剩余（按依赖顺序）：
 
@@ -100,14 +104,15 @@ fetcher，不起服务、不联网）：`Resolver`（路径 → 驱动 + 相对�
 2. **断点续传**：`OPEN` 带 `write` 但没有 `trunc`、且目标已存在时明确回
    `op_unsupported`（要先下载现有内容到 temp 才能续写）。主流客户端上传都用
    `write|creat|trunc`，不受影响。
-3. **互通**：OpenSSH `sftp` 已通过；WinSCP、FileZilla、`rclone lsd :sftp:`
-   待测。落地后删掉 `--sftp-plain`（无认证端点不该长期存在）。
+3. **互通**：OpenSSH `sftp`、PuTTY `pscp` 已通过（后者暴露了一个 OpenSSH
+   测不出的收尾问题，见 §60.35）；WinSCP、FileZilla、`rclone lsd :sftp:` 待测。
+   落地后删掉 `--sftp-plain`（无认证端点不该长期存在）。
 4. **前端开关**：管理页「存储/设置」里没有 SFTP 入口，目前只能手改
    `config.json`。等配置面稳定后再决定要不要暴露到 UI。
-5. **客户端 rekey**：长传输后（OpenSSH 约 1 GB / 1 h）客户端会主动发
-   `KEXINIT` 重协商，现在 `channel.dispatch` 只回 `UNIMPLEMENTED` ⇒ 连接随即
-   断开。要支持得把 `ssh.kex` 接进消息循环，并且**沿用首次的 session_id**
-   （RFC 4253 §7.2）。代码里已用 `TODO(rekey)` 标出。
+5. **重协商的触发阈值**：客户端主动 rekey 已支持（§60.35），但**服务端自己**
+   不发起重协商。OpenSSH 默认 1 GB / 1 h 由客户端发起，够用；若以后要按
+   服务端策略强制换密钥（例如 `RekeyLimit` 更激进），需要定时器 + 主动发
+   `KEXINIT` 并处理「两边同时发起」的竞争。
 6. **`READ` 依赖驱动上报的 size**：`details().size <= 0` 时句柄 size 归 0，
    `offset >= size` ⇒ 恒回 EOF，表现为「能列出来但读出来是空」。要支持得改成
    「size 未知时按 Range 请求的实际返回判断 EOF」。

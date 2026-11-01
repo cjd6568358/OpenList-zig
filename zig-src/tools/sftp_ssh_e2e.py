@@ -8,7 +8,10 @@
 * 未认证直接开 channel 必须被拒（`channel.zig` 的 P0 闸门）；
 * 错口令必须被拒；
 * 大文件 `get` 必须逐字节一致 —— 这一条会走满 `sendData` 的分片与
-  `waitForWindow` 的等待路径，是窗口流控唯一能自动回归的地方。
+  `waitForWindow` 的等待路径，是窗口流控唯一能自动回归的地方；
+* 客户端主动重协商（rekey）后会话必须照常可用 —— OpenSSH 大约每 1 GB 或
+  1 小时会自己发起一次，服务端不接就是「大文件传到一半掉线」。连做两次是为了
+  抓「上次的 KEXINIT 存放在短命 allocator 里」这类悬垂引用。
 
 依赖：**paramiko**（唯一一个需要第三方包的回归工具；其余探针都刻意零依赖）。
 安装到隔离环境：
@@ -97,6 +100,25 @@ def main():
     back = os.path.join(work, "back.txt")
     sftp.get(args.dir + "/e2e_small.txt", back)
     check("put/get 往返一致", md5(back) == md5(small))
+
+    # ---- 1b) 客户端主动重协商（rekey）：只换密钥，会话继续 ----
+    # 连续两次：第二次会复用上一次写进 Transport 的 KEXINIT 原文（算 H 要用）。
+    # 如果那份内存挂在短命 arena 上，第二次重协商就会读到已释放的字节 ——
+    # 症状是密钥算错、之后所有包 BadMac，而不是当场报错。
+    try:
+        for i in (1, 2):
+            c.get_transport().renegotiate_keys()
+            check(f"第 {i} 次 rekey 成功", c.get_transport().is_active())
+    except Exception as e:  # noqa: BLE001
+        check("rekey 成功", False, f"{type(e).__name__}: {e}")
+
+    back2 = os.path.join(work, "back2.txt")
+    sftp.get(args.dir + "/e2e_small.txt", back2)
+    check("rekey 后 get 仍然一致", md5(back2) == md5(small))
+
+    got2 = os.path.join(work, "got2.bin")
+    sftp.get(args.dir + "/e2e_big.bin", got2)
+    check("rekey 后 get 300KiB 仍然一致", md5(got2) == md5(big))
 
     for name in ("e2e_big.bin", "e2e_small.txt"):
         try:

@@ -374,6 +374,7 @@ fn bridgeHandle(
     out: *Buf,
 ) anyerror!void {
     const b: *Bridge = @ptrCast(@alignCast(c));
+    log.debug("sftp: pkt {s}", .{@tagName(pkt.packet_type)});
     return handler.dispatch(b.ctx, b.sess, a, pkt, out);
 }
 

@@ -5249,3 +5249,90 @@ KEX 取 H、H 的串接顺序（RFC 8731）、MAC 覆盖 seq‖明文且在加�
 
 复核只增加 **1,536 B**。单测：**520 pass + 3 skip**（新增
 「listen 只填补未显式给出的 address/port」一条），0 失败。
+
+### 60.35 重协商、第二个客户端实现与两处收尾缺陷（2026-11-01）
+
+上一轮留下的 `TODO(rekey)` 和「互通未测」一起做掉了。过程中撞到两个**只有换
+客户端实现才会暴露**的缺陷。
+
+**① 客户端主动重协商（rekey）**
+
+OpenSSH 大约每 1 GB 或 1 小时会自己发一个新的 `KEXINIT`。之前 `dispatch` 只
+回 `UNIMPLEMENTED`，客户端随即断连 —— 症状是「大文件传到一半掉线」，而单测
+永远碰不到（单测里没有 1 GB 的传输）。
+
+改法：`ssh.kex` 拆出 `kexInner(t, host_key, alloc, pending_client_kexinit)`，
+`kex` 传 null，`rekey` 传已经读到的那份 `KEXINIT`；`channel.onRekey` 接在
+`dispatch` 和 `waitForWindow` 两处。三个不能错的细节：
+
+* `session_id` **沿用首次的 H**（§7.2），取新的会让派生密钥不一致；
+* `seq_in` / `seq_out` **不重置**（§7.3），重置后每个包的 MAC 都对不上；
+* 重协商用的是**连接级 allocator**而不是消息循环的 arena —— `kex` 会把双方
+  的 `KEXINIT` 原文 dup 进 `Transport`（下次重协商还要用它们算 H），arena 在
+  下一轮循环就释放了，留着就是悬垂 slice。**连做两次 rekey** 才能抓到这一点。
+
+验证：paramiko `Transport.renegotiate_keys()` 连做两次，之后 300 KiB `get`
+仍逐字节一致。
+
+**② `readPacket` 的返回值不能直接 free**
+
+`readPacket` 返回的是 `body[1..len-padlen]` —— 分配起点 +5 字节、长度也不同。
+之前 KEX 里读到的包从不释放（首次 KEX 走的是 gpa），想补上释放时才发现
+`a.free(p)` 会直接 panic（`SafeAllocator`：free of invalid memory）。
+
+新增 `readPacketOwned`，把整块（`raw`）与 payload 一起交出，`OwnedPacket.deinit`
+释放 `raw`；`readPacket` 变成它的薄包装（arena 调用方不需要单独释放）。
+`readKexPacket` 改为返回 `OwnedPacket`，KEX 的三处读包点各自 `defer deinit`。
+另外 KEX 期间会跳过 `IGNORE` / `DEBUG` / `UNIMPLEMENTED`（§11.3 允许插在任意
+两个包之间），遇到 `DISCONNECT` 直接当对端断开。
+
+**③ 协商失败要发 `DISCONNECT`，不能静默关 socket**
+
+`checkKexInit` 早就返回错误了，但没人告诉客户端原因 —— 客户端只看到「连接被
+对端关闭」，运维也分不清是算法不匹配还是进程崩了。现在按 §11.1 发
+`DISCONNECT`：算法不匹配用 3（`KEY_EXCHANGE_FAILED`）并在描述里写明我们支持
+什么，KEXINIT 解析失败用 2（`PROTOCOL_ERROR`）。
+
+**④ 收尾：收到 `EOF` 必须由服务端回 `EOF` + `CLOSE`**
+
+PuTTY 的 `pscp` 传完文件后**只发一个 `CHANNEL_EOF`** 就停在那里等服务端关
+（RFC 4254 §5.3 里 EOF 不要求回应，真正结束靠 `CLOSE`）。我们原来把
+`CHANNEL_CLOSE` 当成「直接断 TCP」，`EOF` 干脆忽略，于是 pscp 永远不退出：
+
+```
+dl4.bin | 300 kB | 300.0 kB/s | 100%      ← 内容逐字节正确
+                                          ← 然后挂到超时，退出码 124
+```
+
+OpenSSH 自己会发 `CLOSE`，所以这个洞用 OpenSSH 测不出来。现在 `dispatch` 和
+`waitForWindow` 的 `EOF` / `CLOSE` 两条路径都调 `closeChannel()`（先 EOF 再
+CLOSE），单测钉住两个包的顺序与 channel 号。
+
+**⑤ 第二个客户端实现（互通的实质进展）**
+
+PuTTY 0.85 的 SSH 栈与 OpenSSH、paramiko 完全独立。实测：
+
+| 操作 | 结果 |
+|---|---|
+| `pscp -ls :/local` | 列出 3 个文件，退出码 0 |
+| `pscp :/local/big.bin`（300 KiB） | md5 一致，退出码 0 |
+| `pscp up_local.txt :/local/pscp_up.txt` | md5 一致，退出码 0 |
+
+顺带确认 host key 指纹跨连接稳定（`SHA256:Gk0Q1vH0…`，PuTTY 会缓存）。
+
+> OpenSSH 的口令认证在本机 shell 里无法自动化（`SSH_ASKPASS` 不被
+> Windows 版接受），所以 OpenSSH 只验到 KEX + 加密 USERAUTH；端到端回归用
+> paramiko + PuTTY 两套实现覆盖。
+
+**调试口子**：`--log-level debug` 会打每个 SSH 消息号与 SFTP 包类型，定位
+「客户端卡在哪一步」时非常有用（上面第 ④ 条就是这么定位的）。
+
+### 60.36 体积与单测（rekey 之后）
+
+| 阶段 | 大小 | sha256 |
+|---|---|---|
+| + 复核修复（60.34） | 1,935,360 B | `948ed083` |
+| + rekey / 收尾 / DISCONNECT | **1,942,528 B** | `78d263d3` |
+
++7,168 B。单测：**525 pass + 3 skip**（新增 4 条：DISCONNECT 两个原因码、
+KEX 失败路径不泄漏、收尾必须发 EOF+CLOSE），0 失败，0 泄漏。

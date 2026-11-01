@@ -82,6 +82,8 @@
 10. 路由白名单：`handle()` 只放行已知前缀进 `handleAuthed`，加端点必须同步改白名单。
 11. 架构：每请求一个 ArenaAllocator（`http.zig:622`）；`Client` 每实例一把全局锁（`client.zig:159`），并发靠每 worker 一个 Client；`model.Obj` 无 ID ⇒ 189 靠路径逐段翻页找 ID。
 12. busybox ash 的 `trap 'cmd' INT TERM` 跑完会从中断处继续循环 ⇒ trap 里必须显式 `exit`；TERM 要等当前 `sleep` 跑完。
+13. **协议实现只用一个客户端验证 = 必然漏**：PuTTY 的 `pscp` 传完只发 `CHANNEL_EOF` 就等服务端关，而 OpenSSH 自己会发 `CLOSE` ⇒ 「不回 close」这个洞用 OpenSSH 永远测不出来，症状是「文件已 100% 正确但命令不退出」。**每加一个协议层，至少用两套独立实现回归**（SFTP 现有 paramiko + PuTTY `pscp`）。
+14. **`Transport.readPacket` 返回的是分配块 +5 的子切片，不能直接 `free`**（`SafeAllocator` 直接 panic）。需要释放走 `readPacketOwned` → `OwnedPacket.deinit`。
 
 ## 边界与 API 契约
 
@@ -96,7 +98,8 @@
 ## 文档与留档
 
 - **权威待办 `zig-src/TODO.md`**（只放未做项）；状态与编年 `zig-src/docs/STATUS.md`；驱动审计 `docs/AUDIT_2026-10-18-drivers.md`。基线：467 单测 + 3 skip。分片上传真机验收用 `tools/multipart_upload.py`（Git Bash 要给 `--path` 加 `MSYS_NO_PATHCONV=1`，否则路径被改写成 `D:/Program Files/Git/...` ⇒ 服务端回 `storage not found`）。
-- **SFTP 端到端回归** `zig-src/tools/sftp_ssh_e2e.py`（唯一依赖 **paramiko** 的工具，装在 `binaries/python/envs/default`）：先起服务（data 目录首次用 `OPENLIST_ADMIN_PASSWORD=<pw>` 建管理员，config 里塞一个 Local 存储，`--sftp-ssh <port>`），再 `python tools/sftp_ssh_e2e.py --port <n> --password <pw>`。⚠ Windows 自带 `sftp.exe` 非交互拿不到口令（`SSH_ASKPASS` 无效）⇒ 只能走 paramiko；paramiko 只认 `curve25519-sha256@libssh.org`，脚本里补了 `curve25519-sha256` 别名，**不要**为此改服务端算法宣告。裸协议探针 `tools/sftp_probe.py`（零依赖，走 `--sftp-plain`，不含 SSH 层）。
+- **SFTP 端到端回归** `zig-src/tools/sftp_ssh_e2e.py`（唯一依赖 **paramiko** 的工具，装在 `binaries/python/envs/default`）：先起服务（data 目录首次用 `OPENLIST_ADMIN_PASSWORD=<pw>` 建管理员，config 里塞一个 Local 存储，`--sftp-ssh <port>`），再 `python tools/sftp_ssh_e2e.py --port <n> --password <pw>`。脚本含客户端主动 rekey（连做两次）。⚠ Windows 自带 `sftp.exe` 非交互拿不到口令（`SSH_ASKPASS` 无效）⇒ 只能走 paramiko；paramiko 只认 `curve25519-sha256@libssh.org`，脚本里补了 `curve25519-sha256` 别名，**不要**为此改服务端算法宣告。裸协议探针 `tools/sftp_probe.py`（零依赖，走 `--sftp-plain`，不含 SSH 层）。
+- **PuTTY 互通回归**（第二套独立 SSH 栈，10-31 起可用 `pscp`/`plink`）：`pscp -batch -pw <pw> -P <port> -hostkey "SHA256:<fp>" admin@127.0.0.1:/local/x.bin ./x.bin`；`-ls` 可列目录。⚠ batch 模式**必须**给 `-hostkey`，否则 `Cannot confirm a host key in batch mode`。定位卡点用 `openlist server --log-level debug`（打每条 SSH 消息号 + SFTP 包类型）。
 - **根目录整洁铁律**：根只允许上游文件 + `zig-src/ .github/ .workbuddy/ .workbuddy-ai/`；Zig 脚本一律 `zig-src/tools/`，新脚本用 `Path(__file__).resolve().parents[2]` 定位根。
 - **pan115 fixture 铁律**：`src/drivers/115list_fixture.json`（`tools/gen_115_fixture.py` 生成）**必须入库**；真机原文 `115list_sample.json` **永不入库**。
 - **外部二进制留档**：`D:/workspace/server/armbian/bin/openlist/` = 二进制（= 设备现役 `935ab9fc`，10-31 版）+ 设备现役 `config.zig.json`；`_backup/` 已清空，设备侧不留 .bak。换二进制走设备脚本规定的流程：传 `openlist.new` → `chmod 755` → `openlist_start.sh stop` → `mv -f` → `openlist_start.sh`。

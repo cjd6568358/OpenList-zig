@@ -59,6 +59,11 @@ pub const MSG_NEWKEYS: u8 = 21;
 pub const MSG_KEX_ECDH_INIT: u8 = 30;
 pub const MSG_KEX_ECDH_REPLY: u8 = 31;
 
+// ---- 断开原因码（RFC 4253 §11.1），只列本实现会用到的 ----
+pub const DISCONNECT_PROTOCOL_ERROR: u32 = 2;
+pub const DISCONNECT_KEY_EXCHANGE_FAILED: u32 = 3;
+pub const DISCONNECT_SERVICE_NOT_AVAILABLE: u32 = 7;
+
 pub const server_version = "SSH-2.0-OpenList_0.1";
 
 /// 单包上限。OpenSSH 默认 256 KiB；SFTP 的读块不会超过这个量级。
@@ -304,7 +309,28 @@ pub const Transport = struct {
     }
 
     /// 读一个包，返回 payload（调用方的 `a` 拥有）。**不含** padding 与长度字段。
+    ///
+    /// ⚠ 返回值是整块分配的**子切片**（起点 +5 字节），**不能**直接 `free`：
+    /// 长度和起点都对不上，`SafeAllocator` 会当成非法释放 panic。需要自己
+    /// 释放时用 `readPacketOwned`。
     pub fn readPacket(self: *Transport, a: std.mem.Allocator) ![]const u8 {
+        const p = try self.readPacketOwned(a);
+        return p.payload;
+    }
+
+    /// 一块已分配的包：`raw` 是整个分配，`payload` 是去掉长度与 padding 的
+    /// 子切片。连接级 allocator（首次 KEX、重协商）必须用这个版本才能正确
+    /// 释放 —— 否则每条连接漏一个包。
+    pub const OwnedPacket = struct {
+        raw: []u8,
+        payload: []const u8,
+
+        pub fn deinit(self: OwnedPacket, a: std.mem.Allocator) void {
+            a.free(self.raw);
+        }
+    };
+
+    pub fn readPacketOwned(self: *Transport, a: std.mem.Allocator) !OwnedPacket {
         var lenbuf: [4]u8 = undefined;
         self.rd.readSliceAll(&lenbuf) catch return error.ConnectionClosed;
         if (self.enc_in) |*c| c.xor(&lenbuf);
@@ -313,6 +339,7 @@ pub const Transport = struct {
         if (len < 5 or len > max_packet) return error.BadPacketLength;
 
         const body = try a.alloc(u8, len);
+        errdefer a.free(body);
         self.rd.readSliceAll(body) catch return error.ConnectionClosed;
         if (self.enc_in) |*c| c.xor(body);
 
@@ -334,7 +361,7 @@ pub const Transport = struct {
         const padlen = body[0];
         if (padlen < 4 or @as(usize, padlen) + 1 > len) return error.BadPadding;
         self.seq_in +%= 1;
-        return body[1 .. len - padlen];
+        return .{ .raw = body, .payload = body[1 .. len - padlen] };
     }
 
     /// 发一个包。`payload` 的第一字节是消息号。
@@ -380,6 +407,19 @@ pub const Transport = struct {
         try b.append(body);
         try self.writePacket(b.slice());
     }
+
+    /// 协商失败时先发 `DISCONNECT` 说明原因，再把错误交给调用方。
+    ///
+    /// 只 close socket 是不够的：客户端只能看到「连接被对端关闭」，运维也就
+    /// 无从区分「算法不匹配」和「服务进程崩了」。RFC 4253 §11.1 要求说明原因。
+    /// 这里自己吞掉发送错误 —— 发送失败说明对端已经走了，原本那个 KEX 失败
+    /// 才是要上报的根因。
+    fn rejectKex(self: *Transport, e: anyerror) void {
+        const info = kexFailInfo(e);
+        sendDisconnect(self, info.code, info.desc) catch |se| {
+            log.debug("ssh: cannot send DISCONNECT: {s}", .{@errorName(se)});
+        };
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -399,6 +439,44 @@ fn derive(k_mpint: []const u8, h_hash: [32]u8, letter: u8, session_id: [32]u8, o
     // 本实现只需要 <= 32 字节的密钥，无需继续 K2/K3。
 }
 
+/// KEX 失败对应的 `DISCONNECT` 原因码与说明。
+const KexFail = struct { code: u32, desc: []const u8 };
+
+fn kexFailInfo(e: anyerror) KexFail {
+    return switch (e) {
+        error.NoCommonKex => .{ .code = DISCONNECT_KEY_EXCHANGE_FAILED, .desc = "no common key exchange algorithm (server offers curve25519-sha256)" },
+        error.NoCommonHostKey => .{ .code = DISCONNECT_KEY_EXCHANGE_FAILED, .desc = "no common host key algorithm (server offers ssh-ed25519)" },
+        error.NoCommonCipher => .{ .code = DISCONNECT_KEY_EXCHANGE_FAILED, .desc = "no common cipher (server offers aes128-ctr)" },
+        error.NoCommonMac => .{ .code = DISCONNECT_KEY_EXCHANGE_FAILED, .desc = "no common MAC (server offers hmac-sha2-256)" },
+        else => .{ .code = DISCONNECT_PROTOCOL_ERROR, .desc = "malformed key exchange message" },
+    };
+}
+
+/// KEX 期间读包：跳过 `IGNORE` / `DEBUG` / `UNIMPLEMENTED`。
+///
+/// RFC 4253 §11.3 允许这几种消息插在任何两个包之间，且它们不占用 KEX 的
+/// 消息序号。不跳过的话，一个发了 `IGNORE` 的客户端会让 KEX 直接失败。
+/// 返回整块的所有权（`OwnedPacket`）—— 首次 KEX 走的是 gpa，调用方必须释放。
+fn readKexPacket(t: *Transport, a: std.mem.Allocator) !Transport.OwnedPacket {
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const p = try t.readPacketOwned(a);
+        if (p.payload.len == 0) {
+            p.deinit(a);
+            continue;
+        }
+        switch (p.payload[0]) {
+            MSG_IGNORE, MSG_DEBUG, MSG_UNIMPLEMENTED => p.deinit(a),
+            MSG_DISCONNECT => {
+                p.deinit(a);
+                return error.PeerDisconnect;
+            },
+            else => return p,
+        }
+    }
+    return error.TooManyGenericPackets;
+}
+
 pub const KexResult = struct {
     h: [32]u8,
     session_id: [32]u8,
@@ -413,6 +491,25 @@ pub const KexResult = struct {
 ///
 /// `a` 是**连接级** allocator：`k_mpint` 要活到密钥派生结束。
 pub fn kex(t: *Transport, host_key: HostKey, a: std.mem.Allocator) !KexResult {
+    return kexInner(t, host_key, a, null);
+}
+
+/// 客户端已经发来 `KEXINIT` 时继续这次重协商（RFC 4253 §9）。
+///
+/// 与 `kex` 的唯一区别：客户端的 KEXINIT 已经由消息循环读掉，这里不再读一遍。
+/// 其余完全一致 —— 包括**沿用首次的 `session_id`**（`t.session_id` 非空时
+/// 不再取 H），这是 RFC 4253 §7.2 的要求，取错不会报错，只会让密钥不一致。
+pub fn rekey(t: *Transport, host_key: HostKey, a: std.mem.Allocator, client_kexinit: []const u8) !KexResult {
+    return kexInner(t, host_key, a, client_kexinit);
+}
+
+fn kexInner(
+    t: *Transport,
+    host_key: HostKey,
+    a: std.mem.Allocator,
+    /// 非空 = 客户端主动重协商，其 `KEXINIT` 已经读到了。
+    pending_client_kexinit: ?[]const u8,
+) !KexResult {
     // ---- 1. 发 KEXINIT ----
     {
         var b = Buf.init(a);
@@ -440,19 +537,34 @@ pub fn kex(t: *Transport, host_key: HostKey, a: std.mem.Allocator) !KexResult {
     }
 
     // ---- 2. 收客户端的 KEXINIT ----
-    {
-        const p = try t.readPacket(a);
-        if (p.len < 1 or p[0] != MSG_KEXINIT) return error.ExpectedKexInit;
+    // 重协商时这份 KEXINIT 已经由消息循环读掉并传进来了（`rekey`），首次
+    // KEX 才从线上读 —— 读到的包归本作用域，用完要释放（首次 KEX 用的
+    // allocator 是连接级的 gpa，不释放就是每条连接一个泄漏）。
+    if (pending_client_kexinit) |p| {
         if (t.kexinit_recv.len > 0) a.free(t.kexinit_recv);
         t.kexinit_recv = try a.dupe(u8, p);
-        try checkKexInit(p);
+        checkKexInit(p) catch |e| {
+            t.rejectKex(e);
+            return e;
+        };
+    } else {
+        const pkt = try readKexPacket(t, a);
+        defer pkt.deinit(a);
+        if (pkt.payload.len < 1 or pkt.payload[0] != MSG_KEXINIT) return error.ExpectedKexInit;
+        if (t.kexinit_recv.len > 0) a.free(t.kexinit_recv);
+        t.kexinit_recv = try a.dupe(u8, pkt.payload);
+        checkKexInit(pkt.payload) catch |e| {
+            t.rejectKex(e);
+            return e;
+        };
     }
 
     // ---- 3. 收 KEX_ECDH_INIT，拿 Q_C ----
     const q_c: []const u8 = blk: {
-        const p = try t.readPacket(a);
-        if (p.len < 1 or p[0] != MSG_KEX_ECDH_INIT) return error.ExpectedEcdhInit;
-        var r = Reader{ .buf = p[1..] };
+        const pkt = try readKexPacket(t, a);
+        defer pkt.deinit(a);
+        if (pkt.payload.len < 1 or pkt.payload[0] != MSG_KEX_ECDH_INIT) return error.ExpectedEcdhInit;
+        var r = Reader{ .buf = pkt.payload[1..] };
         const q = try r.string();
         if (q.len != 32) return error.BadEcdhKey;
         break :blk try a.dupe(u8, q);
@@ -504,8 +616,9 @@ pub fn kex(t: *Transport, host_key: HostKey, a: std.mem.Allocator) !KexResult {
     // ---- 7. NEWKEYS 双向 ----
     try t.sendMsg(MSG_NEWKEYS, "");
     {
-        const p = try t.readPacket(a);
-        if (p.len < 1 or p[0] != MSG_NEWKEYS) return error.ExpectedNewKeys;
+        const pkt = try readKexPacket(t, a);
+        defer pkt.deinit(a);
+        if (pkt.payload.len < 1 or pkt.payload[0] != MSG_NEWKEYS) return error.ExpectedNewKeys;
     }
 
     // ---- 8. 安装密钥 ----
@@ -706,10 +819,6 @@ test "ssh: 密钥派生的六个方向互不相同" {
 
 /// 处理一条 SSH 连接：版本交换 → KEX → 消息循环。
 ///
-/// 目前循环只应答 `SERVICE_REQUEST`（回 `SERVICE_ACCEPT`），认证与 channel
-/// 在下一层实现。客户端走到这一步会看到「认证未实现」—— 但**能走到这一步
-/// 就说明传输层是对的**：认证消息是加密且带 MAC 的，密钥或 MAC 错一个字节，
-/// 客户端会报 `Corrupted MAC on input`，而不是 `Permission denied`。
 /// 版本交换 + KEX。返回后 `t` 处于加密状态，可以开始收发应用层消息。
 ///
 /// 连接循环（认证 / channel）不在这里 —— 见 `channel.zig`。切开是为了让传输层
@@ -731,4 +840,87 @@ pub fn sendDisconnect(t: *Transport, reason: u32, desc: []const u8) !void {
     try putString(&b, desc);
     try putString(&b, "");
     try t.writePacket(b.slice());
+}
+
+// ---------------------------------------------------------------------------
+// 测试：协商失败必须显式断开
+// ---------------------------------------------------------------------------
+
+test "ssh: 协商失败发 DISCONNECT（而不是静默关 socket）" {
+    // 只回 UNIMPLEMENTED 或干脆 close 的话，客户端只会报「连接被对端关闭」，
+    // 而运维看到的就是一个没有原因的断连。原因码是唯一能区分「算法不匹配」
+    // 和「服务崩了」的东西，所以钉住它。
+    var rd = std.Io.Reader.fixed(&.{});
+    var out = std.Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+
+    var t = Transport{ .alloc = testing.allocator, .rd = &rd, .wr = &out.writer };
+    defer t.deinit();
+
+    t.rejectKex(error.NoCommonCipher);
+
+    // 明文包：[len:4][padlen:1][msg:1][reason:4][desc...]
+    const w = out.written();
+    try testing.expect(w.len > 10);
+    try testing.expectEqual(MSG_DISCONNECT, w[5]);
+    try testing.expectEqual(DISCONNECT_KEY_EXCHANGE_FAILED, std.mem.readInt(u32, w[6..10], .big));
+}
+
+test "ssh: 畸形 KEXINIT 用 PROTOCOL_ERROR 断开" {
+    // 解析失败（不是「没有共同算法」）属于协议错误，原因码必须是 2 ——
+    // 报成 3 会让对端以为该换算法重试。
+    try testing.expectEqual(DISCONNECT_PROTOCOL_ERROR, kexFailInfo(error.EndOfStream).code);
+    try testing.expectEqual(DISCONNECT_KEY_EXCHANGE_FAILED, kexFailInfo(error.NoCommonKex).code);
+    try testing.expectEqual(DISCONNECT_KEY_EXCHANGE_FAILED, kexFailInfo(error.NoCommonHostKey).code);
+    try testing.expectEqual(DISCONNECT_KEY_EXCHANGE_FAILED, kexFailInfo(error.NoCommonMac).code);
+}
+
+test "ssh: KEX 失败路径不泄漏（读到的包必须释放）" {
+    // 客户端发完 KEXINIT 就断线：kex 会走到「等 KEX_ECDH_INIT」时失败。
+    // 这条路径上有三份堆内存：我们自己的 KEXINIT（存进 Transport）、客户端
+    // KEXINIT 的原件（读完要释放）、以及 dup 进 Transport 的那份。
+    // 用 testing.allocator 跑，漏任何一份都会在测试结束时炸出来 ——
+    // 服务端用的是 gpa，这类泄漏在线上只能表现为「内存缓慢增长」。
+    var payload = Buf.init(testing.allocator);
+    defer payload.deinit();
+    try payload.appendByte(MSG_KEXINIT);
+    try payload.append(&fill(16, 0)); // cookie
+    try putNameList(&payload, "curve25519-sha256");
+    try putNameList(&payload, "ssh-ed25519");
+    try putNameList(&payload, "aes128-ctr");
+    try putNameList(&payload, "aes128-ctr");
+    try putNameList(&payload, "hmac-sha2-256");
+    try putNameList(&payload, "hmac-sha2-256");
+    try putNameList(&payload, "none");
+    try putNameList(&payload, "none");
+    try putNameList(&payload, "");
+    try putNameList(&payload, "");
+    try payload.appendByte(0); // first_kex_packet_follows
+    try putU32(&payload, 0);
+
+    // 封成线上格式（[len:4][padlen:1][payload][padding]）—— 客户端发来的
+    // 就是这个样子，直接喂裸 payload 的话 readPacket 会把它当成长度字段。
+    var framed = std.Io.Writer.Allocating.init(testing.allocator);
+    defer framed.deinit();
+    {
+        var no_in = std.Io.Reader.fixed(&.{});
+        var tw = Transport{ .alloc = testing.allocator, .rd = &no_in, .wr = &framed.writer };
+        try tw.writePacket(payload.slice());
+    }
+
+    var rd = std.Io.Reader.fixed(framed.written());
+    var out = std.Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+
+    var t = Transport{ .alloc = testing.allocator, .rd = &rd, .wr = &out.writer };
+    defer t.deinit();
+
+    var hk = try HostKey.fromSeed(testing.allocator, fill(32, 9));
+    defer hk.deinit(testing.allocator);
+
+    // 客户端发完 KEXINIT 就断线：kex 在等 KEX_ECDH_INIT 时读到 EOF。
+    try testing.expectError(error.ConnectionClosed, kex(&t, hk, testing.allocator));
+    // 我们发出去的 KEXINIT 必须已经记在 Transport 上（否则 H 算出别的值）。
+    try testing.expect(t.kexinit_sent.len > 0);
+    try testing.expect(t.kexinit_recv.len > 0);
 }
