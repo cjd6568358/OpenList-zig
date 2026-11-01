@@ -30,7 +30,7 @@
 
 - Zig 0.17.0：`C:\Program Files\zig-x86_64-windows-0.17.0\zig.exe`；**基线 550 pass + 4 skip**（`zig-src` 下跑）。
 - 必须：① `tools/ziglib_patch.py "<toolchain>/lib" C:/zigcache/olz-ziglib`（已就绪，`grep -c "openlist-zig patch"` = 2）；② 用 **`ZIG_LIB_DIR=C:/zigcache/olz-ziglib`**（`--zig-lib-dir` 0.17 不认）；③ `ZIG_GLOBAL_CACHE_DIR`/`ZIG_LOCAL_CACHE_DIR` → `C:/zigcache/olz`。
-- **🔴 裸调 `zig build`（漏 ZIG_LIB_DIR）= 静默丢 TLS 补丁**：不报错，部署后 Quark/UC 消失（14→12）。尺寸判据代码一变即失效（10-31 生产 `935ab9fc` / 11-01 候选 1,950,720 B `2199ecbd`）；**最终判据：部署后 grep `mount(s) published` = 14**。
+- **🔴 裸调 `zig build`（漏 ZIG_LIB_DIR）= 静默丢 TLS 补丁**：不报错，部署后 Quark/UC 消失（14→12）。尺寸判据代码一变即失效（**11-01 生产 aarch64 1,447,328 B `b7bdef70`**，win 1,952,768 B `49d0627c`）；**最终判据：部署后 grep `mount(s) published` = 14**。
 - ⚠ `zig build` 吞 "All tests passed" 且末尾打误导性 `failed command`（退出码 0）；**跑测试一律带 `--summary all`**，判据是 `N pass, M skip`。裸跑 `.zig-cache/o/*/test.exe` 必崩（`--listen=-` 是 server 模式）——正常现象。裸 `zig test src/tests.zig` 编译不过（缺 `build_options`）。
 - 单测一律 `std.testing.allocator`；**D 盘满会假报 NoSpaceLeft/泄漏**。写盘只写 `/tmp`；工具链 cache 只读。
 - **Zig 0.17 坑**：裸 `assert` 移除 → `std.debug.assert`；`**` 数组重复非法 → 定长数组 + `@memset`；驱动新方法必须放进 struct；`_ = self;` 在 self 已用时是编译错误。
