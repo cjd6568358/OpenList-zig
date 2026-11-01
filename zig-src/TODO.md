@@ -44,7 +44,7 @@
 `BaiduNetdisk` / `Onedrive` 未移植。Go 树里都有，备份配置里 `/baidu` 是在用的、
 `/onedrive` 是 disabled 的。唯一重启信号：用户说「百度网盘也要」。
 
-## 5. SFTP 服务端（进行中：五层已通，认证已接真校验）
+## 5. SFTP 服务端（可用：五层已通，认证接真校验，三客户端互通通过）
 
 2026-10-31 动手，分层落地。已完成的两层**零依赖、可纯单测**（不需要密钥、
 不需要起服务、不需要真实客户端）：
@@ -53,12 +53,15 @@
 |---|---|---|
 | `src/sftp/protocol.zig` | v3 线协议编解码：帧、`PacketType`/`Status`/`OpenFlags`/`AttrFlags`、`Attributes`、流式 `parse`、`writeStatus/Handle/Data/Attrs` | 16 |
 | `src/sftp/session.zig` | 句柄表（上限 512、id 不复用、重复 close 不致命）、虚拟路径纯词法归一化（`..` 越根钳制而非报错） | 13 |
-| `src/sftp/handler.zig` | 请求分发：`INIT`/`REALPATH`/`STAT`/`LSTAT`/`FSTAT`/`OPENDIR`/`READDIR`（64 条一页）/`MKDIR`/`RMDIR`/`REMOVE`/`RENAME`/`OPEN`(只读)/`READ`（1 MiB 窗口缓存）/`CLOSE`/`SETSTAT` | 13 |
+| `src/sftp/handler.zig` | 请求分发：`INIT`/`REALPATH`/`STAT`/`LSTAT`/`FSTAT`/`OPENDIR`/`READDIR`（64 条一页）/`MKDIR`/`RMDIR`/`REMOVE`/`RENAME`/`OPEN`(读写/续传)/`READ`（1 MiB 窗口缓存）/`WRITE`/`CLOSE`/`SETSTAT` | 18 |
 | `src/sftp_wire.zig` | 生产接线：`Resolver` 包 `App.resolve`（含虚拟根列挂载点）、`Fetcher` 包 `client.zig` 的 Range 请求、`--sftp-plain` 裸 TCP 监听（仅 127.0.0.1、无认证）、`--sftp-ssh` SSH 监听 | — |
-| `src/sftp/ssh.zig` | SSH-2 传输层：版本交换、KEXINIT、`curve25519-sha256`、`ssh-ed25519` host key、二进制包协议、`aes128-ctr`+`hmac-sha2-256`、NEWKEYS 密钥派生 | 7 |
-| `src/sftp/channel.zig` | 连接层（RFC 4254）+ 认证（RFC 4252）+ SFTP 桥接：单 channel、`subsystem sftp`、窗口补给、`max_packet` 分片 | 1 |
+| `src/sftp/ssh.zig` | SSH-2 传输层：版本交换、KEXINIT、`curve25519-sha256`、`ssh-ed25519` host key、二进制包协议、`aes128-ctr`+`hmac-sha2-256`、NEWKEYS 密钥派生、双向 rekey（含 stash） | 14 |
+| `src/sftp/channel.zig` | 连接层（RFC 4254）+ 认证（RFC 4252）+ SFTP 桥接：单 channel、`subsystem sftp`、窗口补给、`max_packet` 分片、服务端主动 rekey 触发 | 3 |
+| `src/util/peeraddr.zig` | 对端 IP 提取（POSIX `getpeername`，**只取 IP 不带端口**；Windows 无对应 API ⇒ null） | 4 |
 | `src/sftp.zig` | 模块入口，汇总四层 | — |
 | `tools/sftp_probe.py` | 裸 SFTP 探针（不依赖 SSH / paramiko），端到端验证协议 → 分发 → 真实驱动 | — |
+| `tools/sftp_ssh_e2e.py` | 走真 SSH 的端到端：认证闸门、大文件往返、rekey（双向）、断点续传 | — |
+| `tools/sftp_interop.py` | 第三方客户端互通：PuTTY `psftp` / WinSCP / `rclone` 各跑一遍 ls/put/get/rm 并逐字节比对 | — |
 
 `handler.zig` 用两个窄接口隔离依赖，所以分发逻辑能纯单测（内存驱动 + 内存
 fetcher，不起服务、不联网）：`Resolver`（路径 → 驱动 + 相对路径）、`Fetcher`
@@ -94,30 +97,47 @@ fetcher，不起服务、不联网）：`Resolver`（路径 → 驱动 + 相对�
   已接（连续两次，之后 300 KiB `get` 仍逐字节一致）；PuTTY `pscp` 列目录 /
   下载 / 上传全部通过 —— 它暴露了一个 OpenSSH 测不出的收尾缺陷（只发 `EOF`
   就等服务端关，我们不回 `CLOSE` 就永远不退出）。单测 525 pass + 3 skip。
+* **复核后的五项收尾**（2026-11-01，见 §60.37）：①失败计数按 IP 分桶（64 桶
+  LRU，HTTP/SSH 仍共用同一份，换协议绕不过去）；②断点续传（不带 `trunc` 打开
+  已存在文件时先把原内容拉进 temp 再接受 `WRITE`）；③`READ` 不再把「驱动没报
+  size」当成空文件（`size_known` + 短读判 EOF）；④服务端主动 rekey
+  （`sftp.rekey_mb`，默认 1024 MiB；KEX 期间对端继续发的包进 stash，NEWKEYS
+  后补投）；⑤host key 落成 0600。单测 537 pass + 4 skip。
+* **互通抓到一个收尾缺陷**（同日，见 §60.38）：psftp 连跑 15 次挂 6 次，报
+  `Software caused connection abort` / `Remote side unexpectedly closed network
+  connection`，而且**文件传完、rm 都成功了，就 quit 那一下报错**。根因是收到
+  `CHANNEL_EOF` 后发完 `EOF`+`CLOSE` 就关 socket，对端回的 `CLOSE` 还没读走 ⇒
+  Winsock 用 RST 收尾。改成 §5.3 的双向握手（等对端 CLOSE 再关）后 15/15 全过，
+  pscp 这种「只发 EOF 就等我们关」的客户端也不受影响。单测 538 pass + 4 skip。
+* **互通三客户端自动化**（同日）：`tools/sftp_interop.py` 把 PuTTY `psftp`、
+  WinSCP、`rclone`（临时 `:sftp:` 远端，不写配置）三个第三方客户端串起来跑
+  `ls`/`put`/`get`/`rm` 并逐字节比对 —— 512 KiB 往返全过；OpenSSH `sftp`
+  因「没有 sshpass 就传不进口令」只能手工跑，脚本里明确报 SKIP 而不是假装通过。
+  `--kib` 可调数据量，用来把「传输量」这个变量从一次失败里摘出去；
+  **连跑才有意义**（上面那个收尾缺陷单跑一次是 60% 概率溜过去的）。
+* **独立复核后的修复**（同日，见 §60.39 / `docs/REVIEW_2026-11-01-sftp.md`）：
+  ①**WebDAV 完全不参与失败计数** ⇒ `/dav` 是整套限速的后门（`curl -u admin:猜`
+  无限试），现按 Go `WebDAVAuth` 补上，且区分「没带凭据」（不计数）与「凭据错」
+  （计数）；②已知大小时的**上游短读**被当成 EOF ⇒ 下载静默截断，改回 `FAILURE`；
+  ③续传把「驱动不报大小」当成「空文件」⇒ 上传静默缺一块，改成明确拒绝；
+  ④锁定期内继续尝试会续期（对齐 Go `Expire`）、成功登录不再新建桶；
+  ⑤更正「上游用 `IP:端口`」的错误归因（FTP 带端口，HTTP 是纯 IP，上游 SFTP
+  无 `LoginCache`）。单测 **550 pass + 4 skip**。
 
-剩余（按依赖顺序）：
+剩余：
 
-1. **失败计数按 IP 分桶**：现在是**全局**计数（`std.Io.net.Stream` 不暴露对端
-   地址），副作用是任何人都能把管理员账户锁 5 分钟、并顺带锁住 HTTP 登录。
-   拿到 IP 后 key **必须用纯 IP 不带端口** —— 上游用 `IP:端口`，扫描器源端口
-   每次都变，限速形同虚设（`docs/STATUS.md` §9）。
-2. **断点续传**：`OPEN` 带 `write` 但没有 `trunc`、且目标已存在时明确回
-   `op_unsupported`（要先下载现有内容到 temp 才能续写）。主流客户端上传都用
-   `write|creat|trunc`，不受影响。
-3. **互通**：OpenSSH `sftp`、PuTTY `pscp` 已通过（后者暴露了一个 OpenSSH
-   测不出的收尾问题，见 §60.35）；WinSCP、FileZilla、`rclone lsd :sftp:` 待测。
-   落地后删掉 `--sftp-plain`（无认证端点不该长期存在）。
-4. **前端开关**：管理页「存储/设置」里没有 SFTP 入口，目前只能手改
-   `config.json`。等配置面稳定后再决定要不要暴露到 UI。
-5. **重协商的触发阈值**：客户端主动 rekey 已支持（§60.35），但**服务端自己**
-   不发起重协商。OpenSSH 默认 1 GB / 1 h 由客户端发起，够用；若以后要按
-   服务端策略强制换密钥（例如 `RekeyLimit` 更激进），需要定时器 + 主动发
-   `KEXINIT` 并处理「两边同时发起」的竞争。
-6. **`READ` 依赖驱动上报的 size**：`details().size <= 0` 时句柄 size 归 0，
-   `offset >= size` ⇒ 恒回 EOF，表现为「能列出来但读出来是空」。要支持得改成
-   「size 未知时按 Range 请求的实际返回判断 EOF」。
-7. **host key 文件权限**：`data/ssh_host_ed25519_key` 是 32 字节私钥 seed，目前
-   按默认权限写出。应落成 0600（`0600` 在 Windows 上要显式设置 ACL）。
+1. **前端开关**：管理页「存储/设置」里没有 SFTP 入口，只能手改 `config.json`。
+   **这一条在当前仓库里做不了**，缺的东西是具体的：①仓库没有前端产物
+   （`public/dist/` 只有一个 README，`dist_dir` 默认空 ⇒ 服务端只发占位页），
+   没有页面可加控件；②`setting/save` 写的是 `zig.*`，SFTP 读的是根上的
+   `sftp.*`，不是同一张表，得先加映射；③就算存进去了也不会生效 —— 监听器是
+   `accept` 死循环跑在 detached 线程里，没有 stop 句柄，运行时起停要先解决
+   「怎么唤醒阻塞中的 accept」。等前端构建进发布物再做，见 §60.37 末尾。
+
+> `--sftp-plain`（无认证、固定绑 `127.0.0.1`、启动打 WARN）**保留**：TODO 原
+> 来说互通落地后就删，但它是 `tools/sftp_probe.py`（唯一零第三方依赖的探针）
+> 的唯一入口，且只存在于 CLI、不在配置文件里，不存在「线上误开」的路径。
+> 要删的话连探针一起删，说一声即可。
 
 密码学**不需要任何 C 库**（2026-10-31 核对 `lib/std/crypto/`）：
 `std.crypto.dh.X25519`（KEX）、`25519/ed25519.zig`（host key）、

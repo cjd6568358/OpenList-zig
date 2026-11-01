@@ -199,7 +199,7 @@
   `reset_token`（§45）、`fs/copy`（驱动不支持时 501）、上传进度**已通过 `fs/put`
   暴露给前端**（`api.zig` 的 `PutProgress`）。
 - **SFTP SSH 服务端：明确 defer**。单用户虽可缩授权范围（仅开放一个管理员账号、复用现有 `driver.Driver` vtable），但仍需 SSH transport + SFTP 协议，而 Zig 标准库无现成 SSH server，需移植/引依赖；恢复前应先选定可信 SSH 实现并以 OpenSSH/Paramiko 验证互通与 xz 体积，不直接自写密码学传输层。
-- **★ 未来移植 SFTP/FTP 服务端时的安全要点（用户 2026-10-13 提出的上游 bug）**：上游 Go 版的 SFTP/FTP 登录**失败计数 key 用了 `IP:端口`** —— 互联网扫描器每次连接源端口都不同，计数永远到不了阈值，**限速/锁定形同虚设**（已被真实爆破验证）。这条值得反馈上游 OpenList。我们将来实现时：**失败计数的 key 必须用纯 IP**（不带端口），阈值判定、锁定时长（Go `model.DefaultMaxAuthRetries` / `DefaultLockDuration`，见 `server/handles/auth.go` 的 `model.LoginCache` 用法）也要对齐并自查一遍 key 的粒度。同理适用于 HTTP 登录接口现有限流逻辑的复查。
+- **★ 未来移植 SFTP/FTP 服务端时的安全要点（用户 2026-10-13 提出的上游 bug）**：上游 Go 版的 **FTP** 登录失败计数 key 用了 `IP:端口`（`server/ftp.go` 的 `cc.RemoteAddr().String()`）—— 互联网扫描器每次连接源端口都不同，计数永远到不了阈值，**限速/锁定形同虚设**（已被真实爆破验证）。这条值得反馈上游 OpenList。（**2026-11-01 复核更正**：HTTP 登录那条路径没有这个问题 —— `server/handles/auth.go` 用的是 `c.ClientIP()`，gin 会剥掉端口；上游 SFTP 侧根本没有 `LoginCache`。所以「带端口」只发生在 FTP。）我们将来实现时：**失败计数的 key 必须用纯 IP**（不带端口），阈值判定、锁定时长（Go `model.DefaultMaxAuthRetries` / `DefaultLockDuration`，见 `server/handles/auth.go` 的 `model.LoginCache` 用法）也要对齐并自查一遍 key 的粒度。同理适用于 HTTP 登录接口现有限流逻辑的复查。
 
 ## 10. 与上游代码对比（当前布局：Go 树 + `zig-src/` 并列）
 
@@ -4693,7 +4693,8 @@ DigestInfo 前缀（约 80 行）。
 
 SSH-2 传输层（RFC 4253/4252/4254）→ 请求分发到 `driver.Driver` vtable →
 `sftp` 配置段 → 四家客户端互通回归。认证的失败计数 key **必须用纯 IP 不带
-端口**（上游 Go 版用 `IP:端口`，扫描器每次源端口不同，限速形同虚设，见 §9）。
+端口**（上游 Go 的 **FTP** 用 `cc.RemoteAddr().String()`，带端口 ⇒ 扫描器源
+端口一变就是一个新桶，限速形同虚设；HTTP 登录的 `c.ClientIP()` 才是纯 IP。见 §9）。
 
 ### 60.6 handler 层（同日，接 60.3）
 
@@ -5033,10 +5034,11 @@ channel 层只问「过没过」，不知道 `twoHashPwd` 的存在 —— 口�
 共用是刻意的：**换个协议不能绕过限速**。副作用是 SSH 爆破会顺带锁住 HTTP
 登录 5 分钟 —— 单管理员部署下可接受，Go 也是同一份 `LoginCache`。
 
-⚠ 计数 key 目前是**全局**而非按 IP：`std.Io.net.Stream` 不暴露对端地址（与
+⚠ 计数 key 当时是**全局**而非按 IP：`std.Io.net.Stream` 不暴露对端地址（与
 HTTP 登录同一个限制）。后果是任何人都能锁住管理员账户 5 分钟。将来拿到 IP 后
-key **必须用纯 IP、不带端口**（上游用 `IP:端口`，扫描器源端口每次都变，计数
-永远到不了阈值 —— `docs/STATUS.md` §9）。
+key **必须用纯 IP、不带端口**（上游 FTP 用的是带端口的 `RemoteAddr()`，扫描器
+源端口每次都变，计数永远到不了阈值 —— `docs/STATUS.md` §9）。**已于 2026-11-01
+按此实现**（`util/peeraddr.zig` + 64 桶 LRU，见 §60.39）。
 
 ### 60.24 实测（OpenSSH `sftp`，`OPENLIST_ADMIN_PASSWORD=test123`）
 
@@ -5336,3 +5338,318 @@ PuTTY 0.85 的 SSH 栈与 OpenSSH、paramiko 完全独立。实测：
 
 +7,168 B。单测：**525 pass + 3 skip**（新增 4 条：DISCONNECT 两个原因码、
 KEX 失败路径不泄漏、收尾必须发 EOF+CLOSE），0 失败，0 泄漏。
+
+### 60.37 五项收尾：按 IP 分桶 / 续传 / size 未知 / 服务端 rekey / host key 权限
+
+| 阶段 | 大小 | sha256 |
+|---|---|---|
+| + rekey / 收尾 / DISCONNECT（60.36） | 1,942,528 B | `78d263d3` |
+| + 本轮五项收尾（中间态，终值见 §60.38） | 1,951,232 B | `584db25f` |
+
++8,704 B。单测：**537 pass + 4 skip**（新增 12 条），0 失败，0 泄漏。
+端到端 `sftp_ssh_e2e.py` **15/15 PASS**，互通 `sftp_interop.py` **3/3 PASS**。
+
+#### ① 失败计数按 IP 分桶（`src/util/peeraddr.zig` 新增）
+
+原来是**全局**一个计数，副作用很具体：谁都能拿错口令把管理员账户锁 5 分钟，
+而且顺带锁住 HTTP 登录（两边共用同一份计数 —— 这一点是特性，换协议不该绕过
+限速）。根因是 `std.Io.net.Stream` 不暴露对端地址。
+
+* POSIX 走 `std.posix.getpeername`；**Windows 没有对应 API**（
+  `std.posix.getpeername` 在 Windows 上直接 `@compileError("use std.Io instead")`，
+  而 `Io/Threaded.zig` 的 `netAcceptWindows` 拿到了 `RemoteAddress` 却在构造
+  `Socket` 时把它丢了）。所以 Windows 返回 null ⇒ 回退到全局桶，不假装支持。
+* key **必须纯 IP 不带端口**：上游 Go 的 **FTP** 用 `cc.RemoteAddr().String()`
+  （带端口，扫描器每次源端口都不同 ⇒ 限速形同虚设），HTTP 登录的 `c.ClientIP()`
+  才是纯 IP。也不能拿 `Ip4Address.format` / `Ip6Address.format` 生成 key ——
+  两者都会拼 `:端口`（IPv6 还带方括号），所以 `peeraddr` 自建 `format4`，
+  IPv6 复用 `Ip6Address.Unresolved.format`（这个不拼端口）。
+* IPv4 取地址字节用 `@as(*const [4]u8, @ptrCast(&sin.addr)).*` 按**内存序**读，
+  走 `ntohl` 路线会把 `1.2.3.4` 变成 `4.3.2.1`。
+* 分桶本体：64 个桶 + LRU 淘汰。`ThrottleBucket` 新增 `used: bool` ——
+  **不能拿 `key_len == 0` 判空闲**，全局桶的 key 本来就是空串。
+
+#### ② 断点续传（`handler.openForWrite` + `preloadExisting`）
+
+`OPEN` 带 `write` 但不带 `trunc` 且目标已存在 ⇒ 这是续传语义
+（draft-ietf-secsh-filexfer-02 §6.3）。原来直接回 `op_unsupported`，现在：
+
+```
+want_resume = !flags.trunc and exists
+  └─ 按 read_window 分块把现有内容拉进 temp（每块一个 arena），再从 temp 续写
+```
+
+上游短读**直接报错**，不吞：宁可让客户端看到失败，也不要「上传成功但文件少了
+一块」—— 后者是最坏的一种 bug（客户端拿不到任何信号）。测试里专门有一条
+「续传被拒时不能静默截断」，同时覆盖了失败路径上的两处泄漏（都是正常
+`return`，`errdefer` 根本不跑，得手工 `free(vpath_owned)` / `destroy(st)`）。
+
+#### ③ `READ` 不再把「驱动没报 size」当成空文件（`ReadState.size_known`）
+
+`details().size <= 0` 有两种含义：真空文件，或者驱动压根没报大小。原来一律当
+size=0 ⇒ `offset >= size` 恒回 EOF，表现为「能列出来，但读出来是空」。
+现在加 `size_known`：未知时不夹窗口、按 Range 实际返回判断 EOF
+（`got.len == 0` ⇒ EOF，短读 ⇒ 短读回给客户端）。另外把
+`error.EndOfStream` / `error.OutOfRange` 映射成 `.eof` 而不是 `failure`。
+
+#### ④ 服务端主动 rekey（`sftp.rekey_mb`，默认 1024 MiB，0=关）
+
+客户端主动 rekey 在 60.35 已支持；这次补服务端自己发起。两个坑：
+
+* **KEX 期间对端还在发 `CHANNEL_DATA`**。服务端发完 KEXINIT 就进入 KEX 循环，
+  此时读到的非 KEX 包既不能丢也不能就地处理（密钥正在换）。新增
+  `ssh.Stash`（4 MiB / 256 条上限）暂存，`NEWKEYS` 之后 `drainStash` 一包一个
+  arena 补投给 `dispatch` —— 等同于「这些包晚到了一点」。
+* **`-Osmall` 下 inferred error set 成环直接链接失败**：
+  `sendData → waitForWindow → onRekey → drainStash → dispatch → onChannelData →
+  sendData`。给 `drainStash` 显式写 `anyerror!void` 断开推导。
+* 另一个更隐蔽的：`Conn.init` 是**按值返回**的，在 `init` 里取 `&self.stash`
+  存进 `Transport` 会悬垂（栈上的副本）。必须在 `loop()` 开头再赋一次
+  `self.t.stash = &self.stash`。
+
+#### ⑤ host key 文件权限 0600
+
+`data/ssh_host_ed25519_key` 只有 32 字节私钥 seed。写文件时带
+`Permissions.fromMode(0o600)`，**已存在的老文件也 tighten 一次**（升级场景）；
+Windows 上 POSIX mode 无效，打一条 DEBUG 说明要手工设 ACL。
+
+#### 端到端：15/15（含两处工具自身的坑）
+
+```
+PASS 认证通过（正确口令）
+PASS REALPATH . | /
+PASS 列虚拟根非空 | ['local']
+PASS put 后可见
+PASS get 300KiB 逐字节一致（跨分片 + 窗口） | 307200 B
+PASS put/get 往返一致
+PASS 第 1/2 次 rekey 成功（客户端发起）
+PASS rekey 后 get 仍然一致（小文件 + 300KiB 各一次）
+PASS 断点续传保留原内容 | b'0123456789abc'
+PASS 服务端主动发起 rekey | rekeys=5
+PASS 服务端 rekey 期间数据未损坏 | 3145728 B
+PASS 错口令被拒 / 未认证开 channel 被拒
+```
+
+两个「测试自己写错、看起来像产品 bug」的坑，记下来省得下次再踩：
+
+1. **paramiko 的 rekey 计数恒为 0**。最初包 `transport._negotiate_keys`，
+   完全无效 —— paramiko 在 `__init__` 里就把 `_handler_table` 建成
+   `{MSG_KEXINIT: self._negotiate_keys}`，表里存的是 **bound method**，
+   事后改实例属性影响不到分发表。服务端日志明明有
+   `ssh: initiating rekey after 1071824 bytes` + `rekey ok (server-initiated)`，
+   客户端却数到 0。正解是替换 `_handler_table[MSG_KEXINIT]` 那一项
+   （paramiko 源码注释写明这张表就是为了 per-instance 改写才搬进 `__init__`）。
+2. **`--dir /local` 被 Git Bash 改写**。MSYS 的路径转换把 `/local` 变成
+   `C:/Users/.../PortableGit/local`，客户端和服务端各自理解一次，`put` 就报
+   `FileNotFoundError`。跑端到端必须 `MSYS_NO_PATHCONV=1`；当时是靠服务端
+   `sftp: open ... flags=0x1a` 这条 DEBUG 日志才定位到「路径根本不是那个路径」。
+
+#### 互通：三个第三方客户端
+
+`tools/sftp_interop.py`（本轮新增，只依赖标准库 + 客户端本身）：
+
+| 客户端 | 结果 | 备注 |
+|---|---|---|
+| PuTTY `psftp` | PASS | host key 指纹从首次报错里自动捞出来再重跑 |
+| WinSCP 6.7 | PASS | `WinSCP.com /ini=nul /script=`；它把我们当陌生服务器主动降到 v3 |
+| `rclone` 1.75 | PASS | 临时 `:sftp:` 远端；known_hosts 由 paramiko 现问现写 |
+| OpenSSH `sftp` | SKIP | 没有 sshpass 就传不进口令（`SSH_ASKPASS` 在 Windows 不生效），只能手工 |
+
+512 KiB 往返 MD5 全部一致。WinSCP 日志里唯一的「告警」是它自己那句
+「Not well known server, limiting to safe SFTP version 3」—— 我们本来就只支持
+v3，不是缺陷。
+
+#### 这一轮**没做**的，以及为什么
+
+* **前端开关**：仓库里没有前端产物（`public/dist/` 只有一个 README，
+  `dist_dir` 默认空 ⇒ 只发占位页），没有页面可加控件；`setting/save` 写的是
+  `zig.*` 而 SFTP 读根上的 `sftp.*`，不是同一张表；就算存进去也不生效 ——
+  监听器是 `accept` 死循环跑在 detached 线程里，没有 stop 句柄。三样都缺，
+  不是「加个复选框」的事。
+* **删 `--sftp-plain`**：TODO 原话是互通落地后删。它确实是个无认证端点，
+  但只存在于 CLI（不在配置文件里）、固定绑 `127.0.0.1`、启动打 WARN，且是
+  `tools/sftp_probe.py`（唯一零第三方依赖探针）的唯一入口。**保留**，删的话
+  连探针一起删。
+
+### 60.38 收尾握手：发完 `EOF`+`CLOSE` 就关 socket ⇒ 对端收到 RST
+
+这条是 `tools/sftp_interop.py` 抓到的最有价值的一个 —— **只有第三方客户端 +
+多次重复**才暴露得出来，之前偶发过一次被当成环境抖动放过了。
+
+**现象**：psftp 连跑 15 次挂 6 次，两种报错交替出现：
+
+```
+FATAL ERROR: Network error: Software caused connection abort
+FATAL ERROR: Remote side unexpectedly closed network connection
+```
+
+报错点很反直觉：**文件已经传完、`rm` 也返回 OK，最后 `quit` 那一下才报**。
+
+**排除法**（每一步都只改一个变量）：
+
+| 假设 | 实验 | 结果 |
+|---|---|---|
+| 和 rekey 有关 | `--kib 64`，总量 128 KiB，够不到 1 MiB 阈值 | 8/15 照样挂 ⇒ 无关 |
+| psftp 特有 | 手工直连跑 12 次（不经脚本的探测流程） | 5/12 挂 ⇒ 与脚本无关 |
+| 数据量相关 | 512 KiB / 64 KiB 两档 | 都挂 ⇒ 与大小无关 |
+
+**根因**：`dispatch` 收到 `MSG_CHANNEL_EOF` → 发 `EOF`+`CLOSE` → **立刻 return**，
+`loop` 退出、`run` 返回、`stream.close()`。此刻对端回的 `CLOSE` 还排在 socket
+接收缓冲里**没被读走**；Winsock 对「还有未读数据的 close」发的是 **RST 而不是
+FIN**，对端最后一次读写就炸。RST 会不会发出取决于对端的 `CLOSE` 有没有先到，
+所以是**随机**的 —— 这正是它被当成偶发问题的原因。
+
+**修法**（RFC 4254 §5.3 的关闭是双向握手，不是单向通知）：
+
+```
+收到 CHANNEL_EOF → 发 EOF+CLOSE，但【不返回】，继续读
+  ├─ 对端 CHANNEL_CLOSE / DISCONNECT → 返回（此时接收缓冲已清空，close 是干净的 FIN）
+  └─ 其它包 → 丢弃（上限 256 条兜底，对端赖着不发也不会无限读）
+closeChannel() 改幂等（closing 标志）—— 收到对端 CLOSE 时不能再回一个
+```
+
+**验证**：
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| psftp 512 KiB × 15 | 6 失败 | **0 失败** |
+| psftp 64 KiB × 15 | 8 失败 | **0 失败** |
+| pscp 上传 / 下载（「只发 EOF 就等我们关」的客户端） | — | rc=0，MD5 一致，**不挂** |
+| paramiko 端到端 15 项 | 15/15 | 15/15 |
+
+最后一行是必须单独验的：新逻辑会「等对端的 CLOSE」，而 pscp 偏偏是
+「发了 EOF 就等我们关」的那种客户端，一不小心就把自己等死。实测没有。
+
+**顺带记一个把验证做成假通过的坑**：`timeout 30 env MSYS_NO_PATHCONV=1 pscp …`
+在 Git Bash 下**静默什么都不做** —— rc=0、零输出、文件根本没传。当时差点据此
+写「pscp 正常」。直接跑（`MSYS_NO_PATHCONV=1 pscp …`，不套 `timeout`/`env`）才对。
+
+体积与单测：**1,950,720 B / `2199ecbd`**，**538 pass + 4 skip**（新增 1 条：
+「收到 EOF 后要继续读到对端的 CLOSE 才能收尾」）。
+
+---
+
+## 60.39 独立复核：WebDAV 绕过限速、两处静默截断（2026-11-01）
+
+用户要求对 §60.37 / §60.38 的改动做系统性复核。复核报告单独成文
+（`docs/REVIEW_2026-11-01-sftp.md`），本节只记**改了什么**。
+
+### 60.39.1 WebDAV 完全不参与失败计数（高危）
+
+`webdav.zig` 的 `checkBasic` 只校验凭据、**不记账**，而 `/dav` 是无条件路由
+（没有 enable 开关）。于是本轮刚做好的「按 IP 分桶」有一个现成的后门：
+
+```
+curl -u admin:猜口令 http://host/dav/        # 无限次，5 次锁定完全不生效
+```
+
+而且每次失败都要跑一遍 `twoHashPwd`（双层加盐），等于白送一个 CPU 放大面。
+
+Go 上游是**计数**的（`server/webdav.go:52-66`：锁定期 429、失败 `Set(ip, count+1)`、
+成功 `Del(ip)`），所以这是漏实现，不是刻意偏差。修法：
+
+* `handle()` 在 `checkBasic` 之前先过 `authThrottleAllow(req.peer_ip)`，锁定期回
+  **429 + 空正文**（Go 只 `c.Status(429)`）；
+* `checkBasic` 的返回值从 `bool` 改成 `enum { ok, missing, invalid }` —— 只有
+  `invalid` 才记失败。Go 的 `LoginCache.Set` 也只在凭据比对失败的分支里执行，
+  「没带 Authorization」直接 401 不计数。不区分的话，任何扫描器随手发几个不带
+  凭据的 `PROPFIND` 就能把管理员锁 5 分钟，比按 IP 分桶之前还糟。
+
+### 60.39.2 已知大小时的短读被当成 EOF ⇒ 下载静默截断
+
+`handleRead` 把 `error.OutOfRange` 和 `error.EndOfStream` 一起映射成 `EOF`，
+但 `readAt` 在**大小已知**时也返回 `OutOfRange`（上游少给了字节）。后果是客户端
+认为「文件就这么长」，拿到一个残缺文件且没有任何错误 —— 与「上传成功但少一块」
+是同一类问题，只是方向反过来。改回：`OutOfRange` 只在 `!size_known` 时算 EOF，
+已知大小时回 `FAILURE`（§60.37 之前的 `.failure` 行为）。
+
+### 60.39.3 续传把「大小未知」当成「空文件」⇒ 上传静默缺一块
+
+`preloadExisting` 原本 `if (det.size <= 0) return 0; // 空文件`。但同一个文件在
+`handleOpen` 里的判定是 `size_known = f.size > 0` —— 即 `size == 0` 被当作
+**未知**。两处规则相反：驱动报 0 时会预载 0 字节却接受 `offset > 0` 的 `WRITE`，
+前面那段就是空洞，正是续传要避免的场景。改成 `det.size <= 0 ⇒ NotSupported`
+（客户端拿到 `op_unsupported` 会退回 trunc 重传，代价只是重传一次）。
+
+### 60.39.4 限速语义补齐
+
+* **锁定期内继续尝试会续期**（`locked_until = now + 5min`）：Go 在锁定分支里
+  每次请求都 `LoginCache.Expire`，所以持续爆破会把锁定一直往后推。以前不续期
+  ⇒ 锁定只是一个固定 5 分钟窗口，攻击者按节奏打就能拿到稳定配额。
+* **成功登录不再新建桶**：`recordSuccess` 改走 `find()`（有则清零、无则不动）。
+  否则表满时一次成功登录可能把某个**正在锁定**的来源淘汰掉。
+* `authThrottleReset` 不再是死代码（单测用它清理全局状态）。
+
+### 60.39.5 文档更正：「上游用 `IP:端口`」是错的
+
+实测上游：HTTP 登录 `server/handles/auth.go:48` 用 `c.ClientIP()`（gin 剥掉端口，
+**纯 IP**）；只有 **FTP**（`server/ftp.go:116`）用 `cc.RemoteAddr().String()`
+（带端口）；上游 SFTP 侧根本没有 `LoginCache`。结论（键必须纯 IP）没错，但归因
+错了，且已写进三处文档。本节连同 §9 / §60.35 / §60.37 的表述一起更正。
+
+### 60.39.6 工具脚本
+
+* `tools/sftp_interop.py`：rclone 的 `deletefile` 返回码以前被丢弃（`rm` 失败也报
+  PASS），现在检查；全部 SKIP 时退出码改成 **2**（`NOTHING RAN`），免得 CI 把
+  「什么都没验证」当成「全通过」。
+
+### 验证
+
+**549 pass + 4 skip**，0 失败 0 泄漏（本轮 +11 条）：
+
+| 新增用例 | 钉住什么 |
+|---|---|
+| `webdav: 错凭据计入失败数，到阈值后连正确凭据也 429` | R1 的主路径 |
+| `webdav: 不带凭据的 401 不计数` | `missing` / `invalid` 必须区分 |
+| `auth/throttle: 失败计数按来源分桶，锁一个不影响另一个` | 分桶的全部意义 |
+| `auth/throttle: 空键是独立桶，不会和「空位」混淆` | `used` 标志（用 `key_len == 0` 会让全局桶被覆盖） |
+| `auth/throttle: 成功一次清零，之后重新攒满才锁` | `recordSuccess` |
+| `auth/throttle: 锁定期满自动重新计数` | 过期语义 |
+| `auth/throttle: 锁定期内继续尝试会续期` | Go `Expire` 的续期 |
+| `auth/throttle: 表满淘汰最久未用的来源，内存有界` | 64 桶 LRU |
+| `sftp/handler: 大小已知时上游短读必须报错` | R2 |
+| `sftp/handler: 驱动不报大小时不假装续传` | R3 |
+| `ssh/channel: 只有到达字节阈值、且不在 KEX 中，才由服务端发起 rekey` | `shouldRekey` |
+| `ssh/channel: KEX 期间暂存的包按原顺序补投` | `drainStash` 顺序（EOF 先到 ⇒ 先进收尾态，后续 DATA 被丢弃） |
+
+**本地端到端（Windows，`curl`，端口 15677）**：先发 8 次**不带凭据**的
+`PROPFIND /dav/` → 全是 401（若计数，第 5 次后就会 429）；再发 5 次错凭据 →
+全 401；第 6 次换成**正确**凭据 → **429**；随后 `POST /api/auth/login` 用正确
+口令也回 **429** —— 证明 WebDAV 与 HTTP 登录确实共用同一份计数（这条以前是
+假的：WebDAV 根本不记账）。日志里有对应 WARN。
+
+体积：**Windows 1,951,744 B / `161fabd4`**，**aarch64 1,446,792 B / `cfb98afd`**
+（均 `-Doptimize=small`；上一版 1,950,720 B）。真机验证时用的是 R9 修好之前的
+aarch64 构建（`9e8a43b0`，1,446,768 B）—— 两者只差 `--sftp-ssh` 密钥路径那一行，
+不涉及限速路径。
+
+**真机端到端（光猫 aarch64 / musl，`/tmp/olz-ip`，端口 15399 + `--sftp-ssh` 15400）**：
+交叉编译 `-Dtarget=aarch64-linux-musl -Doptimize=small`（当时 1,446,768 B / `9e8a43b0`），
+scp 到 `/tmp/olz-ip`，`--port 15399 --sftp-ssh 15400`，**没有碰生产**（生产 `20556`
+一直跑在 15244，测试后复核仍是 1 个进程、不带 `(deleted)`、`15244=200`）。
+用不同的**目的地址**制造不同的来源 IP：
+
+| 步骤 | 结果 |
+|---|---|
+| 源 `127.0.0.1`：5 次错凭据（WebDAV） | 401 ×5 |
+| 源 `127.0.0.1`：第 6 次**正确**凭据 | **429** |
+| 源 `192.168.1.1`：正确凭据（另一个桶） | **207** ← 分桶成立 |
+| 源 `192.168.1.1`：5 次错凭据后改用 `/api/auth/login` | **429** ← 同 IP 跨协议共用 |
+| 源 `127.0.0.1`：回头再试 | 仍是 **429**（互不影响） |
+| 源 `127.0.0.1`：WebDAV 锁住后，**SSH**（经端口转发，pscp）用正确口令 | **Access denied**，日志 `ssh: auth refused … (from 127.0.0.1)` |
+| 日志里的来源 | 真实 IP（`from 127.0.0.1`），**不是** `unknown` ⇒ POSIX `getpeername` 真的取到了 |
+
+最后两行是这次真机验证的重点：SSH 与 WebDAV 用的是**同一个 IP 桶**，换协议绕不过去；
+而且日志里是真实 IP，说明 `peeraddr` 在 POSIX 上工作正常（Windows 上恒 null）。
+
+⚠ 一个未解释的观察：第一次非 verbose 的 pscp（隧道 + 提前放弃的路径）报过一次
+`Remote side unexpectedly closed network connection`；同一命令加 `-v` 重跑干净收尾，
+本地直连连跑 **8/8 干净**。**未复现，不认定是缺陷**，但记在这里 —— 若以后在
+「客户端拿到错误后立刻断开」的路径上再见到，优先怀疑收尾握手（§60.38 同一类）。
+
+### 60.39.7 顺带修掉：`--sftp-ssh` 的主机密钥路径是相对 cwd 的
+
+真机验证时从 `zig-src/` 起服务，结果仓库里凭空多出 `zig-src/data/ssh_host_ed25519_key`
+—— `main.zig` 把调试端点的密钥路径写死成 `"data/ssh_host_ed25519_key"`，**相对 cwd**，
+而且**忽略**配置里的 `sftp.host_key`。改成传 `cfg.sftp_host_key`：既跟随配置，
+也不再往工作目录里扔东西。`--sftp-ssh` 本身仍只绑 `127.0.0.1`、仍打 WARN。
