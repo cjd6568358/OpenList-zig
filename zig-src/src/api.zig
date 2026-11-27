@@ -129,6 +129,22 @@ pub const App = struct {
     /// 当前时间，于是所有旧令牌立刻失效。对应 Go 的 `model.User.PwdTS`
     /// （server/common/auth.go:19 与 server/middlewares/auth.go:62-66）。
     admin_pwd_ts: i64,
+    /// AUDIT-2026-11-27 #7：管理员凭据组（user/salt/hash/pwd_ts）的一致性闸。
+    /// 写方（setup/meUpdate/reloadAdminCredentials）：先备齐全部新值（失败
+    /// 零残留），再持此锁「retire 旧代 + 逐字段替换」一次性发布；读方
+    /// （loginCommon/checkAuth/issueToken/handleMe/handleInitStatus）持锁读
+    /// 全组 —— 消除「新 user 配旧 salt」类的撕裂读窗口（M17 只解决了 UAF，
+    /// 没解决撕裂）。锁内只有指针赋值、常量时间比较与一次哈希计算，微秒级。
+    /// 当初在「单原子指针切片」与「小锁」之间选了锁：后者零测试构造面改动
+    /// （~15 处字面量 App），且与既有 M17 注释纪律同构。
+    creds_mu: std.Io.Mutex = .init,
+    /// AUDIT #7：首启 TOCTOU 闸。0=未初始化，1=初始化进行中，2=已初始化。
+    /// 进程内 cmpxchg 占位 —— 两个并发 setup 都见 admin_hash 为空时，只有
+    /// 一个能占住闸（Go 有 DB 唯一索引兑底，这里没有；公网首启窗口存在
+    /// 与机主竞速夺号的形态）。测试构造的 App 缺省 0；handleInitStatus 与
+    /// setup 入口判「已初始化」仍以 admin_hash.len 为准（闸只管竞速窗口），
+    /// 所以字面量 App 的既有行为不变。
+    setup_gate: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     /// 权限位图，对应 Go `model.User.Permission`。Go 建 admin 时写死
     /// `0x71FF`（= 29183，`server/handles/setup.go:60`），前端按这些位决定
     /// 显不显示某些操作按钮 —— 返回 0 会让界面把功能全禁掉。
@@ -213,6 +229,8 @@ pub const App = struct {
             // struct cannot be built inline in the literal.
             .frontend = undefined,
         };
+        // AUDIT #7：闸门初值跟随凭据状态（已建管理员 ⇒ 已初始化）。
+        app.setup_gate = std.atomic.Value(u8).init(if (app.admin_hash.len > 0) 2 else 0);
         app.frontend = try frontend_mod.init(alloc, .{
             .site_url = cfg.site_url,
             .cdn = cfg.cdn,
@@ -319,6 +337,9 @@ pub const App = struct {
         // M17（审计）：先把三个新值都备齐（任何一步失败都不会留下半新半旧），
         // 再一次性发布。以前是 `dupe` 一个就赋一个 —— 请求线程无锁读这三个
         // 字段，中间态是「新 hash 配旧 salt」，恰好跨越的那次登录必然失败。
+        // M17（审计）：先把三个新值都备齐（任何一步失败都不会留下半新半旧），
+        // 再一次性发布。以前是 `dupe` 一个就赋一个 —— 请求线程无锁读这三个
+        // 字段，中间态是「新 hash 配旧 salt」，恰好跨越的那次登录必然失败。
         const new_user = try self.alloc.dupe(u8, user);
         errdefer self.alloc.free(new_user);
         const new_salt = try self.alloc.dupe(u8, salt);
@@ -326,15 +347,21 @@ pub const App = struct {
         const new_hash = try self.alloc.dupe(u8, hash);
         errdefer self.alloc.free(new_hash);
 
-        const old = [3][]const u8{ self.admin_user, self.admin_salt, self.admin_hash };
-        self.admin_user = new_user;
-        self.admin_salt = new_salt;
-        self.admin_hash = new_hash;
-        self.admin_pwd_ts = pwd_ts;
-        // 旧值不能当场 free：正在处理的请求可能还持有那几个切片（鉴权在请求
-        // 线程上无锁读）。按代次留存，超过 `retired_creds_cap` 代才释放最老的
-        // 一代 —— 请求是秒级的，8 代远超任何在途请求的生命周期。
-        self.retireCreds(old);
+        // AUDIT #7：发布持 creds_mu（读方锁内读全组，M17 时代是裸发布）。
+        {
+            const io = rt.io();
+            self.creds_mu.lockUncancelable(io);
+            defer self.creds_mu.unlock(io);
+            const old = [3][]const u8{ self.admin_user, self.admin_salt, self.admin_hash };
+            self.admin_user = new_user;
+            self.admin_salt = new_salt;
+            self.admin_hash = new_hash;
+            self.admin_pwd_ts = pwd_ts;
+            // 旧值不能当场 free：正在处理的请求可能还持有那几个切片（鉴权在请求
+            // 线程上无锁读）。按代次留存，超过 `retired_creds_cap` 代才释放最老的
+            // 一代 —— 请求是秒级的，8 代远超任何在途请求的生命周期。
+            self.retireCreds(old);
+        }
     }
 
     /// M17：换下来的旧凭据按代次留存后回收（见 `reloadAdminCredentials`）。
@@ -1226,7 +1253,14 @@ fn handleInitStatus(app: *App, req: *http.Request, res: *http.Response) !void {
         return res.jsonError(405, "method not allowed");
     }
     // Go 的判据是"管理员是否已存在"（`op.GetAdmin()` 取不到记录 ⇒ 未初始化）。
-    try res.jsonOk(if (app.admin_hash.len > 0) "{\"initialized\":true}" else "{\"initialized\":false}");
+    // AUDIT #7：凭据组锁内读。
+    const initialized = blk: {
+        const io = rt.io();
+        app.creds_mu.lockUncancelable(io);
+        defer app.creds_mu.unlock(io);
+        break :blk app.admin_hash.len > 0;
+    };
+    try res.jsonOk(if (initialized) "{\"initialized\":true}" else "{\"initialized\":false}");
 }
 
 /// `POST /api/public/init/setup` —— 对齐 Go `server/handles/setup.go:37`。
@@ -1234,8 +1268,19 @@ fn handleInitStatus(app: *App, req: *http.Request, res: *http.Response) !void {
 /// 会自己再走一次登录）。
 fn handleInitSetup(app: *App, req: *http.Request, res: *http.Response) !void {
     if (!std.mem.eql(u8, req.method, "POST")) return res.jsonError(405, "method not allowed");
-    // 已初始化 ⇒ 拒绝（Go：`system has already been initialized`）。
+    // 已初始化 ⇒ 拒绝（Go：`system has already been initialized`）。此读在
+    // 闸门之前：闸门只管「hash 为空」的竞速窗口；两个并发请求都见到空以后，
+    // 只有一个能占住闸。
     if (app.admin_hash.len > 0) return res.jsonError(400, "system has already been initialized");
+    // AUDIT-2026-11-27 #7：TOCTOU 闸（见 setup_gate 字段注释）。并发到达者
+    // 409，不进入凭据构造与落盘 —— 原来两个并发 setup 都见到空、各自建
+    // 管理员，最后落盘者赢（Go 有 DB 唯一索引兑底，这里没有）。
+    if (app.setup_gate.cmpxchgStrong(0, 1, .acq_rel, .acquire)) |_| {
+        return res.jsonError(409, "initialization already in progress");
+    }
+    // 无论成败都收闸：成功 = 2（已初始化），失败回滚 = 0（机主可重试）。
+    var gate_done = false;
+    defer app.setup_gate.store(if (gate_done) 2 else 0, .release);
 
     const a = req.arena;
     const v = try parseBodyJson(a, req, res) orelse return;
@@ -1259,8 +1304,8 @@ fn handleInitSetup(app: *App, req: *http.Request, res: *http.Response) !void {
     try cfg.putZig("admin_salt", .{ .string = salt });
     try cfg.putZig("admin_password_hash", .{ .string = hash });
     // 口令版本：让随后签发的令牌带上它（改密/重置时推进即可失效旧令牌）。
-    app.admin_pwd_ts = rt.nowSeconds();
-    try cfg.putZig("admin_pwd_ts", .{ .int = app.admin_pwd_ts });
+    const pwd_ts = rt.nowSeconds();
+    try cfg.putZig("admin_pwd_ts", .{ .int = pwd_ts });
     // 权限位与 Go `InitSetup` 一致（setup.go:60 的 `Permission: 0x71FF`）。
     // 落盘是为了导入 Go 配置时能保留原值，且重启后仍是同一个数。
     try cfg.putZig("admin_permission", .{ .int = 0x71FF });
@@ -1277,11 +1322,32 @@ fn handleInitSetup(app: *App, req: *http.Request, res: *http.Response) !void {
         log.warn("api: could not persist init setup: {s}", .{@errorName(e)});
         return res.jsonError(500, "could not save setup");
     };
-    app.admin_user = try app.alloc.dupe(u8, username);
-    app.admin_salt = try app.alloc.dupe(u8, salt);
-    app.admin_hash = try app.alloc.dupe(u8, hash);
+    // AUDIT #7：内存凭据的发布改到**落盘成功之后**（旧代码先赋值后 save，
+    // 落盘失败会留下「内存有管理员、磁盘没有」的失步）；发布本身持 creds_mu
+    // 一次性完成（旧代码是三个裸赋值：非原子、且旧切片直接覆盖不退役 =
+    // 泄漏敏感串，违反自家 M17 纪律 —— 首启时旧值是空串无实害，但纪律
+    // 应当只在有实害的例外处破例）。
+    {
+        const new_user = try app.alloc.dupe(u8, username);
+        errdefer app.alloc.free(new_user);
+        const new_salt = try app.alloc.dupe(u8, salt);
+        errdefer app.alloc.free(new_salt);
+        const new_hash = try app.alloc.dupe(u8, hash);
+        errdefer app.alloc.free(new_hash);
+        const io = rt.io();
+        app.creds_mu.lockUncancelable(io);
+        const old = [3][]const u8{ app.admin_user, app.admin_salt, app.admin_hash };
+        app.admin_user = new_user;
+        app.admin_salt = new_salt;
+        app.admin_hash = new_hash;
+        app.admin_pwd_ts = pwd_ts;
+        app.retireCreds(old);
+        app.creds_mu.unlock(io);
+    }
     app.frontend.settings.site_title = try app.alloc.dupe(u8, cfg.site_title);
     log.info("api: initialised by {s}", .{username});
+    // 闸门最终态：凭据已发布 ⇒ 已初始化（defer 读到 true 置 2）。
+    gate_done = true;
     try res.jsonOk("null");
 }
 
@@ -1494,20 +1560,27 @@ fn loginCommon(app: *App, req: *http.Request, res: *http.Response, already_stati
     if (!login_throttle.allow(key)) {
         return res.jsonError(429, msg_too_many);
     }
-    if (!std.mem.eql(u8, username, app.admin_user)) {
-        login_throttle.recordFailure(key);
-        return res.jsonError(401, msg_login_failed);
-    }
-    // Go `User.ValidatePwd` / `ValidatePwdStaticHash`（internal/model/user.go:83-94）：
-    //     PwdHash == HashPwd(<static hash>, Salt)
-    // 明文接口先做一次 StaticHash；`/login/hash` 直接拿收到的 static hash 用。
-    const static = if (already_static) password else try staticHash(a, password);
-    const expect = try hashPwd(a, static, app.admin_salt);
-    // Constant-time compare. A plain `std.mem.eql` would leak the position of
-    // the first differing byte; a length check first would leak the length.
-    if (!ctEqual(expect, app.admin_hash)) {
-        login_throttle.recordFailure(key);
-        return res.jsonError(401, msg_login_failed);
+    // AUDIT #7：凭据比对整体持 creds_mu（读全组 user/salt/hash）—— 并发
+    // 改密（meUpdate 锁内发布）下不会读到「新 user 配旧 hash」的撕裂组合。
+    {
+        const io = rt.io();
+        app.creds_mu.lockUncancelable(io);
+        defer app.creds_mu.unlock(io);
+        if (!std.mem.eql(u8, username, app.admin_user)) {
+            login_throttle.recordFailure(key);
+            return res.jsonError(401, msg_login_failed);
+        }
+        // Go `User.ValidatePwd` / `ValidatePwdStaticHash`（internal/model/user.go:83-94）：
+        //     PwdHash == HashPwd(<static hash>, Salt)
+        // 明文接口先做一次 StaticHash；`/login/hash` 直接拿收到的 static hash 用。
+        const static = if (already_static) password else try staticHash(a, password);
+        const expect = try hashPwd(a, static, app.admin_salt);
+        // Constant-time compare. A plain `std.mem.eql` would leak the position of
+        // the first differing byte; a length check first would leak the length.
+        if (!ctEqual(expect, app.admin_hash)) {
+            login_throttle.recordFailure(key);
+            return res.jsonError(401, msg_login_failed);
+        }
     }
     login_throttle.recordSuccess(key);
     return issueToken(app, a, res, username);
@@ -1528,11 +1601,19 @@ fn issueToken(app: *App, a: std.mem.Allocator, res: *http.Response, username: []
 
     const h64 = try b64Url(a, "{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
 
+    // AUDIT #7：pwd_ts 属于凭据组，锁内读。
+    const pwd_ts: i64 = blk: {
+        const io = rt.io();
+        app.creds_mu.lockUncancelable(io);
+        defer app.creds_mu.unlock(io);
+        break :blk app.admin_pwd_ts;
+    };
+
     var payload = Buf.init(a);
     try payload.append("{\"username\":");
     try json.writeString(&payload, username);
     try payload.print(",\"pwd_ts\":{d},\"exp\":{d},\"iat\":{d},\"nbf\":{d}}}", .{
-        app.admin_pwd_ts, exp, now, now,
+        pwd_ts, exp, now, now,
     });
     const p64 = try b64Url(a, payload.slice());
 
@@ -1642,13 +1723,19 @@ fn checkAuth(app: *App, req: *http.Request) !bool {
     // A03：令牌必须绑在「当前管理员 + 当前口令版本」上。
     // Go 在 server/middlewares/auth.go:55-68 做同样两件事：按 username 取用户，
     // 再比对 user.PwdTS。改密后旧令牌在这里被拒，而不是继续有效到过期。
-    const uname = v.strAt("username") orelse return false;
-    if (!std.mem.eql(u8, uname, app.admin_user)) return false;
+    // AUDIT #7：凭据组锁内读（写方 meUpdate/setup 锁内发布）。
+    {
+        const io = rt.io();
+        app.creds_mu.lockUncancelable(io);
+        defer app.creds_mu.unlock(io);
+        const uname = v.strAt("username") orelse return false;
+        if (!std.mem.eql(u8, uname, app.admin_user)) return false;
 
-    const pwd_ts = v.intAt("pwd_ts") orelse 0;
-    if (pwd_ts != app.admin_pwd_ts) {
-        log.warn("api: token rejected: password changed since it was issued", .{});
-        return false;
+        const pwd_ts = v.intAt("pwd_ts") orelse 0;
+        if (pwd_ts != app.admin_pwd_ts) {
+            log.warn("api: token rejected: password changed since it was issued", .{});
+            return false;
+        }
     }
 
     const exp = v.intAt("exp") orelse return false;
@@ -2807,6 +2894,7 @@ fn handleMultipartChunk(app: *App, req: *http.Request, res: *http.Response) !voi
             s.mu.unlock(io);
             return e;
         };
+        var md5_oom = false;
         while (true) {
             var found: ?usize = null;
             for (s.pending.slice(), 0..) |pc, i| {
@@ -2818,12 +2906,22 @@ fn handleMultipartChunk(app: *App, req: *http.Request, res: *http.Response) !voi
             const at = found orelse break;
             const pc = s.pending.slice()[at];
             s.md5.update(pc.bytes);
-            s.slice_md5s.append(pc.md5_upper) catch app.alloc.free(pc.md5_upper);
+            // AUDIT-2026-11-27 #8：OM 时静默丢掉这一片的 slice MD5，
+            // received_bytes 已计、next_md5_idx 已进，complete 拿残缺链去
+            // mpCommit —— 上游秒传/校验语义被静默破坏且无日志。改为立即
+            // 判死会话（重启上传是唯一诚实的结果），别静默丢片。
+            s.slice_md5s.append(pc.md5_upper) catch {
+                app.alloc.free(pc.md5_upper);
+                mpSetState(app, s, .failed, "out of memory recording slice md5; restart the upload");
+                md5_oom = true;
+                break; // pending 里剩余条目由 mpFreeSession 统一回收
+            };
             app.alloc.free(pc.bytes);
             mpPendingRemoveAt(&s.pending, at);
             s.next_md5_idx += 1;
         }
         s.mu.unlock(io);
+        if (md5_oom) return res.jsonError(500, "out of memory recording slice md5; restart the upload");
         return mpRespondSnapshot(res, s, a);
     }
 
@@ -2917,14 +3015,22 @@ fn handleMultipartComplete(app: *App, req: *http.Request, res: *http.Response) !
             const at = found orelse break;
             const pc = s.pending.slice()[at];
             s.md5.update(pc.bytes);
-            s.slice_md5s.append(pc.md5_upper) catch {};
+            // AUDIT #8（同 chunk 路径）：排空阶段丢片同样判死，不能带着残缺链 commit。
+            s.slice_md5s.append(pc.md5_upper) catch {
+                app.alloc.free(pc.md5_upper);
+                mpSetState(app, s, .failed, "out of memory recording slice md5; restart the upload");
+                s.mu.unlock(io);
+                return res.jsonError(500, "out of memory recording slice md5; restart the upload");
+            };
             app.alloc.free(pc.bytes);
             mpPendingRemoveAt(&s.pending, at);
             s.next_md5_idx += 1;
         }
         if (s.next_md5_idx != s.total) {
-            s.mu.unlock(io);
+            // 注：旧代码先 unlock 再 mpSetState —— 写 state/err_msg 在锁外，
+            // 与读侧构成数据竞争；顺手修正为锁内置状态。
             mpSetState(app, s, .failed, "internal error: md5 chain incomplete");
+            s.mu.unlock(io);
             return res.jsonError(500, "internal error: md5 chain incomplete");
         }
         const file_md5 = s.md5.finalHexUpper(a) catch |e| {
@@ -3593,7 +3699,13 @@ fn handleMe(app: *App, req: *http.Request, res: *http.Response) !void {
     try b.append("{\"code\":200,\"message\":\"success\",\"data\":{");
     try b.print("\"id\":{d},", .{1});
     try b.append("\"username\":");
-    try json.writeString(&b, app.admin_user);
+    // AUDIT #7：凭据组锁内读。
+    {
+        const io = rt.io();
+        app.creds_mu.lockUncancelable(io);
+        defer app.creds_mu.unlock(io);
+        try json.writeString(&b, app.admin_user);
+    }
     try b.append(",\"password\":\"\",\"base_path\":\"/\",\"role\":2,\"disabled\":false");
     try b.print(",\"permission\":{d}", .{app.admin_permission});
     // `model.User.SsoID` / `AllowLdap` 有 json tag，Go 会输出；本实现没有 SSO
@@ -3632,6 +3744,17 @@ fn handleMeUpdate(app: *App, req: *http.Request, res: *http.Response) !void {
     // 密码：空串 = 不改（Go 同样语义）。
     const password = v.strAt("password") orelse "";
     var pwd_changed = false;
+    // AUDIT #7：全部新值先备齐（失败零残留）、成功锁内一次性发布。旧代码
+    // 三个裸赋值散在流程各处：改密中途回 500 会留下「内存已换、磁盘没换」
+    // 的失步 + 新 salt 配旧 hash 的撕裂读窗口 + 旧切片不退役（泄漏敏感串，
+    // 违反 M17）。
+    var new_salt: ?[]const u8 = null;
+    var new_hash: ?[]const u8 = null;
+    var new_ts: i64 = 0;
+    errdefer {
+        if (new_salt) |s| app.alloc.free(s);
+        if (new_hash) |h| app.alloc.free(h);
+    }
     if (password.len > 0) {
         if (password.len < 4) return res.jsonError(400, "password must be at least 4 characters");
         // 复用建号时的同一条路径：新 salt + TwoHashPwd，与 Go SetPassword 一致。
@@ -3640,20 +3763,38 @@ fn handleMeUpdate(app: *App, req: *http.Request, res: *http.Response) !void {
         try cfg.putZig("admin_salt", .{ .string = salt });
         try cfg.putZig("admin_password_hash", .{ .string = hash });
         // 推进口令版本 ⇒ 已签发的令牌全部失效。
-        app.admin_pwd_ts = rt.nowSeconds();
-        try cfg.putZig("admin_pwd_ts", .{ .int = app.admin_pwd_ts });
-        app.admin_salt = try app.alloc.dupe(u8, salt);
-        app.admin_hash = try app.alloc.dupe(u8, hash);
+        new_ts = rt.nowSeconds();
+        try cfg.putZig("admin_pwd_ts", .{ .int = new_ts });
+        new_salt = try app.alloc.dupe(u8, salt);
+        new_hash = try app.alloc.dupe(u8, hash);
         pwd_changed = true;
     }
 
     try cfg.putZig("admin_user", .{ .string = try ca.dupe(u8, username) });
-    app.admin_user = try app.alloc.dupe(u8, username);
+    const new_user = try app.alloc.dupe(u8, username);
+    errdefer app.alloc.free(new_user);
 
     cfg.save() catch |e| {
         log.warn("api: could not persist profile update: {s}", .{@errorName(e)});
+        // 落盘失败：磁盘是旧凭据，内存同步保持旧值（新值全部回收）。
+        if (new_salt) |s| app.alloc.free(s);
+        if (new_hash) |h| app.alloc.free(h);
+        app.alloc.free(new_user);
         return res.jsonError(500, "could not save profile");
     };
+    // 锁内一次性发布 + 退役旧代（retireCreds 只在环满 8 代后才 free，测试里
+    // 字面量旧值得以存活到 arena 回收，见该函数注释）。
+    {
+        const io = rt.io();
+        app.creds_mu.lockUncancelable(io);
+        const old = [3][]const u8{ app.admin_user, app.admin_salt, app.admin_hash };
+        app.admin_user = new_user;
+        if (new_salt) |s| app.admin_salt = s;
+        if (new_hash) |h| app.admin_hash = h;
+        if (pwd_changed) app.admin_pwd_ts = new_ts;
+        app.retireCreds(old);
+        app.creds_mu.unlock(io);
+    }
     log.info("api: profile updated (username={s}, password changed={})", .{ username, pwd_changed });
     // Go 成功时 `common.SuccessResp(c)` ⇒ `{"code":200,"message":"success","data":null}`
     try res.jsonOk("null");
@@ -5914,7 +6055,14 @@ fn fmtTime(a: std.mem.Allocator, ts: i64) ![]const u8 {
 fn parseBodyJson(a: std.mem.Allocator, req: *http.Request, res: *http.Response) !?json.Value {
     // The frontend sends JSON; a few endpoints also accept form-encoded.
     if (req.body.len() == 0) return json.Value{ .object = .{} };
-    const text = req.body.readAll(a) catch return null;
+    // AUDIT-2026-11-27 #8：读体失败不能静默返回 null —— 上层是
+    // `try parseBodyJson(...) orelse return`，返回 null 意味着一个**从未写
+    // 过任何字节的 200 空响应**，比错误码更难排查（JSON 解析失败分支早就有
+    // 400，唯独读体失败被漏了）。
+    const text = req.body.readAll(a) catch {
+        res.jsonError(400, "cannot read request body") catch {};
+        return null;
+    };
     return json.parse(a, text) catch {
         res.jsonError(400, "invalid JSON body") catch {};
         return null;
@@ -7626,6 +7774,122 @@ test "init_status drives the first-run wizard and init/setup creates the admin" 
         const res = try doRequest(&app, a, "GET", "/api/public/init_status");
         const parsed = try json.parse(a, res.buf.slice());
         try testing.expectEqual(true, parsed.getPath("data.initialized").?.asBool().?);
+    }
+}
+
+test "AUDIT #7: setup gate — concurrent contenders yield exactly one winner" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fe = try frontend_mod.initFromHtml(a, .{}, ROUTING_SHELL);
+    defer fe.deinit();
+    var app = routingApp(a, fe);
+
+    // ① handler 语义：闸门被占（进行中）⇒ 409，且**不碰 config**
+    //（不依赖 config 单例 —— 与既有 setup 测试不同，这里无需装载临时配置）。
+    app.setup_gate = std.atomic.Value(u8).init(1);
+    {
+        const body = "{\"username\":\"a\",\"password\":\"1234\"}";
+        var no_hs = [_]Header{};
+        const res = try doRequestJson(&app, a, "POST", "/api/public/init/setup", body, &no_hs);
+        try expectApiCode(res, 409);
+    }
+    // 闸门不受影响（还是 1：并发者的 409 不复位它）。
+    try testing.expectEqual(@as(u8, 1), app.setup_gate.load(.acquire));
+    app.setup_gate = std.atomic.Value(u8).init(0);
+
+    // ② 原语语义：8 个线程同时抢 cmpxchg(0→1)，恰好一个赢家。
+    const Racer = struct {
+        gate: *std.atomic.Value(u8),
+        wins: *std.atomic.Value(u32),
+        fn run(self: *@This()) void {
+            if (self.gate.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
+                _ = self.wins.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var wins = std.atomic.Value(u32).init(0);
+    var ths: [8]std.Thread = undefined;
+    var racer = Racer{ .gate = &app.setup_gate, .wins = &wins };
+    for (&ths) |*t| t.* = try std.Thread.spawn(.{}, Racer.run, .{&racer});
+    for (&ths) |t| t.join();
+    try testing.expectEqual(@as(u32, 1), wins.load(.acquire));
+    try testing.expectEqual(@as(u8, 1), app.setup_gate.load(.acquire));
+
+    // ③ 失败回滚：闸占用时 body 校验失败 ⇒ 闸复位为 0（机主可重试）。
+    //    走真 handler 前先复位。
+    app.setup_gate = std.atomic.Value(u8).init(0);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg_dir = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(cfg_dir);
+    const cfg_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{cfg_dir});
+    defer testing.allocator.free(cfg_path);
+    const prev_cfg = config.getOpt();
+    const tcfg = try config.load(testing.allocator, cfg_path);
+    defer tcfg.deinit();
+    config.setForTest(tcfg);
+    defer config.setForTest(prev_cfg);
+    {
+        // 密码过短（<4）⇒ 400，闸门应回到 0。
+        var no_hs = [_]Header{};
+        const res = try doRequestJson(&app, a, "POST", "/api/public/init/setup", "{\"username\":\"a\",\"password\":\"x\"}", &no_hs);
+        try expectApiCode(res, 400);
+    }
+    try testing.expectEqual(@as(u8, 0), app.setup_gate.load(.acquire));
+}
+
+test "AUDIT #7: me/update publishes credentials atomically and retires the old set" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fe = try frontend_mod.initFromHtml(a, .{}, ROUTING_SHELL);
+    defer fe.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cfg_dir = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(cfg_dir);
+    const cfg_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{cfg_dir});
+    defer testing.allocator.free(cfg_path);
+    const prev_cfg = config.getOpt();
+    const tcfg = try config.load(testing.allocator, cfg_path);
+    defer tcfg.deinit();
+    config.setForTest(tcfg);
+    defer config.setForTest(prev_cfg);
+
+    // 先真建一个管理员（走 setup：内存里的凭据是 app.alloc 拥有的 ——
+    // 后续 retire 才能安全地在环满时 free；字面量旧值在环内存活到 arena 回收）。
+    var app = routingApp(a, fe);
+    {
+        var no_hs = [_]Header{};
+        const body = "{\"username\":\"admin\",\"password\":\"test-pw-1234\"}";
+        const res = try doRequestJson(&app, a, "POST", "/api/public/init/setup", body, &no_hs);
+        try expectApiCode(res, 200);
+    }
+    // setup 的发布也是一次 retire（旧三元组是空串）。
+    try testing.expectEqual(@as(usize, 1), app.retired_creds_count);
+    const old_salt = app.admin_salt;
+
+    // 改密码 + 用户名：新凭据锁内一次性可见。
+    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+    {
+        var hs = [_]Header{.{ .name = "Authorization", .value = auth }};
+        const body = "{\"username\":\"root\",\"password\":\"new-pw-5678\"}";
+        const res = try doRequestJson(&app, a, "POST", "/api/me/update", body, &hs);
+        try expectApiCode(res, 200);
+    }
+    try testing.expectEqualStrings("root", app.admin_user);
+    try testing.expect(app.admin_salt.ptr != old_salt.ptr); // salt 确实换了
+    // 退役环记了第二代（M17：环满 8 代才 free —— 本次不 free，字面量/新值都安全）。
+    try testing.expectEqual(@as(usize, 2), app.retired_creds_count);
+
+    // 改密后旧令牌必须被拒（pwd_ts 推进，checkAuth 锁内读出新值）。
+    {
+        var old_hs = [_]Header{.{ .name = "Authorization", .value = auth }};
+        const res = try doRequestWith(&app, a, "GET", "/api/me", "", &old_hs);
+        try expectApiCode(res, 401);
     }
 }
 
