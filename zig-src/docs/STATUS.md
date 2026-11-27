@@ -13,13 +13,13 @@
 >   需要原文用 `git show 7356589e:<path>` 取回（见 §38.5）。
 > - **待办以 `TODO.md` 为准**；功能边界见 §22。
 >
-> **当前基线（2026-11-02；SFTP 子系统已落地并复审修复，见 §60.30–§60.42）**
+> **当前基线（2026-11-27；P0 加固轮落地，见 §60.43；SFTP 子系统见 §60.30–§60.42）**
 >
 > | 项 | 值 |
 > |---|---|
-> | 单元测试 | **打包机 Linux 原生 560/560（0 跳过）**；本机 Windows 556 pass + 4 skip（Linux-only 用例）；历史打包机基线 451/451 见 §54.1 |
+> | 单元测试 | 本机 Windows **563 pass + 5 skip**（568 总，§60.43 新增 8 条）；打包机 Linux 原生上一轮 560/560（0 跳过）——**本轮 +8 用例待打包机复跑**（含 http 滴灌超时用例的真 Linux 执行） |
 > | SFTP 服务端（SSH-2 + SFTP v3，`sftp.enable` 默认 false） | 五层落地：断点续传 / 双向 rekey / 按 IP 分桶限速（与 HTTP 共用）/ pre-auth 超时 + 64 并发上限；三客户端互通 + paramiko e2e；`--sftp-plain` 已删（§60.41） |
-> | 交叉编译（aarch64-linux-musl，`-Doptimize=small`） | 通过；当前产物 **1,443,624 B / `8fac3896`**（2026-11-02，§60.42 修复后重建，已切生产） |
+> | 交叉编译（aarch64-linux-musl，`-Doptimize=small`） | 通过；本机最新产物 **1,447,632 B / `14F58FBA`**（2026-11-27 P0 加固轮，**未部署**）；生产仍跑 11-02 的 1,443,624 B / `8fac3896`（§60.42） | |
 > | 真机 e2e（光猫，13 挂载点） | **464 通过 / 0 失败 / 1 跳过**（跳过 = 坚果云根目录 403 服务商规则；2026-10-18 基线，本轮未重跑全量 e2e） |
 > | 真机无凭据回归（`driver_matrix.py`） | 默认产物 **27/27**；点名产物（+3 变体）**14/14** |
 > | 注册驱动 | **15 个注册项 / 12 个实现**（Quark+UC 共用 quarkuc.zig，thunder 出 3 个 factory），12/12 真机覆盖；**另 3 个变体（`123 Open`/`QuarkOpen`/`115 Open`）编译期可选**，见 §53 |
@@ -5833,5 +5833,127 @@ P2 收尾池（未动，下一轮）：host key tmp+rename 原子写、默认监
   `IP:端口`」旧表述随 §60.39.5 更正、头部日期；
 * 顶部基线表从 10-22 的 451 刷新到当前（560/560、SFTP 子系统行、当前产物
   `8fac3896` 已切生产）。
+
+---
+
+## 60.43 架构复核（AUDIT 2026-11-27）后的 P0 加固轮：六项落地
+
+**背景**：对全库（~52,000 行）做了一轮四路子代理系统性复核 + 主控逐条一手
+复验（方法与全量发现见 `docs/AUDIT_2026-11-27-architecture.md`，**该报告是
+本轮的权威台账**：P0×7 / P1×14 / P2×~20 / P3 若干，含证据行号与溯源分级），
+随后按其路线图一次性落地全部 6 项 P0（#1-#6）。代码 +783/-150 行，
+**本机 Windows 563 pass + 5 skip（568 总）**，产物 1,447,632 B（+3,920 B，+0.27%）。
+
+### #1 multipart 会话 UAF（P0，全库唯一内存安全缺陷）
+
+**形态**：chunk/status/complete 均为「`mp_mu` 内 get → 解锁 → 裸指针
+`s.touch()`」，而 abort / sweep / init-stale 三条销毁路径都在解锁 `mp_mu`
+后直接 `mpFreeSession`（destroy）。原生前端「取消上传（3 worker 在飞 +
+abort）」即触发形态。配套：`mp_seq` 裸 `+=` 是数据竞争（并发 init），
+外加 init 里一处双重自增死代码。
+
+**修法**（引用计数制）：
+
+* `MpSession.refs`（Atomic u32）——入表即 1（表基准）；`mpAcquire`（持锁
+  get＋+1）/ `mpRelease`（-1，归零者销毁）；三个 handler 与 init 一律
+  「拿引用 + defer 归还」；
+* 销毁路径（abort/sweep/stale）摘表后把 spool 删除放两刀 release **之前**
+  （路径还在 s 里时），随后连减「表基准 + 自己」两刀 —— 在途引用不归零
+  就不销毁；`init` 的 stale/续传块重构，`mpStaleRetire` 收敛；
+* `last_active` / `mp_seq` 原子化（sweep 锁外读 vs touch 锁外写的竞争一并
+  消除）；死代码 `app.mp_seq += 1` 删除；
+* `mpFreeSession` 的驱动查找从「按 mount_path 找当前驱动」改为「按
+  `s.driver_ptr` 找**创建会话的那个实例**」（存储重载后旧代码会把旧句柄
+  喂给新驱动的 mpAbort —— 跨实例操作，顺手修正）；
+* 好收敛的附带项：「按 mount_path 找挂载 + 比对 driver_ptr」三份拷贝收敛
+  为 `mpMountFor`（正是 UAF 病灶所在的三处）。
+
+### #2 WebDAV href 未转义 `&`（P0，互操作正确性）
+
+`url.zig` 的 `.path` 编码集按 RFC 3986 保留 `&`，`davHref` 结果直接进
+`<D:href>{s}`（`displayname` 却一直走 xmlEscape）—— 文件名含 `&` 即产出
+非良构 XML，严格解析器把整个 PROPFIND 判为解析失败。修一行：编码后再过
+`xmlEscape`；回归用例覆盖 `Tom & Jerry.mp4` 的 href 断言 + 整条 response
+喂真 XML 解析器。
+
+### #3 HTTP 头部总限时 + body 空闲超时（P0，slowloris 暴露面）
+
+在此之前 HTTP 侧只有 socket 级单次超时（read_timeout=300s）：慢速攻击者每
+<300s 滴一个字节即可无限占线程（每请求体在鉴权**之前**读到内存/spool，
+未认证即耗资源）。此前 SFTP 侧已有 pre-auth 30s + 64 并发三件套，HTTP 侧
+一项都没有 —— 本轮对称补齐：
+
+* `head_timeout_s`（默认 30s）：请求头**首字节起**的总墙钟。锚点在
+  「缓冲区真见到字节」之后（空闲 keep-alive 不误杀）；实现挂在 readLine 的
+  refill 循环（慢速攻击是**一行内**滴答，只有逐次 refill 才查得到墙钟）；
+  POSIX 同时把 socket 超时钳到 min(head, read_timeout)（行内 stall 有界）；
+  超限 → 408 + 关连接；
+* `body_idle_timeout_s`（默认 60s）：body 阶段把 socket 超时钳到该值。
+  已知残留（文档化）：每 <60s 滴 1 字节的 body 滴灌仍可存活，受连接闸门
+  约束 —— 见审计报告 #3；
+* `max_connections` **默认从 0（不限）改为 64**（对齐 SFTP）；语义不变：
+  显式写 0 仍是「不限」，旧配置含 0 的维持原行为（旋钮已存在，改的是缺省
+  与新写出的模板值）。
+
+### #4 代理回源共享池 + 响应体闸（P0，OOM 路径收口）
+
+ `/d/`、`/p/`、WebDAV 远程 GET 此前**每请求** `Client.init(a, .{}, &jar)`：
+连接池、TLS 会话、**系统 CA 逐请求重扫**三样全丢，且空 Options 把
+`zig.ca_bundle` / `zig.http_timeout` 整个绕过。本轮：
+
+* `App` 新增 4 槽代理池（轮询分发，每 Client 自带全生命周期锁，避免并发
+  下载全串到一条锁后）；初始化消费三个既有配置；
+* 新旋钮 `zig.max_proxy_body_mb`（默认 **256 MiB**，0=不限）：挂到池上做
+  `max_response_bytes`，上游忽略 Range 回 200 全量缓冲时回 **507** 而不是
+  吃死设备（此前该路径确定性 OOM，README 自认的「远程 Range 缓冲」欠账的
+  上限收敛；真正的流式转发仍是 P2 待办，见审计 #17）；
+* 池上请求 `use_cookies = false`：Cookie 由驱动经 `lk.header` 显式携带
+  （Go `common.Proxy` 同为无 Jar 客户端），同时消除共享池的 Cookie 串台/
+  重复头风险。
+
+### #5 WebDAV COPY 大文件闸（P0）
+
+COPY 的 fallback 是「整份下载进内存再 put」（本地 `local_size` / 远程
+`up.body` 均无上限 alloc）。改为按 `zig.max_proxy_body_mb` **预检**
+（fetchBytes 之前、details 已知 size）：超限 507，本地与远程一视同仁。
+
+### #6 关停路径 UAF 窗口（P0）
+
+`drain` 超时后 `run()` 返回 → main 的 defer 链释放 Server/App，而在飞的
+detach 连接线程随后仍读 `self.opts` / handler ctx（测试注释自述的竞态）。
+修法：`run()` 返回 + `waitForMountsReady()` 之后，若 `server.inFlight() > 0`
+则 `exit(0)` 跳过全部 defer（与 waitForMountsReady 的既有先例同款取舍）；
+干净路径（in_flight 归零）不受影响。
+
+### 测试（+8 条，556/560 → 563/568）
+
+| 新增用例 | 钉住什么 |
+|---|---|
+| `AUDIT #1: abort cannot free a session an in-flight holder still uses` | 引用计数生命周期契约：abort 后会话仍可读、refs=1、最后一刀才销毁（会话分配走 DebugAllocator，双 free/野 free 当场炸） |
+| `AUDIT #1: acquire/abort/release race stress` | 4 worker 反复 acquire/touch/release 与 abort 赛跑，内容完好、归零后表空 |
+| `AUDIT 2026-11-27 #2: href escapes '&'` | davHref 转义 + 整条 PROPFIND response 可以过真 XML 解析器 |
+| `AUDIT 2026-11-27 #5: COPY over zig.max_proxy_body_mb is 507` | 闸在 fetch 之前（Stub 的 link 不被触碰）；0=不限时不在闸处断 |
+| `AUDIT #3: a dribbling partial header is cut at head_timeout_s` | 半行头 + 100ms 滴灌在 1s 预算内被 408/断连截断（**Windows skip**：绑 socket+accept 线程在测试后端不可靠，与 T5 同款；**Linux 待打包机真跑**） |
+| `AUDIT #4: proxy pool consumes ...` | 三个配置消费 + cap 换算 + 轮询分发（不同实例） |
+| `config: zig.max_proxy_body_mb defaults to 256, 0 disables` | 新旋钮的缺省/显式 0/显式值三态 |
+| `config: max_connections defaults to 64, explicit 0 stays unlimited` | #3 的缺省值变更：缺键 64 / 显式 0 仍不限 / 显式 128 照收 |
+
+测试侧踩坑两则（防复发）：
+
+1. `config.load()` **自己会把单例指到新 cfg** —— 测试里必须**先取 prev 再
+   load**，否则 defer 恢复的是已 deinit 的配置，下一个用 `config.get()` 的
+   测试读悬空指针（本轮真实 segfault 过一次）；
+2. 会话全部销毁后 `mp_sessions` 的桶数组（put 时分配）要在测试里显式
+   `deinit` 还回去，否则泄漏计数报 1 条。
+
+### 验证边界（如实）
+
+* **本机 Windows 563 pass + 5 skip / 568 总，零泄漏零 crash**；
+* aarch64 交叉编译通过：1,447,632 B / SHA256 `14F58FBA…`（+3,920 B，
+  +0.27%）；**未部署**，生产仍跑 `8fac3896`；
+* **待办**：① 打包机 Linux 原生复跑（0600 用例先例：Windows skip 不代表
+  Linux 能过；尤其 http 滴灌用例首次真执行）+ 产物对账（审计 §0 提出的
+  +88 B 漂移仍未解）；② 真机隔离实例回归（multipart 取消上传、WebDAV
+  大文件 COPY 507、/p/ 超限 507 三条新增路径）；③ 部署窗口待机主拍板。
 
 > AI生成
