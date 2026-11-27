@@ -253,9 +253,12 @@ response; a streaming response reader remains a known follow-up"（** README
 > **2026-11-27 落地回填**：#1-#6（全部 P0）已于当日修复并验证（本机
 > Windows 563 pass + 5 skip / 568 总；aarch64 产物 1,447,632 B / `14F58FBA…`，
 > +0.27%，未部署），详见 `docs/STATUS.md` §60.43；同日续批落地 #7-#13
-> （全部 P1，569 pass + 5 skip / 574 总；产物 1,455,104 B / `A082F536…`，
+> （全部 P1，569 pass + 5 skip / 574 总；裸编译口径 1,455,104 B /
+> `A082F536…`，交付口径打包机复跑 574/574、1,455,088 B / `62878FDD…`，
 > 未部署），详见 §60.44，其中 #12 为「验证后记档不修码」（std 0.17 无挂载点）。
-> **#14 起未动。**
+> #14 打包机对账已于 2026-11-28 闭环（§60.44 对账小节）：复现逐字节相同
+> ⇒ 环境漂移排除，+88 B 定性为真实代码增量 + std 口径差。**#15-#17（P2）
+> 未动。**
 > 测试侧两处踩坑（config 单例 prev 必须在 load 前取、mp_sessions 桶数组
 > 测试需显式 deinit）也已记入 §60.43。
 
@@ -274,12 +277,12 @@ response; a streaming response reader remains a known follow-up"（** README
 | 11 | syncStorages scratch 化 | P1 | 1 天 | ✅ 已落地（§60.44 #11） | `Config.storages_a` 专用子 arena：新子树 fresh 建好后换装 root["storages"]，deinit 旧子 arena 整块回收（稳态 save 主 arena 零增长）；顺手删 setTopLevel 死代码 |
 | 12 | TLS 握手超时 | P1 | 1 天 | ✅ 验证后记档（§60.44 #12，未改码） | std 0.17 无干净挂载点：`ConnectTcpOptions.timeout` 声明后从未被消费、握手期无超时注入 API；结论与残余风险记入 client.zig applySocketTimeout 注释，待 std 提供入口后接入 |
 | 13 | thunder 分片重试 | P1 | 0.5 天 | ✅ 已落地（§60.44 #13） | 单传 PUT / CreateMultipartUpload / 分片 PUT / Complete 四操作全部 3 次退避（1s·2ⁿ，对齐 Go 侧 aws sdk 默认 retryer）；网络错误与非 2xx 皆重试，确定性失败不重试 |
-| 14 | 打包机产物对账（88 B 漂移） | P1 | 0.5 天 | 未动（§60.43 验证边界保留） | 复跑 build_remote.py，结论回写 STATUS 基线行 |
+| 14 | 打包机产物对账（88 B 漂移） | P1 | 0.5 天 | ✅ 已落地（2026-11-28，§60.44 对账小节） | build_remote.py 复跑：Linux 原生 574/574（0 跳过）；权威产物 1,455,088 B / `62878FDD`，本机 §5 配方复现逐字节相同；环境漂移排除，+88 B = 真实代码增量 + std 口径差，结论已回写 STATUS 基线行 |
 | 15 | api.zig 拆分 | P2 | 3-5 天 | 未动 | 序：multipart.zig（可随已修的 #1 整体搬走）→ sign/auth（解环）→ storage_admin → mounts → router → download |
 | 16 | drivers/common 机械重复收敛 | P2 | 2-3 天 | 未动 | ~600 行（dupeOr/ObjWriter/SigV4/并发框架/persist 模式） |
 | 17 | client 流式出口 | P2 | 3-5 天 | 未动 | 价值最高、工作量最大，单独排期；#4 的 256MiB 闸已把该路径从 OOM 收口为明确 507 |
 
-**P0 合计 ≈ 4-5 人日（实际一轮完成）；P1 ≈ 6-7 人日（实际一轮完成；#12 记档未修码）；P2 按季度节奏。**
+**P0 合计 ≈ 4-5 人日（实际一轮完成）；P1 ≈ 6-7 人日（实际一轮完成；#12 记档未修码；#14 11-28 闭环）；P2 按季度节奏。**
 
 ---
 
