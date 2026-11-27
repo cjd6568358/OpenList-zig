@@ -223,15 +223,15 @@ pub const Client = struct {
     /// Send one request. The returned `Response` borrows from `arena`, so the
     /// arena must outlive it — which it does, since callers pass the
     /// per-request arena.
-pub fn send(self: *Client, arena: std.mem.Allocator, req: Request) !Response {
-    // N01：配置了做不到的选项就明确失败，不要静默按默认行为跑。
-    if (self.unsupported) |name| {
-        log.err("client: refusing request: unsupported option `{s}` is configured", .{name});
-        return error.UnsupportedOption;
-    }
-    // SSRF：挡在**任何连接动作之前**（含每一跳重定向的目标）。
-    if (isCloudMetadataLiteral(hostOf(req.url))) return ssrfBlocked(req.url);
-    var current_url = req.url;
+    pub fn send(self: *Client, arena: std.mem.Allocator, req: Request) !Response {
+        // N01：配置了做不到的选项就明确失败，不要静默按默认行为跑。
+        if (self.unsupported) |name| {
+            log.err("client: refusing request: unsupported option `{s}` is configured", .{name});
+            return error.UnsupportedOption;
+        }
+        // SSRF：挡在**任何连接动作之前**（含每一跳重定向的目标）。
+        if (isCloudMetadataLiteral(hostOf(req.url))) return ssrfBlocked(req.url);
+        var current_url = req.url;
         var method = req.method;
         var hops: u8 = 0;
         var body = req.body;
@@ -463,9 +463,9 @@ pub fn send(self: *Client, arena: std.mem.Allocator, req: Request) !Response {
             log.warn("client: {s} {s} receiveHead failed: {s}", .{ method, raw_url, @errorName(e) });
             return e;
         };
-        log.debug("client: {s} {s} got head, status={d}", .{ method, raw_url, @intFromEnum(resp.head.status) });
+        log.debug("client: {s} {s} got head, status={d}", .{ method, raw_url, @backingInt(resp.head.status) });
 
-        const status: u16 = @intFromEnum(resp.head.status);
+        const status: u16 = @backingInt(resp.head.status);
 
         // Capture Set-Cookie before reading the body: a WAF can close the
         // connection early and we still want the challenge cookie. The head
@@ -752,6 +752,18 @@ pub fn send(self: *Client, arena: std.mem.Allocator, req: Request) !Response {
 /// 而「上游一声不吭」的 read 最多阻塞 `timeout_s` 秒就会失败。
 ///
 /// 服务端的 `http.applyTimeouts()` 用的是同一套写法，两边保持一致。
+///
+/// **已知缺口（AUDIT-2026-11-27 #12，验证后记档）**：本函数只能在
+/// `inner.request()` **返回之后**拿到 Connection 挂超时，而 **TLS 握手发生
+/// 在 request() 内部的 `connectTcpOptions` → `Tls.create` →
+/// `std.crypto.tls.Client.init`**——验证结论：std 0.17 这里**没有挂载点**，
+/// `ConnectTcpOptions.timeout` 字段在 lib/std/http/Client.zig 全文件里
+/// 声明后从未被消费（纯摆设），握手期间的 read 无超时入口，也没有把
+/// 自建 socket 注入连接池的 API。上游 TLS 层静默挂起时线程仍会无限阻塞
+/// —— 观测层只能靠上层 read 超时兜底（握手之后的第一次 read 距握手
+/// 挂起点很近，实际风险窗口主要在 DoS 形态而非普通故障）。待 std 提供
+/// 握手超时或连接注入 API 后在此接入；分支改用 fork std 的方案被否决
+/// （维护成本不成比例）。
 fn applySocketTimeout(conn: *std.http.Client.Connection, seconds: u32) void {
     if (seconds == 0) return;
     // `comptime`：Windows 上 `std.posix.setsockopt` 是编译错误，分支不能被分析。
