@@ -241,6 +241,81 @@ pub fn persist(storage_id: i64, addition_json: []const u8) void {
     if (persist_hook) |h| h(storage_id, addition_json);
 }
 
+/// AUDIT-2026-11-27 #10：persist-if-changed —— 会话类驱动（token/cookie 滚动
+/// 刷新回写配置）的落盘去重公共层。
+///
+/// 背景：此前 8 家驱动各持一份私有 `last_saved` 副本实现同一形状（thunder /
+/// cloud189pc / wopan / 123open / quark / 115open / aliyundrive / itvsh 的按
+/// cookies 内容比对变体），**quarkuc 是唯一没有去重的** —— `__puus` 滚动机制
+/// 下夸克几乎每个响应都带 Set-Cookie，一次深层 list（逐级逐页全是 request()）
+/// 能触发十几次「全量序列化 + fsync + rename」落盘：光猫 flash 磨损 + IO 放大。
+/// 收敛到一处后，quarkuc 的根治与其余驱动随后的增量迁移（机械替换）共用同
+/// 一份审验。
+///
+/// 用法：驱动持有字段 `last_saved: []const u8 = ""`（**长期**分配器所有，
+/// deinit 释放），然后：
+///
+///     driver.persistIfChanged(&self.last_saved, self.alloc, self.storage_id, text);
+///
+/// `text` 可来自请求 arena —— 去重通过后本函数会在长期分配器上 dupe 一份
+/// 自持（旧值同函数内释放，无泄漏）。dupe OOM 时置回 ""：最坏效果是下次
+/// 同内容再落一次盘，不出错。
+pub fn persistIfChanged(
+    last_saved: *[]const u8,
+    alloc: std.mem.Allocator,
+    storage_id: i64,
+    addition_json: []const u8,
+) void {
+    // toJson 不会产出空串；防御性早退（空内容没法作为下次的去重基准）。
+    if (addition_json.len == 0) return;
+    if (std.mem.eql(u8, addition_json, last_saved.*)) return;
+    persist(storage_id, addition_json);
+    if (last_saved.len > 0) alloc.free(@constCast(last_saved.*));
+    last_saved.* = alloc.dupe(u8, addition_json) catch "";
+}
+
+test "AUDIT #10: persistIfChanged dedups identical additions" {
+    const Counter = struct {
+        var calls: usize = 0;
+        var last_id: i64 = -1;
+        fn hook(storage_id: i64, addition_json: []const u8) void {
+            _ = addition_json;
+            calls += 1;
+            last_id = storage_id;
+        }
+    };
+    const prev = persist_hook;
+    persist_hook = Counter.hook;
+    defer persist_hook = prev;
+    // 跨用例的全局计数器，退出前复位。
+    defer {
+        Counter.calls = 0;
+        Counter.last_id = -1;
+    }
+
+    var last: []const u8 = "";
+    defer if (last.len > 0) testing.allocator.free(@constCast(last));
+
+    // 首次：落盘一次。
+    persistIfChanged(&last, testing.allocator, 7, "{\"a\":1}");
+    try testing.expectEqual(@as(usize, 1), Counter.calls);
+    try testing.expectEqual(@as(i64, 7), Counter.last_id);
+    try testing.expectEqualStrings("{\"a\":1}", last);
+
+    // 相同内容：不落盘。
+    persistIfChanged(&last, testing.allocator, 7, "{\"a\":1}");
+    try testing.expectEqual(@as(usize, 1), Counter.calls);
+
+    // 变化：再落盘，旧基准被替换（无泄漏——allocator 盯住）。
+    persistIfChanged(&last, testing.allocator, 7, "{\"a\":2}");
+    try testing.expectEqual(@as(usize, 2), Counter.calls);
+    try testing.expectEqualStrings("{\"a\":2}", last);
+
+    // 空内容：直接跳过（防御分支）。
+    persistIfChanged(&last, testing.allocator, 7, "");
+    try testing.expectEqual(@as(usize, 2), Counter.calls);
+}
+
 // ---------------------------------------------------------------------------
 // fs bridge —— Strm 驱动回调本实例其他挂载的通道
 // ---------------------------------------------------------------------------
@@ -480,7 +555,6 @@ fn nameInList(raw: []const u8, comptime name: []const u8) bool {
     return false;
 }
 
-
 /// 精确匹配，与 Go `op.GetDriver`（`internal/op/driver.go:26` 的 map 查找）
 /// 一致：没有别名、不忽略大小写。用户 2026-10-15 定的规矩——不背兼容性
 /// 包袱，历史名直接删，配置按最新驱动名重新加。
@@ -538,12 +612,12 @@ test "find matches the Go Config.Name byte for byte — no aliases, no case fold
 
     for ([_][]const u8{
         "上海电信智家硬盘", // itvsh 2026-10-19 改名前的旧中文名（无兼容包袱，必须查不到）
-        "123",             // 123Pan 的历史名
-        "quark",           // 大小写变体
+        "123", // 123Pan 的历史名
+        "quark", // 大小写变体
         "local",
         "LOCAL",
         "123pan",
-        "",                // 空串
+        "", // 空串
     }) |bad| {
         try testing.expect(find(bad) == null);
     }

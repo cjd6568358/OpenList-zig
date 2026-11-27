@@ -185,6 +185,19 @@ fn setCookieValue(alloc: std.mem.Allocator, cookie: []const u8, name: []const u8
     return out.toOwned();
 }
 
+/// AUDIT-2026-11-27 #10：`k=v; k=v` 形态 Cookie 串的读取侧（与
+/// `setCookieValue` 配对）。absorbCookie 用它做「值没变就不落盘」的比对。
+fn cookieValue(cookie: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, cookie, ';');
+    while (it.next()) |raw| {
+        const pair = std.mem.trim(u8, raw, " \t");
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (!std.mem.eql(u8, std.mem.trim(u8, pair[0..eq], " \t"), name)) continue;
+        return std.mem.trim(u8, pair[eq + 1 ..], " \t");
+    }
+    return null;
+}
+
 // ---------------------------------------------------------------------------
 // 驱动
 // ---------------------------------------------------------------------------
@@ -200,6 +213,9 @@ pub const Quark = struct {
     /// T6：init 跑在后台线程，请求线程随时可能进来 —— 串行化同一驱动的请求，
     /// 顺带保护 `cfg.cookie` 的并发写（Go 那边是单协程模型下直接改字段）。
     req_mu: std.Io.Mutex = .init,
+    /// AUDIT-2026-11-27 #10：上次落盘的 addition JSON（persistIfChanged
+    /// 的去重基准）。deinit 时释放。
+    last_saved: []const u8 = "",
 
     pub const vtable = driver.Driver.VTable{
         .name = drvName,
@@ -285,6 +301,12 @@ pub const Quark = struct {
     }
 
     /// 从响应里捡一个指定 cookie 并写回配置（util.go:49-61）。
+    ///
+    /// AUDIT-2026-11-27 #10：与现有值相同就**什么都不做**（连内存都不动）。
+    /// `__puus` 滚动机制下夸克几乎每个响应都回 Set-Cookie，旧代码无去重：
+    /// 每个响应都 free/重配 cookie + 全量序列化 + persist 落盘，一次深层
+    /// list（逐级逐页下钻全是 request()）可触发十几次配置写盘 —— 光猫
+    /// flash 磨损 + fsync 放大。落盘再经 persistIfChanged 去一道重。
     fn absorbCookie(self: *Quark, res: httpclient.Response, name: []const u8) void {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -299,12 +321,16 @@ pub const Quark = struct {
             if (!std.mem.eql(u8, k, name)) continue;
             const v = std.mem.trim(u8, first[eq + 1 ..], " \t");
             if (v.len == 0) continue;
+            // 值没变：cookie 未滚动（上游重复回同一个值），直接跳过。
+            if (cookieValue(self.cfg.cookie, name)) |cur| {
+                if (std.mem.eql(u8, cur, v)) return;
+            }
             const next = setCookieValue(self.alloc, self.cfg.cookie, name, v) catch return;
             if (self.cfg.cookie.len > 0) self.alloc.free(self.cfg.cookie);
             self.cfg.cookie = next;
             // Go：op.MustSaveDriverStorage(d)
             const text = self.cfg.toJson(a) catch return;
-            driver.persist(self.storage_id, text);
+            driver.persistIfChanged(&self.last_saved, self.alloc, self.storage_id, text);
             return;
         }
     }
@@ -341,7 +367,10 @@ fn requestUnchecked(self: *Quark, arena: std.mem.Allocator, pathname: []const u8
         .use_cookies = true,
     });
     self.absorbCookie(res, "__puus");
-    if (self.cfg.use_transcoding_address) self.absorbCookie(res, "__pus");
+    // AUDIT-2026-11-27 #10：补齐 M4 修复的同族漏网 —— `request()` 侧当年已
+    // 加上 isQuarkVariant 判据，这里没有：UC 变体 + use_transcoding_address
+    // 开启时，MakeDir 仍会把 UC 的 cookie 串写成夸克会话的 `__pus` 值。
+    if (self.isQuarkVariant() and self.cfg.use_transcoding_address) self.absorbCookie(res, "__pus");
     return res.body;
 }
 
@@ -439,6 +468,8 @@ fn deinit(ptr: *anyopaque, ctx: *driver.Ctx) void {
     const self = as(ptr);
     _ = ctx;
     self.client.deinit();
+    // AUDIT #10：去重基准的自持拷贝。
+    if (self.last_saved.len > 0) self.alloc.free(@constCast(self.last_saved));
 }
 
 fn list(ptr: *anyopaque, ctx: *driver.Ctx, dir: []const u8) anyerror![]model.Obj {
@@ -679,7 +710,8 @@ fn put(ptr: *anyopaque, ctx: *driver.Ctx, dst: []const u8, src: model.Source) an
     // Go 用 `file.GetMimetype()`（= `utils.GetMimeType(name)`），不是恒定的
     // octet-stream。夸克拿它做上传分类，推错不影响上传本身。
     const content_type = mime.mimeFor(name);
-    const pre_body = try std.fmt.allocPrint(a,
+    const pre_body = try std.fmt.allocPrint(
+        a,
         "{{\"ccp_hash_update\":true,\"dir_name\":\"\",\"file_name\":{s},\"format_type\":\"{s}\",\"l_created_at\":{d},\"l_updated_at\":{d},\"pdir_fid\":{s},\"size\":{d}}}",
         .{ try jsonQuote(a, name), content_type, now_ms, now_ms, try jsonQuote(a, parent.id), size },
     );
@@ -1058,8 +1090,6 @@ test "T3: the UC variant is its own registered driver, not an alias" {
     try testing.expectEqualStrings("Quark", q.vtable.name(q.ptr));
 }
 
-
-
 test "M4: transcoding criteria are Quark-only (Go config.Name == \"Quark\")" {
     // 审计 M4：Go 的两处转码判据都带 `d.config.Name == "Quark"`
     // （`util.go:55` 吸 `__pus`；`driver.go:66` 走转码链）。以前 Zig 只看
@@ -1081,7 +1111,6 @@ test "M4: transcoding criteria are Quark-only (Go config.Name == \"Quark\")" {
     try testing.expectEqualStrings("UC", uc.conf.name);
 }
 
-
 test "T2: copy is NotSupported, matching Go" {
     // Go `drivers/quark_uc/driver.go:116-118` 的 Copy 就是 `return errs.NotSupport`。
     // 夸克服务端没有服务端复制接口，上游因此不做。`Driver.copy` 的默认槽
@@ -1096,6 +1125,55 @@ test "T2: copy is NotSupported, matching Go" {
     try testing.expectError(driver.Error.NotSupported, d.copy(&ctx, "/src", "/dst"));
 }
 
+test "AUDIT #10: absorbCookie writes nothing when the cookie value is unchanged" {
+    // 回归：`__puus` 滚动机制下夸克几乎每个响应都回 Set-Cookie。旧代码
+    // 无任何去重 —— 一次深层 list 可触发十几次全量序列化 + 落盘（flash
+    // 磨损 + fsync 放大，AUDIT-2026-11-27 #10）。修复后：值没变 → 零改动；
+    // 落盘再经 persistIfChanged 兜一道（同文本零落盘）。
+    var arena = testArena();
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Counter = struct {
+        var calls: usize = 0;
+        fn hook(storage_id: i64, addition_json: []const u8) void {
+            _ = storage_id;
+            _ = addition_json;
+            calls += 1;
+        }
+    };
+    const prev = driver.persist_hook;
+    driver.persist_hook = Counter.hook;
+    defer driver.persist_hook = prev;
+    defer Counter.calls = 0;
+
+    const self = try createWithId(a, 41, null, quark_conf);
+    defer self.client.deinit();
+    self.cfg.cookie = try a.dupe(u8, "__puus=stale");
+
+    // ① 值变化：吸收一次 + 落盘一次，cfg.cookie 换新。
+    {
+        var hs = [_]model.Header{.{ .name = "Set-Cookie", .value = "__puus=fresh; Path=/; Max-Age=9999" }};
+        self.absorbCookie(.{ .status = 200, .headers = &hs, .body = "" }, "__puus");
+        try testing.expectEqualStrings("__puus=fresh", self.cfg.cookie);
+        try testing.expectEqual(@as(usize, 1), Counter.calls);
+    }
+    // ② 值不变（上游重复回同一个值，属性串不同也没关系）：零改动零落盘。
+    {
+        var hs = [_]model.Header{.{ .name = "Set-Cookie", .value = "__puus=fresh; Path=/; Max-Age=8888" }};
+        self.absorbCookie(.{ .status = 200, .headers = &hs, .body = "" }, "__puus");
+        try testing.expectEqualStrings("__puus=fresh", self.cfg.cookie);
+        try testing.expectEqual(@as(usize, 1), Counter.calls);
+    }
+    // ③ 值再变：再落一次。
+    {
+        var hs = [_]model.Header{.{ .name = "Set-Cookie", .value = "__puus=again; Path=/" }};
+        self.absorbCookie(.{ .status = 200, .headers = &hs, .body = "" }, "__puus");
+        try testing.expectEqualStrings("__puus=again", self.cfg.cookie);
+        try testing.expectEqual(@as(usize, 2), Counter.calls);
+    }
+}
+
 test "linkResult: header array is allocator-owned (no dangling stack literal)" {
     // 回归测试，对应 2026-10-16 真机事故：`return .{ .header = &[_]model.Header{...} }`
     // 的数组字面量落在被调函数栈帧里，返回后即悬垂 —— 生产表现为代理下载
@@ -1107,8 +1185,7 @@ test "linkResult: header array is allocator-owned (no dangling stack literal)" {
     defer arena.deinit();
     const a = arena.allocator();
     const cookie = "x_pan_client_id=abc; x_pan_access_token=def";
-    const lk = try linkResult(a, "https://cdn.example/f", cookie,
-        "https://pan.quark.cn", "Mozilla/5.0 quark", true);
+    const lk = try linkResult(a, "https://cdn.example/f", cookie, "https://pan.quark.cn", "Mozilla/5.0 quark", true);
     var pollute_buf: [8192]u8 = undefined;
     var i: usize = 0;
     while (i < 4) : (i += 1) {

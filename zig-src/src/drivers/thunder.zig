@@ -177,11 +177,16 @@ const web_algorithms_str = "QT5gqd1eSINZe+K,9TafMwqVWgh45hLntDm6HLcOXE,L0nOen58D
 const web_captcha_ttl_ms: i64 = 300 * 1000;
 const web_captcha_skew_ms: i64 = 60 * 1000;
 
-
-
 // s3manager 默认值（Go 侧没有覆盖，只有超大文件时才调 PartSize）。
 const default_part_size: i64 = 5 * 1024 * 1024;
 const max_upload_parts: i64 = 10000;
+
+/// AUDIT-2026-11-27 #13：S3 操作重试（对齐 Go 侧 aws sdk 默认 retryer 的
+/// 3 次尝试 —— s3manager 的单传/分片/收尾一律经 client 重试；此前本驱动
+/// 是全部上传驱动里唯一无重试的，弱网大文件成功率明显劣于 itvsh/189pc/
+/// pan123，也劣于 Go 上游）。退避 1s·2ⁿ（itvsh 同款）。
+const s3_attempts: u8 = 3;
+const s3_retry_delay_ms: u64 = 1000;
 const s3_region = "xunlei";
 const s3_service = "s3";
 const unsigned_payload = "UNSIGNED-PAYLOAD";
@@ -592,12 +597,11 @@ pub const Thunder = struct {
 
     /// Go `op.MustSaveDriverStorage(x)`。失败只记日志（Go 那边是 Must*，会
     /// panic；本工程不因为写盘失败把整个存储打挂）。
+    /// AUDIT-2026-11-27 #10：去重收敛到 `driver.persistIfChanged`（本函数
+    /// 原是 8 家私有 last_saved 副本之一的样板；quarkuc 根治的同一轮）。
     fn persist(self: *Thunder, a: std.mem.Allocator) void {
         const text = self.additionJson(a) catch return;
-        if (std.mem.eql(u8, text, self.last_saved)) return;
-        driver.persist(self.storage_id, text);
-        if (self.last_saved.len > 0) self.alloc.free(@constCast(self.last_saved));
-        self.last_saved = self.alloc.dupe(u8, text) catch "";
+        driver.persistIfChanged(&self.last_saved, self.alloc, self.storage_id, text);
     }
 
     // -- 签名 / 设备 --------------------------------------------------------
@@ -824,10 +828,10 @@ pub const Thunder = struct {
                 const prev = if (ed) |p| (p.* orelse "") else "";
                 const msg = if (prev.len > 0)
                     std.fmt.allocPrint(a, "refresh_token 失败（{s}）；账号密码登录也失败：{s}", .{ rf, prev }) catch
-                    return e
+                        return e
                 else
                     std.fmt.allocPrint(a, "refresh_token 失败（{s}）；账号密码登录也不可用（没配 username/password）", .{rf}) catch
-                    return e;
+                        return e;
                 setErr(ed, msg);
             }
             return e;
@@ -1209,8 +1213,7 @@ pub const Thunder = struct {
         // ⚠ 前端把 error_msg 当**纯文本**渲染（不解析 HTML），所以这里绝不能包
         // HTML 外壳——否则用户看到的就是"全是代码"。信息一个不少：JSON 仍完整
         // 内嵌，指导语换成三行中文，照着做即可。（Go 那边是 HTML，前端同样不渲染。）
-        const msg = try std.fmt.allocPrint(a,
-            "本次登录需要验证（新设备 / 风控）。\n" ++
+        const msg = try std.fmt.allocPrint(a, "本次登录需要验证（新设备 / 风控）。\n" ++
             "把下面这段 JSON（含大括号）复制到 https://i.xunlei.com/xlcaptcha/android.html ，\n" ++
             "按 F12 打开控制台执行 reviewCb(<粘贴>) ；完成后把得到的 creditkey 填到本存储的\n" ++
             "「信用密钥」再保存即可。\n{s}", .{j.slice()});
@@ -1377,37 +1380,63 @@ pub const Thunder = struct {
             const buf = try a.alloc(u8, @intCast(@max(size, 1)));
             if (size > 0) try src.readAllInto(0, buf[0..@intCast(size)]);
             const auth = try sigV4(a, sc, "PUT", obj_uri, "", &.{});
-            const res = try self.client.send(a, .{
-                .method = "PUT",
-                .url = obj_url,
-                .headers = try authHeaders(a, sc, auth),
-                .body = buf[0..@intCast(size)],
-                .omit_content_type = true,
-                .use_cookies = false,
-            });
-            if (!res.isOk()) {
-                log.warn("[thunder] s3 single PUT HTTP {d}: {s}", .{ res.status, res.body[0..@min(res.body.len, 200)] });
-                return Error.UploadFailed;
+            // AUDIT #13：单传同享 3 次退避（网络错误与非 2xx 都重试）。
+            var attempt: u8 = 0;
+            while (true) : (attempt += 1) {
+                const res = self.client.send(a, .{
+                    .method = "PUT",
+                    .url = obj_url,
+                    .headers = try authHeaders(a, sc, auth),
+                    .body = buf[0..@intCast(size)],
+                    .omit_content_type = true,
+                    .use_cookies = false,
+                }) catch |e| {
+                    if (attempt + 1 >= s3_attempts) return e;
+                    log.warn("[thunder] s3 single PUT failed ({s}), attempt {d}/{d}", .{ @errorName(e), attempt + 1, s3_attempts });
+                    rt.sleepMillis(@intCast(s3_retry_delay_ms << @intCast(attempt)));
+                    continue;
+                };
+                if (res.isOk()) break;
+                if (attempt + 1 >= s3_attempts) {
+                    log.warn("[thunder] s3 single PUT HTTP {d}: {s}", .{ res.status, res.body[0..@min(res.body.len, 200)] });
+                    return Error.UploadFailed;
+                }
+                log.warn("[thunder] s3 single PUT HTTP {d}, attempt {d}/{d}", .{ res.status, attempt + 1, s3_attempts });
+                rt.sleepMillis(@intCast(s3_retry_delay_ms << @intCast(attempt)));
             }
             reportProgress(ctx, 100);
             return;
         }
 
         const count: i64 = @divTrunc(size + part_size - 1, part_size);
-        // 1) CreateMultipartUpload
+        // 1) CreateMultipartUpload（AUDIT #13：同款 3 次退避）
         const create_auth = try sigV4(a, sc, "POST", obj_uri, "uploads=", &.{});
-        const create_res = try self.client.send(a, .{
-            .method = "POST",
-            .url = try std.fmt.allocPrint(a, "{s}?uploads=", .{obj_url}),
-            .headers = try authHeaders(a, sc, create_auth),
-            .omit_content_type = true,
-            .use_cookies = false,
-        });
-        if (!create_res.isOk()) {
-            log.warn("[thunder] s3 MPU create HTTP {d}", .{create_res.status});
-            return Error.UploadFailed;
-        }
-        const upload_id = xmlTag(create_res.body, "UploadId") orelse return Error.InvalidResponse;
+        const upload_id = create_blk: {
+            var attempt: u8 = 0;
+            while (true) : (attempt += 1) {
+                const create_res = self.client.send(a, .{
+                    .method = "POST",
+                    .url = try std.fmt.allocPrint(a, "{s}?uploads=", .{obj_url}),
+                    .headers = try authHeaders(a, sc, create_auth),
+                    .omit_content_type = true,
+                    .use_cookies = false,
+                }) catch |e| {
+                    if (attempt + 1 >= s3_attempts) return e;
+                    log.warn("[thunder] s3 MPU create failed ({s}), attempt {d}/{d}", .{ @errorName(e), attempt + 1, s3_attempts });
+                    rt.sleepMillis(@intCast(s3_retry_delay_ms << @intCast(attempt)));
+                    continue;
+                };
+                if (create_res.isOk()) {
+                    break :create_blk xmlTag(create_res.body, "UploadId") orelse return Error.InvalidResponse;
+                }
+                if (attempt + 1 >= s3_attempts) {
+                    log.warn("[thunder] s3 MPU create HTTP {d}", .{create_res.status});
+                    return Error.UploadFailed;
+                }
+                log.warn("[thunder] s3 MPU create HTTP {d}, attempt {d}/{d}", .{ create_res.status, attempt + 1, s3_attempts });
+                rt.sleepMillis(@intCast(s3_retry_delay_ms << @intCast(attempt)));
+            }
+        };
 
         // 2) 逐片 PUT
         const chunk = try a.alloc(u8, @intCast(part_size));
@@ -1419,19 +1448,34 @@ pub const Thunder = struct {
             try src.readAllInto(off, chunk[0..len]);
             const q = try std.fmt.allocPrint(a, "partNumber={d}&uploadId={s}", .{ part_no, upload_id });
             const auth = try sigV4(a, sc, "PUT", obj_uri, q, &.{});
-            const res = try self.client.send(a, .{
-                .method = "PUT",
-                .url = try std.fmt.allocPrint(a, "{s}?{s}", .{ obj_url, q }),
-                .headers = try authHeaders(a, sc, auth),
-                .body = chunk[0..len],
-                .omit_content_type = true,
-                .use_cookies = false,
-            });
-            if (!res.isOk()) {
-                log.warn("[thunder] s3 part {d} HTTP {d}", .{ part_no, res.status });
-                return Error.UploadFailed;
+            // AUDIT #13：单片失败 3 次退避（此前单片 HTTP 失败直接 UploadFailed，
+            // 弱网下十几个 GB 的上传会在最后一公里整单报废）。
+            var attempt: u8 = 0;
+            while (true) : (attempt += 1) {
+                const res = self.client.send(a, .{
+                    .method = "PUT",
+                    .url = try std.fmt.allocPrint(a, "{s}?{s}", .{ obj_url, q }),
+                    .headers = try authHeaders(a, sc, auth),
+                    .body = chunk[0..len],
+                    .omit_content_type = true,
+                    .use_cookies = false,
+                }) catch |e| {
+                    if (attempt + 1 >= s3_attempts) return e;
+                    log.warn("[thunder] s3 part {d} failed ({s}), attempt {d}/{d}", .{ part_no, @errorName(e), attempt + 1, s3_attempts });
+                    rt.sleepMillis(@intCast(s3_retry_delay_ms << @intCast(attempt)));
+                    continue;
+                };
+                if (res.isOk()) {
+                    etags[@intCast(part_no - 1)] = res.header("ETag") orelse return Error.InvalidResponse;
+                    break;
+                }
+                if (attempt + 1 >= s3_attempts) {
+                    log.warn("[thunder] s3 part {d} HTTP {d}", .{ part_no, res.status });
+                    return Error.UploadFailed;
+                }
+                log.warn("[thunder] s3 part {d} HTTP {d}, attempt {d}/{d}", .{ part_no, res.status, attempt + 1, s3_attempts });
+                rt.sleepMillis(@intCast(s3_retry_delay_ms << @intCast(attempt)));
             }
-            etags[@intCast(part_no - 1)] = res.header("ETag") orelse return Error.InvalidResponse;
             reportProgress(ctx, @as(f64, @floatFromInt(off + len)) * 100.0 / @as(f64, @floatFromInt(@max(size, 1))));
         }
 
@@ -1444,17 +1488,31 @@ pub const Thunder = struct {
         try xml.append("</CompleteMultipartUpload>");
         const q = try std.fmt.allocPrint(a, "uploadId={s}", .{upload_id});
         const auth = try sigV4(a, sc, "POST", obj_uri, q, &.{});
-        const res = try self.client.send(a, .{
-            .method = "POST",
-            .url = try std.fmt.allocPrint(a, "{s}?{s}", .{ obj_url, q }),
-            .headers = try authHeaders(a, sc, auth),
-            .body = xml.slice(),
-            .omit_content_type = true,
-            .use_cookies = false,
-        });
-        if (!res.isOk()) {
-            log.warn("[thunder] s3 MPU complete HTTP {d}: {s}", .{ res.status, res.body[0..@min(res.body.len, 200)] });
-            return Error.UploadFailed;
+        // AUDIT #13：收尾同样是网络操作，同款 3 次退避（此前直接失败）。
+        {
+            var attempt: u8 = 0;
+            while (true) : (attempt += 1) {
+                const res = self.client.send(a, .{
+                    .method = "POST",
+                    .url = try std.fmt.allocPrint(a, "{s}?{s}", .{ obj_url, q }),
+                    .headers = try authHeaders(a, sc, auth),
+                    .body = xml.slice(),
+                    .omit_content_type = true,
+                    .use_cookies = false,
+                }) catch |e| {
+                    if (attempt + 1 >= s3_attempts) return e;
+                    log.warn("[thunder] s3 MPU complete failed ({s}), attempt {d}/{d}", .{ @errorName(e), attempt + 1, s3_attempts });
+                    rt.sleepMillis(@intCast(s3_retry_delay_ms << @intCast(attempt)));
+                    continue;
+                };
+                if (res.isOk()) break;
+                if (attempt + 1 >= s3_attempts) {
+                    log.warn("[thunder] s3 MPU complete HTTP {d}: {s}", .{ res.status, res.body[0..@min(res.body.len, 200)] });
+                    return Error.UploadFailed;
+                }
+                log.warn("[thunder] s3 MPU complete HTTP {d}, attempt {d}/{d}", .{ res.status, attempt + 1, s3_attempts });
+                rt.sleepMillis(@intCast(s3_retry_delay_ms << @intCast(attempt)));
+            }
         }
         reportProgress(ctx, 100);
     }
@@ -1837,7 +1895,7 @@ fn tokenFromJson(v: *const json.Value) !Token {
 /// Go `GetAction`：正则 `://[^/]+((/[^/\s?#]+)*)` 取 path 部分。
 fn getAction(a: std.mem.Allocator, method: []const u8, url: []const u8) ![]const u8 {
     const scheme = std.mem.indexOf(u8, url, "://") orelse 0;
-    const rest = url[if (scheme == 0) 0 else scheme + 3 ..];
+    const rest = url[if (scheme == 0) 0 else scheme + 3..];
     const slash = std.mem.indexOfScalar(u8, rest, '/');
     const path = if (slash) |i| rest[i..] else "";
     const end = std.mem.indexOfAny(u8, path, "?#") orelse path.len;
@@ -2058,7 +2116,7 @@ fn s3Base(a: std.mem.Allocator, endpoint: []const u8, bucket: []const u8) ![]con
 
 fn hostOf(url: []const u8) []const u8 {
     const i = std.mem.indexOf(u8, url, "://") orelse 0;
-    const rest = url[if (i == 0) 0 else i + 3 ..];
+    const rest = url[if (i == 0) 0 else i + 3..];
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
     return rest[0..slash];
 }
@@ -2553,7 +2611,8 @@ test "THU-10: objFrom maps the Files JSON (string size, RFC3339 times, gcid hash
     try testing.expectEqual(@as(i64, 1792384496), o.modified);
     try testing.expectEqual(@as(i64, 1792281600), o.created);
 
-    const fsrc = \\{"kind":"drive#folder","id":"D1","name":"dir","size":"0"}
+    const fsrc =
+        \\{"kind":"drive#folder","id":"D1","name":"dir","size":"0"}
     ;
     const fv = try json.parse(a, fsrc);
     const fo = objFrom(&fv);
