@@ -252,7 +252,10 @@ response; a streaming response reader remains a known follow-up"（** README
 
 > **2026-11-27 落地回填**：#1-#6（全部 P0）已于当日修复并验证（本机
 > Windows 563 pass + 5 skip / 568 总；aarch64 产物 1,447,632 B / `14F58FBA…`，
-> +0.27%，未部署），详见 `docs/STATUS.md` §60.43。#7 起未动。
+> +0.27%，未部署），详见 `docs/STATUS.md` §60.43；同日续批落地 #7-#13
+> （全部 P1，569 pass + 5 skip / 574 总；产物 1,455,104 B / `A082F536…`，
+> 未部署），详见 §60.44，其中 #12 为「验证后记档不修码」（std 0.17 无挂载点）。
+> **#14 起未动。**
 > 测试侧两处踩坑（config 单例 prev 必须在 load 前取、mp_sessions 桶数组
 > 测试需显式 deinit）也已记入 §60.43。
 
@@ -264,19 +267,19 @@ response; a streaming response reader remains a known follow-up"（** README
 | 4 | 代理回源闸 + Client 复用 | P0 | 0.5 天 | ✅ 已落地（§60.43 #4） | App 4 槽轮询代理池（消费 ca_bundle/http_timeout）+ zig.max_proxy_body_mb=256MiB 闸（507）；use_cookies=false |
 | 5 | WebDAV COPY 大文件闸 | P0 | 0.5 天 | ✅ 已落地（§60.43 #5） | details 预检超 cap → 507（fetchBytes 之前） |
 | 6 | 关停 UAF | P0 | 0.5 天 | ✅ 已落地（§60.43 #6） | run 返回后 inFlight()>0 → exit(0) 跳过 defer |
-| 7 | TOCTOU + 凭据原子发布 | P1 | 0.5 天 | 未动 | setup 入口 atomic 占位；三字段单切片发布 |
-| 8 | 静默失败修硬 ×2 | P1 | 0.5 天 | 未动 | parseBodyJson→400；slice_md5 OOM→fail 会话 |
-| 9 | json surrogate 修复 | P1 | 0.5 天 | 未动 | U+FFFD 替换 + 写盘中毒回归 |
-| 10 | persist-if-changed 公共层 | P1 | 1 天 | 未动 | 抽 drivers/common，8 家共用 + 根治 quarkuc 落盘放大 |
-| 11 | syncStorages scratch 化 | P1 | 1 天 | 未动 | 序列化走临时 arena，M04 补完 |
-| 12 | TLS 握手超时 | P1 | 1 天 | 未动 | 验证 std 0.17 可挂载点 |
-| 13 | thunder 分片重试 | P1 | 0.5 天 | 未动 | 对齐 s3manager 3 次退避 |
+| 7 | TOCTOU + 凭据原子发布 | P1 | 0.5 天 | ✅ 已落地（§60.44 #7） | `App.setup_gate` atomic cmpxchg 0→1→2（并发竞速只放一进、失败路径复位允许重试）+ `creds_mu` 凭据组锁（写方锁内 retire+一次性发布，读方 login/checkAuth/issueToken/handleMe/handleInitStatus 五处锁内读全组）+ setup 改为先落盘后发布 |
+| 8 | 静默失败修硬 ×2 | P1 | 0.5 天 | ✅ 已落地（§60.44 #8） | parseBodyJson 读体失败→400；multipart slice_md5 OOM→判死会话回 500；顺手修 complete 路径锁序 |
+| 9 | json surrogate 修复 | P1 | 0.5 天 | ✅ 已落地（§60.44 #9） | 孤立高/低代理→U+FFFD（配对探测改预消费前验证）；writeString 无效 UTF-8 逐字节 FFFD 消毒；端到端「parse→stringify 产出合法 UTF-8」回归钉住配置中毒链 |
+| 10 | persist-if-changed 公共层 | P1 | 1 天 | ✅ 已落地（§60.44 #10） | `driver.persistIfChanged` 公共层（未抽 drivers/common，落在 driver.zig）+ quarkuc absorbCookie 值比对去重根治落盘放大 + requestUnchecked M4 残留修复；thunder 已迁移作样板，其余 7 家机械跟进 |
+| 11 | syncStorages scratch 化 | P1 | 1 天 | ✅ 已落地（§60.44 #11） | `Config.storages_a` 专用子 arena：新子树 fresh 建好后换装 root["storages"]，deinit 旧子 arena 整块回收（稳态 save 主 arena 零增长）；顺手删 setTopLevel 死代码 |
+| 12 | TLS 握手超时 | P1 | 1 天 | ✅ 验证后记档（§60.44 #12，未改码） | std 0.17 无干净挂载点：`ConnectTcpOptions.timeout` 声明后从未被消费、握手期无超时注入 API；结论与残余风险记入 client.zig applySocketTimeout 注释，待 std 提供入口后接入 |
+| 13 | thunder 分片重试 | P1 | 0.5 天 | ✅ 已落地（§60.44 #13） | 单传 PUT / CreateMultipartUpload / 分片 PUT / Complete 四操作全部 3 次退避（1s·2ⁿ，对齐 Go 侧 aws sdk 默认 retryer）；网络错误与非 2xx 皆重试，确定性失败不重试 |
 | 14 | 打包机产物对账（88 B 漂移） | P1 | 0.5 天 | 未动（§60.43 验证边界保留） | 复跑 build_remote.py，结论回写 STATUS 基线行 |
 | 15 | api.zig 拆分 | P2 | 3-5 天 | 未动 | 序：multipart.zig（可随已修的 #1 整体搬走）→ sign/auth（解环）→ storage_admin → mounts → router → download |
 | 16 | drivers/common 机械重复收敛 | P2 | 2-3 天 | 未动 | ~600 行（dupeOr/ObjWriter/SigV4/并发框架/persist 模式） |
 | 17 | client 流式出口 | P2 | 3-5 天 | 未动 | 价值最高、工作量最大，单独排期；#4 的 256MiB 闸已把该路径从 OOM 收口为明确 507 |
 
-**P0 合计 ≈ 4-5 人日（实际一轮完成）；P1 ≈ 6-7 人日；P2 按季度节奏。**
+**P0 合计 ≈ 4-5 人日（实际一轮完成）；P1 ≈ 6-7 人日（实际一轮完成；#12 记档未修码）；P2 按季度节奏。**
 
 ---
 

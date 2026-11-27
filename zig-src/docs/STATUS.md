@@ -13,13 +13,13 @@
 >   需要原文用 `git show 7356589e:<path>` 取回（见 §38.5）。
 > - **待办以 `TODO.md` 为准**；功能边界见 §22。
 >
-> **当前基线（2026-11-27；P0 加固轮落地，见 §60.43；SFTP 子系统见 §60.30–§60.42）**
+> **当前基线（2026-11-27；P0+P1 加固轮落地，见 §60.43–§60.44；SFTP 子系统见 §60.30–§60.42）**
 >
 > | 项 | 值 |
 > |---|---|
-> | 单元测试 | 本机 Windows **563 pass + 5 skip**（568 总，§60.43 新增 8 条）；打包机 Linux 原生上一轮 560/560（0 跳过）——**本轮 +8 用例待打包机复跑**（含 http 滴灌超时用例的真 Linux 执行） |
+> | 单元测试 | 本机 Windows **569 pass + 5 skip**（574 总；§60.43 新增 8 条、§60.44 新增 6 条）；打包机 Linux 原生上一轮 560/560（0 跳过）——**两轮共 +14 用例待打包机复跑**（含 http 滴灌超时用例的真 Linux 执行） |
 > | SFTP 服务端（SSH-2 + SFTP v3，`sftp.enable` 默认 false） | 五层落地：断点续传 / 双向 rekey / 按 IP 分桶限速（与 HTTP 共用）/ pre-auth 超时 + 64 并发上限；三客户端互通 + paramiko e2e；`--sftp-plain` 已删（§60.41） |
-> | 交叉编译（aarch64-linux-musl，`-Doptimize=small`） | 通过；本机最新产物 **1,447,632 B / `14F58FBA`**（2026-11-27 P0 加固轮，**未部署**）；生产仍跑 11-02 的 1,443,624 B / `8fac3896`（§60.42） | |
+> | 交叉编译（aarch64-linux-musl，`-Doptimize=small`） | 通过；本机最新产物 **1,455,104 B / `A082F536`**（2026-11-27 P0+P1 加固轮，**未部署**）；生产仍跑 11-02 的 1,443,624 B / `8fac3896`（§60.42） |
 > | 真机 e2e（光猫，13 挂载点） | **464 通过 / 0 失败 / 1 跳过**（跳过 = 坚果云根目录 403 服务商规则；2026-10-18 基线，本轮未重跑全量 e2e） |
 > | 真机无凭据回归（`driver_matrix.py`） | 默认产物 **27/27**；点名产物（+3 变体）**14/14** |
 > | 注册驱动 | **15 个注册项 / 12 个实现**（Quark+UC 共用 quarkuc.zig，thunder 出 3 个 factory），12/12 真机覆盖；**另 3 个变体（`123 Open`/`QuarkOpen`/`115 Open`）编译期可选**，见 §53 |
@@ -5955,5 +5955,140 @@ detach 连接线程随后仍读 `self.opts` / handler ctx（测试注释自述�
   Linux 能过；尤其 http 滴灌用例首次真执行）+ 产物对账（审计 §0 提出的
   +88 B 漂移仍未解）；② 真机隔离实例回归（multipart 取消上传、WebDAV
   大文件 COPY 507、/p/ 超限 507 三条新增路径）；③ 部署窗口待机主拍板。
+
+---
+
+## 60.44 P1 批次（AUDIT 2026-11-27 路线图 #7-#13）：七项落地
+
+**背景**：继 §60.43 的 P0 六项后，按同一审计报告（`docs/
+AUDIT_2026-11-27-architecture.md`）路线图连续落地 P1 全部七项（#7-#13）。
+代码 +855/-158 行（7 文件），**本机 Windows 569 pass + 5 skip（574 总）**
+零泄漏；产物 1,455,104 B / SHA256 `A082F536…`（较 P0 轮 +7,472 B / +0.52%，
+较生产基线 `8fac3896` +11,480 B；见顶部基线表）。
+
+### #7 setup TOCTOU 闸 + 凭据组一致性锁（P1）
+
+* **TOCTOU**：`App.setup_gate`（atomic u8：0 未初始化 / 1 进行中 / 2
+  已初始化）。两个并发 `/api/public/init/setup` 都见 admin_hash 为空时，
+  cmpxchg 只放一个进闸，其余 409；失败路径（校验 400 / 落盘 500 / 错误
+  上抛）一律复位为 0 允许机主重试（`defer store(gate_done ? 2 : 0)`）。
+  App.init 按凭据状态初始化闸值；**测试构造的字面量 App 行为不变**（判
+  「已初始化」仍以 admin_hash.len 为准，闸只管竞速窗口）。
+* **凭据发布**：新增 `App.creds_mu`。写方（setup / meUpdate /
+  reloadAdminCredentials）先备齐全部新值（失败零残留），持锁「retire 旧代
+  + 逐字段替换」一次性发布；读方（loginCommon 的比对、checkAuth 的
+  user/pwd_ts、issueToken 的 pwd_ts、handleMe、handleInitStatus）持锁读
+  全组 —— 消除「新 user 配旧 salt」的撕裂读窗口（M17 只解决了 UAF）。
+  选小锁而非单原子指针切片：后者要动 ~15 处测试字面量构造面，锁方案
+  零测试构造面改动（取舍记在字段注释）。
+* **顺手修正**：①setup 的内存发布从「先赋值后 save」改为「落盘成功后
+  发布」（旧顺序在 save 失败时留下「内存有管理员、磁盘没有」的失步）；
+  ②meUpdate 改密中途回 500 时，内存凭据不再超前于磁盘（旧代码配置块里
+  就赋值了）；③两处写方补上 M17 退役纪律（此前直接覆盖旧切片 = 泄漏
+  敏感串）。
+
+### #8 静默失败修硬（P1）
+
+- `parseBodyJson` 读体失败：以前 `catch return null` → 上层 `orelse
+  return` 交出**从未写过任何字节的 200 空响应**；现在写 400
+  `"cannot read request body"`（JSON 解析失败分支一直有 400，唯独这条被漏）。
+- multipart `slice_md5s.append` OOM（chunk 消化队列 + complete 排空两处）：
+  以前静默丢片（received_bytes 已计、next_md5_idx 已进，complete 拿残缺链去
+  mpCommit，上游秒传/校验语义被静默破坏）；现在判死会话回 500
+  "out of memory recording slice md5; restart the upload"。
+- 顺手修正 complete 路径的锁序（原「先 unlock 再 mpSetState 写状态」与
+  读侧构成竞争，改锁内置状态）。
+
+### #9 json surrogate + 无效 UTF-8 消毒（P1，正确性）
+
+- **parseString**：孤立高代理（截断 emoji 的常见形态 `\ud83d`）/ 孤立低
+  代理一律映射 U+FFFD（Go `encoding/json` 语义）。旧代码把代理区码点直接
+  appendUtf8 → CESU-8 风格非法序列 → 驱动 persist → config 落盘 → 下次
+  启动 utf8Validate 拒收 → **服务拒启**（历史「配置中毒」故障链的另一半）。
+  配对探测改为「预消费前先验证」（lookaheadLowSurrogate），「高代理后跟
+  另一个高代理」不再吞掉第二个转义。
+- **writeString**：无效 UTF-8 字节序列写出为 U+FFFD（对齐 Go Marshal；
+  每非法字节一枚、前进一步，ASCII 快路径避开已处理的 `"` 与 `\`）。
+  非法字节从此进不了 JSON 响应与 config 落盘。
+- **踩坑记档（本批唯一一次返工）**：writeString 从 for 改 while 后单字节
+  分支忘了推进 i，首轮测试全量挂死（无限 append）——进程杀掉、改块状
+  i += 1 后过了。已写测试钉住（第⑥断言端到端：含孤立代理的输入
+  parse → stringify 回写必须是合法 UTF-8）。
+- **工具链事故与恢复**：修 `const hs → var hs` 时用了 PowerShell 5.1 的
+  `Set-Content` 原地改 UTF-8 源文件，系统 GBK 编码把 quarkuc/thunder 两个
+  文件的中文注释全部写毁。处置：git stash 隔离被毁文件 → 在干净的 HEAD
+  版本上用编辑工具逐块重放 #10/#13 全部修改（内容可从会话记录精确复刻）
+  → 重跑测试全绿。**教训：含非 ASCII 的源文件严禁 PowerShell 管道原地
+  改写，一律走编辑工具；stash 快照保留备查（stash@{0}）。**
+
+### #10 persist-if-changed 公共层 + quarkuc 落盘放大根治（P1）
+
+- `driver.persistIfChanged(&last_saved, alloc, storage_id, text)` 落成：
+  相同内容零落盘，last_saved 在长期分配器上自持（OOM 置回 "" 的代价
+  只是下次同内容多落一次）。8 家私有 last_saved 副本从此有单一审验点。
+- **quarkuc（唯一无去重的驱动）**：absorbCookie 先按 `cookieValue` 比对
+  （值没变连内存都不动），落盘再经 helper 去重 —— `__puus` 滚动机制
+  下「一次深层 list 触发十几次全量序列化 + fsync + rename」的落盘放大
+  （光猫 flash 磨损）终结。deinit 释放 last_saved。
+- **顺手修正**：`requestUnchecked` 的 M4 残留 —— `request()` 侧当年已加
+  `isQuarkVariant()` 判据，这里没有：UC 变体 + 转码开启时 MakeDir 会把 UC
+  的 cookie 写成夸克会话的 `__pus` 值（驱动层审计 P1，本轮落入）。
+- thunder 的私有 persist 已迁移到 helper 作样板；其余 7 家
+  （cloud189pc/wopan/123open/quark/115open/aliyundrive/itvsh 的按内容比对
+  变体）行为等价，增量迁移为机械跟进（§60.43 收尾池并项）。
+
+### #11 syncStorages 子树专用子 arena（P1，缓慢单调泄漏）
+
+每次 save 在**进程 arena** 里重建整棵 storages JSON 子树、旧子树永久滞留
+（M04 只把序列化文本挪进 scratch，树重建没跟上）—— itvsh 每刷一次
+token/cookie 就 save 一次，长跑只涨不降。修法：`Config.storages_a` 专用
+子 arena，新子树先在 fresh arena 完整建好（失败对现有文档零影响），
+换装 root["storages"] 指针后 deinit 旧 arena 整块回收。安全性论证：子树
+只有 root 一个挂点、无人跨 save 持有其指针（消费方读 self.storages 的
+记录本体，在主 arena）；顶层键缺失的罕见路径走主 arena 分配（root 的
+keys 数组不能寄居在被回收的子 arena）。**顺手删除 `setTopLevel` 死代码**
+（审计 P2：全库无调用方、且不拿 g_save_mutex 的隐患，本批一并清掉）。
+测试：`queryCapacity` 断言稳态 5 轮 save 主 arena 容量逐字节不涨。
+
+### #12 TLS 握手超时：验证后记档（P1，无可挂点）
+
+按路线图「验证 std 0.17 可挂载点」执行，**结论：无干净挂载点**——TLS
+握手发生在 `inner.request()` 内部的 `connectTcpOptions → Tls.create →
+std.crypto.tls.Client.init`；`ConnectTcpOptions.timeout` 字段在 lib/std/
+http/Client.zig 全文件**声明后从未被消费**（纯摆设），握手期 read 无超时
+入口，也没有把自建 socket 注入连接池的 API。fork std 的方案被否决（维护
+成本不成比例）。验证结论与残余风险（上游 TLS 层静默挂起仍会无限阻塞，
+观测层靠上层 read 超时兜底）已完整记入 `client.zig` 的
+`applySocketTimeout` 注释（N01 块后），待 std 提供入口后接入。
+
+### #13 thunder S3 三段重试（P1）
+
+单传 PUT / CreateMultipartUpload / 分片 PUT / Complete 四个操作全部加
+3 次退避（1s·2ⁿ，itvsh 同款；对齐 Go 侧 aws sdk 默认 retryer）。此前
+thunder 是全部上传驱动里唯一无重试的实现 —— 弱网大文件成功率明显劣于
+itvsh/189pc/pan123，单片 HTTP 失败直接 UploadFailed 整单报废。网络错误
+（send error）与非 2xx 都重试；sigV4 等确定性失败在循环外不重试。网络
+路径无单测（驱动层惯例），真机弱网验证列入回归清单。
+
+### 测试（+6 条，563/568 → 569/574）
+
+| 新增用例 | 钉住什么 |
+|---|---|
+| `AUDIT #9: unpaired surrogates decode to U+FFFD...` | 孤立高/低代理、双高代理、配对不变四形态 + 原始非法字节消毒 + 端到端「parse→stringify 产出合法 UTF-8」（配置中毒链的两侧断言） |
+| `AUDIT #7: setup gate — concurrent contenders...` | 闸占用中 409 且不复位、cmpxchg 8 线程恰好一赢家、校验失败回滚为 0 |
+| `AUDIT #7: me/update publishes credentials atomically...` | 发布可见性 + 退役环计数（setup 1 代、meUpdate 2 代）+ 改密后旧令牌 401 |
+| `AUDIT #10: persistIfChanged dedups...`（driver.zig） | 首次落盘/相同内容零落盘/变化再落/空内容跳过，计数钩子 |
+| `AUDIT #10: absorbCookie writes nothing...`（quarkuc） | 值不变零改动零落盘、值变恰好一次，计数钩子 + cfg.cookie 断言 |
+| `AUDIT #11: repeated saves do not grow the config arena` | 稳态 5 轮 save 主 arena 容量逐字节不涨 + 盘上内容 round-trip |
+
+### 验证边界（如实）
+
+* **本机 Windows 569 pass + 5 skip / 574 总，零泄漏零 crash**；
+* aarch64 交叉编译通过（数字见顶部基线表）；**未部署**，生产仍跑
+  `8fac3896`；
+* P0 轮遗留待办不变：打包机 Linux 原生复跑（本轮新增用例同样 Windows
+  可跑、无新增 skip；http 滴灌用例仍待 Linux 首跑）、真机隔离实例回归
+  （P0 三条新路径 + 本轮 thunder 弱网重试与 quarkuc 落盘频率观测）、
+  部署窗口。
 
 > AI生成
