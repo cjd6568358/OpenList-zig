@@ -149,6 +149,12 @@ pub const Config = struct {
     /// 的注释。0 = 沿用 http.zig 的 8 GiB 硬上限（不推荐在光猫上这么配）。
     max_upload_mb: i64,
 
+    /// AUDIT-2026-11-27 #4：代理回源路径（/d、/p、WebDAV 远程 GET、COPY）
+    /// 允许缓冲的最大响应体（MiB）。超出回 507 而不是把设备吃死 —— 上游
+    /// 忽略 Range 回 200 时，当前 client 会整份读进内存。默认 256；
+    /// 0 = 不限（不推荐，除非确信不会有大文件回源）。
+    max_proxy_body_mb: i64,
+
     /// Frontend presentation. OpenList keeps these in its settings table and
     /// rewrites `index.html` from them at startup; this build has no database,
     /// so they are static config. Defaults match OpenList's fresh install (see
@@ -371,10 +377,9 @@ pub const Config = struct {
         var vals = List(json.Value).init(a);
         for (self.storages) |s| {
             const keys = try a.dupe([]const u8, &.{
-                "id",     "mount_path", "order",  "driver",   "cache_expiration",
-                "status", "addition",   "remark", "disabled", "web_proxy",
-                "webdav_policy", "down_proxy_url", "disable_proxy_sign",
-                "modified",
+                "id",            "mount_path",     "order",              "driver",   "cache_expiration",
+                "status",        "addition",       "remark",             "disabled", "web_proxy",
+                "webdav_policy", "down_proxy_url", "disable_proxy_sign", "modified",
             });
             const fields = try a.dupe(json.Value, &.{
                 .{ .int = s.id },
@@ -646,7 +651,10 @@ pub fn load(alloc: std.mem.Allocator, path: []const u8) !*Config {
     cfg.sftp_host_key = str(cfg.root.getPath("sftp.host_key"), "data/ssh_host_ed25519_key");
     cfg.sftp_rekey_mb = int(cfg.root.getPath("sftp.rekey_mb"), 1024);
     cfg.tls_insecure_skip_verify = boolean(cfg.root.getPath("tls_insecure_skip_verify"), false);
-    cfg.max_connections = int(cfg.root.getPath("max_connections"), 0);
+    // AUDIT-2026-11-27 #3：缺省从 0（不限）改为 64 —— H04 只接通了旋钮没给
+    // 默认值，光猫上默认部署仍是无限 spawn。对齐 SFTP 的 64 并发闸。**显式
+    // 写 0 仍是不限**（旧行为保留，升级不惊讶）；改的是缺省与新写出的模板值。
+    cfg.max_connections = int(cfg.root.getPath("max_connections"), 64);
     cfg.max_concurrency = int(cfg.root.getPath("max_concurrency"), 64);
     cfg.delayed_start = int(cfg.root.getPath("delayed_start"), 0);
     // `cors.allow_origins/methods/headers`：字符串数组；缺省/空 → `["*"]`
@@ -668,6 +676,7 @@ pub fn load(alloc: std.mem.Allocator, path: []const u8) !*Config {
     // 给足并发余量（前端同时最多 3 个文件在传）；temp_dir 指到大容量外挂
     // 存储后可调高。Go 没有对应键（服务器不缺内存），属 Zig 部署特有。
     cfg.max_upload_mb = int(cfg.root.getPath("zig.max_upload_mb"), 64);
+    cfg.max_proxy_body_mb = int(cfg.root.getPath("zig.max_proxy_body_mb"), 256);
 
     cfg.site_title = str(cfg.root.getPath("zig.site_title"), "OpenList (zig)");
     cfg.main_color = str(cfg.root.getPath("zig.main_color"), "#1890ff");
@@ -742,7 +751,8 @@ fn parseStringListDefaultStar(a: std.mem.Allocator, v: ?*const json.Value) ![]co
     return out;
 }
 
-fn parseStorages(a: std.mem.Allocator, v: ?*const json.Value) ![]model.Storage {    const arr = if (v) |x| (x.asArray() orelse return &.{}) else return &.{};
+fn parseStorages(a: std.mem.Allocator, v: ?*const json.Value) ![]model.Storage {
+    const arr = if (v) |x| (x.asArray() orelse return &.{}) else return &.{};
     var out = try a.alloc(model.Storage, arr.len);
     var n: usize = 0;
     for (arr) |*item| {
@@ -876,13 +886,14 @@ pub const DEFAULT_CONFIG =
     \\    "compress": false
     \\  },
     \\  "delayed_start": 0,
-    \\  "max_connections": 0,
+    \\  "max_connections": 64,
     \\  "max_concurrency": 64,
     \\  "tls_insecure_skip_verify": false,
     \\  "zig": {
     \\    "ca_bundle": "",
     \\    "http_timeout": 60,
     \\    "max_upload_mb": 64,
+    \\    "max_proxy_body_mb": 256,
     \\    "web_version": "rolling",
     \\    "cdn_fallbacks": [],
     \\    "site_title": "OpenList (zig)",
@@ -1043,6 +1054,93 @@ test "zig.max_upload_mb is honoured and 0 restores the 8 GiB ceiling" {
     setForTest(cfg);
     defer setForTest(null);
     try testing.expectEqual(@as(i64, 256), cfg.max_upload_mb);
+}
+
+test "AUDIT #4: zig.max_proxy_body_mb defaults to 256, 0 disables the cap" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const path = try std.fs.path.join(testing.allocator, &.{ dir, "config.json" });
+    defer testing.allocator.free(path);
+
+    // 缺省（无该键）：默认 256 MiB。
+    try std.Io.Dir.cwd().writeFile(rt.io(), .{ .sub_path = path, .data =
+        \\{"jwt_secret":"x","zig":{},"storages":[]}
+    });
+    {
+        const cfg = try load(testing.allocator, path);
+        defer cfg.deinit();
+        setForTest(cfg);
+        defer setForTest(null);
+        try testing.expectEqual(@as(i64, 256), cfg.max_proxy_body_mb);
+    }
+
+    // 显式 0 = 不限；显式 512 照收。
+    try std.Io.Dir.cwd().writeFile(rt.io(), .{ .sub_path = path, .data =
+        \\{"jwt_secret":"x","zig":{"max_proxy_body_mb":0},"storages":[]}
+    });
+    {
+        const cfg = try load(testing.allocator, path);
+        defer cfg.deinit();
+        setForTest(cfg);
+        defer setForTest(null);
+        try testing.expectEqual(@as(i64, 0), cfg.max_proxy_body_mb);
+    }
+    try std.Io.Dir.cwd().writeFile(rt.io(), .{ .sub_path = path, .data =
+        \\{"jwt_secret":"x","zig":{"max_proxy_body_mb":512},"storages":[]}
+    });
+    {
+        const cfg = try load(testing.allocator, path);
+        defer cfg.deinit();
+        setForTest(cfg);
+        defer setForTest(null);
+        try testing.expectEqual(@as(i64, 512), cfg.max_proxy_body_mb);
+    }
+}
+
+test "AUDIT #3: max_connections defaults to 64, explicit 0 stays unlimited" {
+    // 复核承诺：旋钮已有、默认值此前是 0（不限）—— 改缺省为 64，显式 0 保留。
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const path = try std.fs.path.join(testing.allocator, &.{ dir, "config.json" });
+    defer testing.allocator.free(path);
+
+    // 缺键 → 64。
+    try std.Io.Dir.cwd().writeFile(rt.io(), .{ .sub_path = path, .data =
+        \\{"jwt_secret":"x","storages":[]}
+    });
+    {
+        const cfg = try load(testing.allocator, path);
+        defer cfg.deinit();
+        setForTest(cfg);
+        defer setForTest(null);
+        try testing.expectEqual(@as(i64, 64), cfg.max_connections);
+    }
+    // 显式 0 = 不限（旧语义保留，已按 0 部署的配置升级后行为不变）。
+    try std.Io.Dir.cwd().writeFile(rt.io(), .{ .sub_path = path, .data =
+        \\{"jwt_secret":"x","max_connections":0,"storages":[]}
+    });
+    {
+        const cfg = try load(testing.allocator, path);
+        defer cfg.deinit();
+        setForTest(cfg);
+        defer setForTest(null);
+        try testing.expectEqual(@as(i64, 0), cfg.max_connections);
+    }
+    // 显式 128 照收。
+    try std.Io.Dir.cwd().writeFile(rt.io(), .{ .sub_path = path, .data =
+        \\{"jwt_secret":"x","max_connections":128,"storages":[]}
+    });
+    {
+        const cfg = try load(testing.allocator, path);
+        defer cfg.deinit();
+        setForTest(cfg);
+        defer setForTest(null);
+        try testing.expectEqual(@as(i64, 128), cfg.max_connections);
+    }
 }
 
 test "unknown keys survive a save" {
@@ -1284,4 +1382,3 @@ fn parseListen(listen: []const u8, addr: *[]const u8, port: *i64) void {
         port.* = p;
     } else |_| {}
 }
-

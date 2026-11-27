@@ -168,7 +168,28 @@ pub const App = struct {
     /// 回退路径要把整份文件写进 `temp_dir`，资源画像与 `fs/put` 完全相同，
     /// 所以共用同一个闸；直传路径不落盘，不受此限。
     mp_max_bytes: u64 = 0,
-    mp_seq: u64 = 0,
+    /// AUDIT-2026-11-27 #1：原子化（原来裸 `+=`，并发 init 是数据竞争）。
+    mp_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    // -----------------------------------------------------------------------
+    // 代理回源 Client 池（AUDIT-2026-11-27 #4）。
+    //
+    // 以前 /d、/p 与 WebDAV 远程分支的每次回源都 `Client.init(a, .{}, &jar)`
+    // 现开一个：连接池、TLS 会话、**系统 CA 逐请求重扫**三样全丢，且空
+    // Options 把 `zig.ca_bundle` / `zig.http_timeout` 两个配置整个绕过。
+    // 池化后这笔成本每实例只付 proxy_pool_size 次；响应体由
+    // `zig.max_proxy_body_mb` 闸住（0 = 不限），把「上游忽略 Range 回 200
+    // → 全量缓冲」的 OOM 路径变成明确的 507。
+    //
+    // 每个 Client 自带一把全生命周期互斥锁（std.http.Client 非线程安全），
+    // 轮询分发避免并发下载全部串到同一条锁后面。
+    // -----------------------------------------------------------------------
+    proxy_pool_mu: std.Io.Mutex = .init,
+    proxy_pool: [proxy_pool_size]?ProxySlot = @splat(null),
+    proxy_rr: usize = 0,
+    /// `zig.max_proxy_body_mb` 换算的字节数（0 = 不限）。WebDAV COPY 的
+    /// 507 预检闸同用这一个值（fetchBytes 是整份下载再上传）。
+    proxy_cap_bytes: u64 = 0,
 
     pub fn init(alloc: std.mem.Allocator) !App {
         const cfg = config.get();
@@ -208,7 +229,71 @@ pub const App = struct {
                 .customize_body = cfg.customize_body,
             },
         });
+        // AUDIT-2026-11-27 #4：代理回源池（这里只建槽，CA 在各自首次请求时
+        // 懒加载）。改 ca_bundle/http_timeout 配置需重启生效。
+        try app.initProxyPool(cfg);
         return app;
+    }
+
+    /// AUDIT #4：代理回源池初始化 —— 消费 `zig.max_proxy_body_mb` /
+    /// `zig.http_timeout` / `zig.ca_bundle` 三个配置。独立成函数是为了可在
+    /// 测试里对局部 App 单独调用（App.init 需要 config 已加载且有前端磁盘
+    // 交互）。失败时已建槽由 errdefer / deinitProxyPool 收（见 deinit）。
+    pub fn initProxyPool(self: *App, cfg: *const config.Config) !void {
+        self.proxy_cap_bytes = if (cfg.max_proxy_body_mb > 0)
+            @as(u64, @intCast(cfg.max_proxy_body_mb)) * 1024 * 1024
+        else
+            0;
+        var opts = client_mod.Options{};
+        if (cfg.http_timeout > 0 and cfg.http_timeout <= std.math.maxInt(u32)) {
+            opts.timeout_s = @intCast(cfg.http_timeout);
+        }
+        opts.ca_bundle_path = cfg.ca_bundle;
+        if (self.proxy_cap_bytes > 0 and self.proxy_cap_bytes <= std.math.maxInt(usize)) {
+            opts.max_response_bytes = @intCast(self.proxy_cap_bytes);
+        }
+        var built: usize = 0;
+        errdefer {
+            // 剩余未建的槽为 null，安全跳过；已建的由这里回收，
+            // deinitProxyPool 幂等，双路径都不会双释放。
+            while (built > 0) {
+                built -= 1;
+                if (self.proxy_pool[built]) |*slot| {
+                    slot.client.deinit();
+                    slot.jar.deinit();
+                    self.alloc.destroy(slot.jar);
+                    self.proxy_pool[built] = null;
+                }
+            }
+        }
+        for (0..proxy_pool_size) |i| {
+            const jar = try self.alloc.create(cookiejar.Jar);
+            jar.* = cookiejar.Jar.init(self.alloc);
+            self.proxy_pool[i] = .{ .client = client_mod.Client.init(self.alloc, opts, jar), .jar = jar };
+            built = i + 1;
+        }
+    }
+
+    /// 取一个代理回源 Client（轮询）。仅 main 路径调用（生产中
+    /// initProxyPool 已建满；测试里不碰代理路径则永不进此函数）。
+    pub fn proxyClient(self: *App) *client_mod.Client {
+        const io = rt.io();
+        self.proxy_pool_mu.lockUncancelable(io);
+        defer self.proxy_pool_mu.unlock(io);
+        const i = self.proxy_rr % proxy_pool_size;
+        self.proxy_rr +%= 1;
+        return &self.proxy_pool[i].?.client;
+    }
+
+    fn deinitProxyPool(self: *App) void {
+        for (&self.proxy_pool) |*slot| {
+            if (slot.*) |*s| {
+                s.client.deinit();
+                s.jar.deinit();
+                self.alloc.destroy(s.jar);
+                slot.* = null;
+            }
+        }
     }
 
     /// 从磁盘重读 config.json，只把管理员凭据（user / hash / pwd_ts）换成新值。
@@ -270,6 +355,8 @@ pub const App = struct {
     /// allocation is still accounted for when the server shuts down.
     pub fn deinit(self: *App) void {
         self.frontend.deinit();
+        // AUDIT #4：代理回源池。
+        self.deinitProxyPool();
         // M17：退役代次里的旧凭据也要还回去（进程退出路径，此时无在途请求）。
         var i: usize = 0;
         while (i < self.retired_creds_count) : (i += 1) {
@@ -521,7 +608,7 @@ pub fn buildMountsFromConfig(alloc: std.mem.Allocator, app: *App, cfg: *config.C
                 //    这样每次 init 失败漏几百字节）。拼接交给
                 //    `setStorageErrorParts` 在配置 arena 里做，只做一次。
                 log.err("storage #{d} {s}: init failed: {s}{s}{s} — marking as errored", .{
-                    s.id,  s.driver, ef.name,
+                    s.id,                                                        s.driver,            ef.name,
                     if (ef.detail != null and ef.detail.?.len > 0) ": " else "", ef.detail orelse "",
                 });
                 cfg.setStorageErrorParts(s.id, ef.name, ef.detail);
@@ -797,11 +884,11 @@ fn noRoute(app: *App, req: *http.Request, res: *http.Response, p: []const u8) !v
 /// handler 自己校验），比 gin 的逐路由粒度略粗，边角差异见 STATUS §35。
 fn isRegisteredAuthedPath(p: []const u8) bool {
     const exact = [_][]const u8{
-        "/api/fs/list",           "/api/fs/get",           "/api/fs/dirs",
-        "/api/fs/mkdir",          "/api/fs/rename",        "/api/fs/move",
-        "/api/fs/copy",           "/api/fs/remove",        "/api/fs/put",
-        "/api/fs/archive/list",   "/api/me",               "/api/me/update",
-        "/api/auth/logout",       "/api/admin/storage",    "/api/admin/driver/names",
+        "/api/fs/list",           "/api/fs/get",            "/api/fs/dirs",
+        "/api/fs/mkdir",          "/api/fs/rename",         "/api/fs/move",
+        "/api/fs/copy",           "/api/fs/remove",         "/api/fs/put",
+        "/api/fs/archive/list",   "/api/me",                "/api/me/update",
+        "/api/auth/logout",       "/api/admin/storage",     "/api/admin/driver/names",
         "/api/admin/driver/list", "/api/admin/driver/info",
     };
     for (exact) |e| {
@@ -1037,7 +1124,7 @@ const public_setting_defaults = [_]PublicSetting{
     // ---- PREVIEW ----
     .{ .key = "external_previews", .value = "{}" },
     .{ .key = "iframe_previews", .value =
-        \\{"doc,docx,xls,xlsx,ppt,pptx":{"Microsoft":"https://view.officeapps.live.com/op/view.aspx?src=$e_url","Google":"https://docs.google.com/gview?url=$e_url&embedded=true"},"pdf":{"PDF.js":"https://res.oplist.org/pdf.js/web/viewer.html?file=$e_url"},"epub":{"EPUB.js":"https://res.oplist.org/epub.js/viewer.html?url=$e_url"}}
+    \\{"doc,docx,xls,xlsx,ppt,pptx":{"Microsoft":"https://view.officeapps.live.com/op/view.aspx?src=$e_url","Google":"https://docs.google.com/gview?url=$e_url&embedded=true"},"pdf":{"PDF.js":"https://res.oplist.org/pdf.js/web/viewer.html?file=$e_url"},"epub":{"EPUB.js":"https://res.oplist.org/epub.js/viewer.html?url=$e_url"}}
     },
     .{ .key = "audio_cover", .value = "https://res.oplist.org/logo/logo.svg" },
     .{ .key = "audio_autoplay", .value = "true" },
@@ -1060,7 +1147,7 @@ const public_setting_defaults = [_]PublicSetting{
     .{ .key = "share_preview", .value = "false" },
     .{ .key = "share_archive_preview", .value = "false" },
     .{ .key = "share_summary_content", .value =
-        \\@{{creator}} shared {{#each files}}{{#if @first}}"{{filename this}}"{{/if}}{{#if @last}}{{#unless (eq @index 0)}} and {{@index}} more files{{/unless}}{{/if}}{{/each}} from {{site_title}}: {{base_url}}/@s/{{id}}{{#if pwd}} , the share code is {{pwd}}{{/if}}{{#if expires}}, please access before {{dateLocaleString expires}}.{{/if}}
+    \\@{{creator}} shared {{#each files}}{{#if @first}}"{{filename this}}"{{/if}}{{#if @last}}{{#unless (eq @index 0)}} and {{@index}} more files{{/unless}}{{/if}}{{/each}} from {{site_title}}: {{base_url}}/@s/{{id}}{{#if pwd}} , the share code is {{pwd}}{{/if}}{{#if expires}}, please access before {{dateLocaleString expires}}.{{/if}}
     },
     // ---- INDEX ----
     .{ .key = "search_index", .value = "none" },
@@ -1496,8 +1583,8 @@ fn isGuestReadRequest(app: *const App, req: *http.Request, p: []const u8) bool {
     if (!cfg.guest_browse) return false;
     return std.mem.eql(u8, p, "/api/fs/list") or
         std.mem.eql(u8, p, "/api/fs/get") or
-    std.mem.eql(u8, p, "/api/fs/dirs") or
-    std.mem.eql(u8, p, "/api/fs/archive/list");
+        std.mem.eql(u8, p, "/api/fs/dirs") or
+        std.mem.eql(u8, p, "/api/fs/archive/list");
 }
 
 /// Accepts either `Authorization: Bearer <jwt>` or a `?token=` query param
@@ -2147,6 +2234,15 @@ const MpChunk = struct {
     md5_upper: []const u8,
 };
 
+/// AUDIT-2026-11-27 #4：代理回源 Client 池的槽数。4 是「并发下载不互相
+/// 串行」与「CA/TLS 会话重复加载次数」的折中；每槽一条互斥锁包全程。
+const proxy_pool_size = 4;
+
+const ProxySlot = struct {
+    client: client_mod.Client,
+    jar: *cookiejar.Jar,
+};
+
 const MpSession = struct {
     id: []u8,
     /// `(user)=admin|path|size|last_modified` —— Go 的 sessionKey 少了 hash
@@ -2170,7 +2266,15 @@ const MpSession = struct {
     err_msg: []const u8 = "",
     received: []bool = &.{},
     received_bytes: u64 = 0,
-    last_active: i64 = 0,
+    /// AUDIT-2026-11-27 #1：会话引用计数。创建后 = 1（表持有的基准引用）；
+    /// `mpAcquire` +1，`mpRelease` -1，归零才真正销毁 —— 修复「chunk/complete
+    /// 在 `mp_mu` 解锁后拿着裸指针 touch，而 abort/sweep/init-stale 同一窗口
+    /// 锁外 free」的 UAF（原生前端取消上传 = 3 worker 在飞 + abort 即触发）。
+    /// 创建即为 1：init 失败路径（未入表）直接 `mpFreeSession` 不走计数。
+    refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+    /// 原子化：sweep 只持 mp_mu 读它，而写方（touch）从不在 s.mu/`mp_mu` 内——
+    /// 旧代码「锁外写 vs 锁内读」属数据竞争。毫秒精度足够 TTL 判定。
+    last_active: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     completing: bool = false,
     storage_pct: f64 = 0,
 
@@ -2193,7 +2297,7 @@ const MpSession = struct {
     }
 
     fn touch(self: *MpSession) void {
-        self.last_active = rt.nowMillis();
+        self.last_active.store(rt.nowMillis(), .release);
     }
 
     /// Go `SessionSnapshot.Received`：把 received 位图合并成 [[from,to],…]
@@ -2254,9 +2358,12 @@ fn mpFreeSession(app: *App, s: *MpSession) void {
     if (s.drv_session) |h| {
         // 只在「没走过 mpCommit」时才需要驱动释放；commit 内部已自毁并把
         // 槽位置空。abort/过期路径走这里。
-        const snapshot = app.mountsSnapshot();
-        for (snapshot) |*m| {
-            if (std.mem.eql(u8, m.mount_path, s.mount_path)) {
+        // ⚠ AUDIT-2026-11-27 #1：必须找**创建会话的那一个驱动实例**
+        // （`s.driver_ptr`）—— 旧代码按 mount_path 找到的是「当前」驱动，
+        // 存储被重载后那是另一个实例，把旧句柄喂给新驱动的 mpAbort 属于
+        // 跨实例操作（找不到就放弃 abort，上游孤儿会话由上游自己过期回收）。
+        for (app.mountsSnapshot()) |*m| {
+            if (m.driver.ptr == s.driver_ptr) {
                 var ctx = driver.Ctx{ .alloc = g, .tag = s.mount_path };
                 m.driver.mpAbort(&ctx, h);
                 break;
@@ -2287,6 +2394,42 @@ fn mpSetErr(app: *App, s: *MpSession, msg: []const u8) void {
     s.err_msg = app.alloc.dupe(u8, msg) catch "";
 }
 
+// ---------------------------------------------------------------------------
+// AUDIT-2026-11-27 #1：会话生命周期协议（引用计数）。
+//
+//   * 入表时 refs = 1（表的基准引用）；
+//   * `mpAcquire`：持 mp_mu get 并 +1，返回后调用方拿的是**受保护的**指针，
+//     销毁方随时摘表也不会把脚下的内存抽走；
+//   * `mpRelease`：-1，归零者销毁。**归零制后 release 之后绝不能再碰 s**；
+//   * 销毁路径（abort / sweep / init-stale）在把自己的引用 +1 之后，摘表
+//     并连减两刀（表基准 + 自己那刀）—— 在途 chunk/complete 的引用不归零，
+//     会话就活着，最后一刀才真正 free。
+// ---------------------------------------------------------------------------
+
+fn mpAcquire(app: *App, id: []const u8) ?*MpSession {
+    const io = rt.io();
+    app.mp_mu.lockUncancelable(io);
+    defer app.mp_mu.unlock(io);
+    const s = app.mp_sessions.get(id) orelse return null;
+    _ = s.refs.fetchAdd(1, .acq_rel);
+    return s;
+}
+
+fn mpRelease(app: *App, s: *MpSession) void {
+    if (s.refs.fetchSub(1, .acq_rel) == 1) mpFreeSession(app, s);
+}
+
+/// 会话所属挂载还在不在、驱动实例还是不是创建时的那一个。此前同一段
+/// 「按 mount_path 找 + 比对 driver_ptr」在 free/chunk/complete 抄了三份。
+fn mpMountFor(app: *App, s: *MpSession) ?*Mount {
+    for (app.mountsSnapshot()) |*m| {
+        if (!std.mem.eql(u8, m.mount_path, s.mount_path)) continue;
+        if (m.driver.ptr != s.driver_ptr) return null;
+        return m;
+    }
+    return null;
+}
+
 fn mpSetState(app: *App, s: *MpSession, st: MpState, err_msg: []const u8) void {
     s.state = st;
     if (err_msg.len > 0) mpSetErr(app, s, err_msg);
@@ -2303,7 +2446,14 @@ fn mpSweep(app: *App) void {
         defer app.mp_mu.unlock(io);
         var it = app.mp_sessions.valueIterator();
         while (it.next()) |v| {
-            if (v.*.last_active < deadline) victims.append(v.*) catch {};
+            if (v.*.last_active.load(.acquire) < deadline) {
+                // AUDIT #1：先把手里的引用 +1 再摘出去锁外处理 —— 在途
+                // chunk 持有的引用不归零，会话就不会在别人脚下被销毁。
+                _ = v.*.refs.fetchAdd(1, .acq_rel);
+                victims.append(v.*) catch {
+                    _ = v.*.refs.fetchSub(1, .acq_rel);
+                };
+            }
         }
     }
     for (victims.slice()) |s| {
@@ -2315,20 +2465,35 @@ fn mpSweep(app: *App) void {
         }
         const dead = s.state != .receiving;
         s.mu.unlock(io);
-        if (dead) _ = app.mp_sessions.remove(s.id);
+        const removed = if (dead) app.mp_sessions.remove(s.id) else false;
         app.mp_mu.unlock(io);
         if (dead) {
             if (s.spool_path.len > 0) std.Io.Dir.cwd().deleteFile(rt.io(), s.spool_path) catch {};
-            mpFreeSession(app, s);
+            // 表的基准引用：摘除成功才还（remove 失败 = 并发 abort 已摘）。
+            if (removed) mpRelease(app, s);
         }
+        // sweep 自己那份临时引用。
+        mpRelease(app, s);
     }
 }
 
 fn mpNewId(app: *App) ![]u8 {
     var raw: [16]u8 = undefined;
     const rs = rand.randomString(&raw);
-    app.mp_seq += 1;
-    return std.fmt.allocPrint(app.alloc, "mp-{s}-{d}", .{ rs, app.mp_seq });
+    // AUDIT-2026-11-27 #1：one-thread-per-connection 下并发 init 会同时执行
+    // `+=`（数据竞争 UB），改原子自增。ID 唯一性另有 16 字节随机串兑底。
+    const n = app.mp_seq.fetchAdd(1, .monotonic);
+    return std.fmt.allocPrint(app.alloc, "mp-{s}-{d}", .{ rs, n });
+}
+
+/// AUDIT #1：init 发现同 key 旧会话不可续传（完成/失败/在收尾）时的摘除
+/// 收尾。前提：旧会话已从表里 remove，且调用方已为其 +1 工作引用。这里连减
+/// 两刀（表基准 + 调用方那一刀）—— 在途 chunk/complete 的引用不归零，
+/// 会话就不会被销毁；spool 文件在两刀之前删（旧代码同序）。
+fn mpStaleRetire(app: *App, prev: *MpSession) void {
+    if (prev.spool_path.len > 0) std.Io.Dir.cwd().deleteFile(rt.io(), prev.spool_path) catch {};
+    mpRelease(app, prev); // 表的基准引用
+    mpRelease(app, prev); // 调用方（init）的工作引用
 }
 
 fn mpSessionKey(a: std.mem.Allocator, mount_path: []const u8, rel: []const u8, size: i64, mtime: []const u8) ![]u8 {
@@ -2412,7 +2577,6 @@ fn handleMultipartInit(app: *App, req: *http.Request, res: *http.Response) !void
     {
         const id = try mpNewId(app);
         errdefer app.alloc.free(id);
-        app.mp_seq += 1;
         const s = try app.alloc.create(MpSession);
         errdefer app.alloc.destroy(s);
         s.* = .{
@@ -2486,6 +2650,10 @@ fn handleMultipartInit(app: *App, req: *http.Request, res: *http.Response) !void
     var resumed = false;
     var s: *MpSession = fresh.?;
     var stale: ?*MpSession = null;
+    // AUDIT #1：本 handler 对最终会话（fresh 或续传的 prev）的工作引用，
+    // 函数收尾归还 —— 否则并发 abort 能在快照写出途中就把会话销毁。
+    var held: ?*MpSession = null;
+    defer if (held) |h| mpRelease(app, h);
     app.mp_mu.lockUncancelable(io);
     {
         // 同 key 的旧会话：receiving ⇒ 续传；其余 ⇒ 丢弃重建（Go 对 receiving
@@ -2499,6 +2667,9 @@ fn handleMultipartInit(app: *App, req: *http.Request, res: *http.Response) !void
             }
         }
         if (old) |prev| {
+            // AUDIT #1：先拿引用再做事 —— 之后无论走 resume 还是 stale，
+            // 别的线程都不能把这脚下的内存抽走。
+            _ = prev.refs.fetchAdd(1, .acq_rel);
             prev.mu.lockUncancelable(io);
             const resume_ok = prev.state == .receiving and !prev.completing;
             prev.mu.unlock(io);
@@ -2506,24 +2677,26 @@ fn handleMultipartInit(app: *App, req: *http.Request, res: *http.Response) !void
                 prev.touch();
                 resumed = true;
                 s = prev;
+                held = prev; // defer 收尾时归还
             } else {
-                stale = prev;
+                stale = prev; // 锁外由 mpStaleRetire 连同两份引用一起归还
                 _ = app.mp_sessions.remove(prev.id);
             }
         }
         if (!resumed) {
             app.mp_sessions.put(app.alloc, s.id, s) catch |e| {
                 app.mp_mu.unlock(io);
+                if (stale) |prev| mpStaleRetire(app, prev);
                 mpFreeSession(app, s);
                 return e;
             };
+            // 表的基准引用之外，本函数再加一份工作引用。
+            _ = s.refs.fetchAdd(1, .acq_rel);
+            held = s;
         }
     }
     app.mp_mu.unlock(io);
-    if (stale) |prev| {
-        if (prev.spool_path.len > 0) std.Io.Dir.cwd().deleteFile(io, prev.spool_path) catch {};
-        mpFreeSession(app, prev);
-    }
+    if (stale) |prev| mpStaleRetire(app, prev);
     if (resumed) {
         // 弃掉多余的全新会话。
         if (fresh.?.spool_path.len > 0) std.Io.Dir.cwd().deleteFile(io, fresh.?.spool_path) catch {};
@@ -2549,12 +2722,11 @@ fn handleMultipartChunk(app: *App, req: *http.Request, res: *http.Response) !voi
     const idx_hdr = req.header("X-Chunk-Index") orelse return res.jsonError(400, "invalid X-Chunk-Index header");
     const idx = std.fmt.parseInt(i64, idx_hdr, 10) catch return res.jsonError(400, "invalid X-Chunk-Index header");
 
-    app.mp_mu.lockUncancelable(io);
-    const s = app.mp_sessions.get(id) orelse {
-        app.mp_mu.unlock(io);
+    // AUDIT #1：拿引用而非裸指针 —— abort/sweep/init-stale 的摘除可与此处
+    // 并发，refs 归零前 s 活着。
+    const s = mpAcquire(app, id) orelse
         return res.jsonError(404, "multipart session not found");
-    };
-    app.mp_mu.unlock(io);
+    defer mpRelease(app, s);
     s.touch();
 
     s.mu.lockUncancelable(io);
@@ -2582,20 +2754,12 @@ fn handleMultipartChunk(app: *App, req: *http.Request, res: *http.Response) !voi
     s.mu.unlock(io);
 
     // 挂载可能在会话存活期间被重建（存储编辑）—— 句柄绑定旧驱动实例。
-    var mount: ?*Mount = null;
-    for (app.mountsSnapshot()) |*m| {
-        if (std.mem.eql(u8, m.mount_path, s.mount_path)) {
-            mount = m;
-            break;
-        }
-    }
-    if (mount == null or mount.?.driver.ptr != s.driver_ptr) {
+    const m = mpMountFor(app, s) orelse {
         s.mu.lockUncancelable(io);
         mpSetState(app, s, .failed, "storage was reloaded mid-upload; restart the upload");
         s.mu.unlock(io);
         return res.jsonError(500, "storage was reloaded mid-upload; restart the upload");
-    }
-    const m = mount.?;
+    };
 
     var body = req.body;
     if (body.len() != @as(u64, @intCast(chunk_len))) {
@@ -2696,12 +2860,11 @@ fn handleMultipartComplete(app: *App, req: *http.Request, res: *http.Response) !
     const io = rt.io();
     const id = req.header("X-Upload-Id") orelse return res.jsonError(404, "multipart session not found");
 
-    app.mp_mu.lockUncancelable(io);
-    const s = app.mp_sessions.get(id) orelse {
-        app.mp_mu.unlock(io);
+    // AUDIT #1：拿引用而非裸指针；complete 全程（含 mpCommit 的几秒网络）
+    // 都受 refs 保护。
+    const s = mpAcquire(app, id) orelse
         return res.jsonError(404, "multipart session not found");
-    };
-    app.mp_mu.unlock(io);
+    defer mpRelease(app, s);
     s.touch();
 
     s.mu.lockUncancelable(io);
@@ -2726,20 +2889,12 @@ fn handleMultipartComplete(app: *App, req: *http.Request, res: *http.Response) !
 
     // 挂载可能在会话存活期间被重建（存储编辑）—— 句柄绑定旧驱动实例，
     // 那时只能让用户重传（新建会话会拿到新驱动）。
-    var mount: ?*Mount = null;
-    for (app.mountsSnapshot()) |*m| {
-        if (std.mem.eql(u8, m.mount_path, s.mount_path)) {
-            mount = m;
-            break;
-        }
-    }
-    if (mount == null or mount.?.driver.ptr != s.driver_ptr) {
+    const m = mpMountFor(app, s) orelse {
         s.mu.lockUncancelable(io);
         mpSetState(app, s, .failed, "storage was reloaded mid-upload; restart the upload");
         s.mu.unlock(io);
         return res.jsonError(500, "storage was reloaded mid-upload; restart the upload");
-    }
-    const m = mount.?;
+    };
     var ctx = driver.Ctx{
         .alloc = a,
         .tag = s.mount_path,
@@ -2839,12 +2994,11 @@ fn handleMultipartStatus(app: *App, req: *http.Request, res: *http.Response) !vo
     const a = req.arena;
     const id = req.queryGet("upload_id") orelse "";
     if (id.len == 0) return res.jsonError(400, "status lookup requires upload_id, or path and size");
-    app.mp_mu.lockUncancelable(rt.io());
-    const s = app.mp_sessions.get(id);
-    app.mp_mu.unlock(rt.io());
-    if (s == null) return res.jsonError(404, "multipart session not found");
-    s.?.touch();
-    return mpRespondSnapshot(res, s.?, a);
+    const s = mpAcquire(app, id) orelse
+        return res.jsonError(404, "multipart session not found");
+    defer mpRelease(app, s);
+    s.touch();
+    return mpRespondSnapshot(res, s, a);
 }
 
 fn handleMultipartAbort(app: *App, req: *http.Request, res: *http.Response) !void {
@@ -2855,18 +3009,24 @@ fn handleMultipartAbort(app: *App, req: *http.Request, res: *http.Response) !voi
         app.mp_mu.unlock(io);
         return res.jsonError(404, "multipart session not found");
     };
+    _ = s.refs.fetchAdd(1, .acq_rel); // 本函数的工作引用
     s.mu.lockUncancelable(io);
     if (s.completing) {
         s.mu.unlock(io);
         app.mp_mu.unlock(io);
+        mpRelease(app, s);
         return res.jsonError(409, "multipart session is completing");
     }
     mpSetState(app, s, .aborted, "aborted by client");
     s.mu.unlock(io);
     _ = app.mp_sessions.remove(s.id);
     app.mp_mu.unlock(io);
+    // AUDIT #1：先删 spool（路径还在 s 里，此刻 s 必活），再连减两刀（表基
+    // 准 + 本函数引用）。在途 chunk 持有的引用不归零，会话就活着 —— 修复
+    // 「abort 锁外 free 踩到在途 chunk 的 s.touch()」的 UAF。
     if (s.spool_path.len > 0) std.Io.Dir.cwd().deleteFile(io, s.spool_path) catch {};
-    mpFreeSession(app, s);
+    mpRelease(app, s);
+    mpRelease(app, s);
     try res.jsonOk("null");
 }
 
@@ -3252,11 +3412,11 @@ test "multipart chunk size clamp mirrors Go's ceiling semantics" {
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
 
     const cases = [_]struct { req: ?[]const u8, want: i64 }{
-        .{ .req = null, .want = mpChunkCeiling() },       // 未带 = ceiling
-        .{ .req = "", .want = mpChunkCeiling() },         // 空值 = 未带（Go 同款）
+        .{ .req = null, .want = mpChunkCeiling() }, // 未带 = ceiling
+        .{ .req = "", .want = mpChunkCeiling() }, // 空值 = 未带（Go 同款）
         .{ .req = "33554432", .want = mpChunkCeiling() }, // 大于 ceiling 被夹回
-        .{ .req = "2097152", .want = 2 * 1024 * 1024 },   // 更小的片被采纳
-        .{ .req = "1024", .want = mp_min_chunk },         // 下限 1 MiB
+        .{ .req = "2097152", .want = 2 * 1024 * 1024 }, // 更小的片被采纳
+        .{ .req = "1024", .want = mp_min_chunk }, // 下限 1 MiB
     };
     for (cases, 0..) |c, ci| {
         var hdrs = List(Header).init(a);
@@ -4410,8 +4570,7 @@ fn renderSettingItems(req: *http.Request, res: *http.Response, defaults: bool, o
                 }
             }
             if (!found) {
-                return res.jsonError(400, try std.fmt.allocPrint(
-                    a, "setting not found: {s}", .{k}));
+                return res.jsonError(400, try std.fmt.allocPrint(a, "setting not found: {s}", .{k}));
             }
         }
     }
@@ -4561,7 +4720,6 @@ fn isConfigBackedSetting(key: []const u8) bool {
     for (setting_defs) |def| if (std.mem.eql(u8, key, def.key)) return true;
     return false;
 }
-
 
 // ======================== 配置导入 / 导出（STATUS §36D）========================
 //
@@ -5463,7 +5621,7 @@ fn handleDownload(app: *App, req: *http.Request, res: *http.Response, force_prox
             }
             res.setStatus(206);
             try res.set("Content-Range", try std.fmt.allocPrint(a, "bytes {d}-{d}/{d}", .{ rg.start, rg.end, total }));
-            try res.write(txt[rg.start..rg.end + 1]);
+            try res.write(txt[rg.start .. rg.end + 1]);
         } else {
             res.setStatus(200);
             try res.write(txt);
@@ -5499,10 +5657,12 @@ fn handleDownload(app: *App, req: *http.Request, res: *http.Response, force_prox
     if (range) |rg| {
         try hdrs.append(.{ .name = "Range", .value = try std.fmt.allocPrint(a, "bytes={d}-{d}", .{ rg.start, rg.end }) });
     }
-    var jar = cookiejar.Jar.init(a);
-    var client = client_mod.Client.init(a, .{}, &jar);
-    defer client.deinit();
-    const up = client.send(a, .{
+    // AUDIT-2026-11-27 #4：共享代理池。不再每请求现开 Client —— 那会把
+    // 连接池、TLS 会话、系统 CA 三样按请求清零，还把 `zig.ca_bundle` /
+    // `zig.http_timeout` 整个绕过。响应体由池上挂的 `zig.max_proxy_body_mb`
+    // 闸住：上游忽略 Range 回 200 时从「全量缓冲把设备吃死」变成明确的 507。
+    const pclient = app.proxyClient();
+    const up = pclient.send(a, .{
         .method = "GET",
         .url = lk.url,
         .headers = hdrs.slice(),
@@ -5511,7 +5671,16 @@ fn handleDownload(app: *App, req: *http.Request, res: *http.Response, force_prox
         // 注意：只在这个**代理回源**点开启；天翼/itvsh 那些把 302 当业务
         // 状态的调用点保持原样，所以不能改 `Request` 的默认值。
         .follow_redirects = true,
+        // 共享池不记 cookie —— 需要的 Cookie 已由驱动放进 lk.header；
+        // Go 的 common.Proxy 也是无 Jar 客户端（net/http 默认 Jar 为 nil）。
+        .use_cookies = false,
     }) catch |e| {
+        if (e == error.ResponseTooLarge) {
+            log.warn("api: proxy fetch {s}: body over zig.max_proxy_body_mb", .{lk.url});
+            try res.jsonError(507, "upstream response exceeds zig.max_proxy_body_mb — raise the setting or stream via a Range request");
+            res.status = 507; // jsonError 恒写 200（对齐 Go 信封），这里要真实状态码
+            return;
+        }
         log.warn("api: proxy fetch {s} failed: {s}", .{ lk.url, @errorName(e) });
         return res.jsonError(502, "upstream fetch failed");
     };
@@ -5831,7 +6000,8 @@ pub fn randomSalt(a: std.mem.Allocator) ![]const u8 {
     return out;
 }
 
-fn hmacSha256(a: std.mem.Allocator, key: []const u8, msg: []const u8) ![32]u8 {    var mac: [32]u8 = undefined;
+fn hmacSha256(a: std.mem.Allocator, key: []const u8, msg: []const u8) ![32]u8 {
+    var mac: [32]u8 = undefined;
     std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, msg, key);
     _ = a;
     return mac;
@@ -6582,10 +6752,199 @@ test "routing: a configured CDN redirects assets and keeps the query" {
     try testing.expectEqualStrings("https://c.example.com/4.2.6/dist/assets/index-abc123.js?v=9", found.?);
 }
 
-/// Test helper: mint a JWT with the same shape `issueToken` emits, so an
-/// admin-route test can pass the auth gate. Lives at file scope because Zig does
-/// not allow `fn` declarations inside a `test` block.
-/// 测试用：签一个和 `issueToken` 同格式的标准三段 JWT。
+// ---------------------------------------------------------------------------
+// AUDIT-2026-11-27 #1：multipart 会话引用计数的回归测试。
+// ★ `app.alloc` 一律用 testing.allocator（DebugAllocator）：会话的逐项
+//   free 全程被跟踪，双 free / 野指针 free 立刻炸；请求/挂载仍走 arena。
+// ---------------------------------------------------------------------------
+
+test "AUDIT #1: abort cannot free a session an in-flight holder still uses" {
+    // 修复前形态：chunk/status 在 `mp_mu` 解锁后仍持有会话指针并发 abort
+    // 锁外 `mpFreeSession` 将其销毁 —— use-after-free。引用计数制下 abort
+    // 只摘表，销毁落在最后一个引用的 release 上（本测试结尾那一刀）。
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fe = try frontend_mod.initFromHtml(a, .{}, ROUTING_SHELL);
+    defer fe.deinit();
+
+    var content_tmp = testing.tmpDir(.{});
+    defer content_tmp.cleanup();
+    var spool_tmp = testing.tmpDir(.{});
+    defer spool_tmp.cleanup();
+    const content_root = try std.Io.Dir.realPathFileAlloc(content_tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(content_root);
+    const spool_root = try std.Io.Dir.realPathFileAlloc(spool_tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(spool_root);
+
+    var local_drv = @import("drivers/local.zig").Local{ .alloc = a, .cfg = .{ .root_folder = content_root } };
+    var app = routingApp(testing.allocator, fe);
+    const mounts = try a.alloc(Mount, 1);
+    mounts[0] = .{
+        .storage = .{ .id = 1, .mount_path = "/local", .driver = "Local", .addition = "{}" },
+        .driver = driver.asDriver(@import("drivers/local.zig").Local, &local_drv),
+        .mount_path = "/local",
+        .label = "Local",
+    };
+    app.mounts = mounts;
+    app.mp_dir = spool_root;
+
+    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+
+    const h = try a.alloc(Header, 4);
+    h[0] = .{ .name = "Authorization", .value = auth };
+    h[1] = .{ .name = "File-Path", .value = "%2Flocal%2Fuaf.bin" };
+    h[2] = .{ .name = "X-File-Size", .value = "12" };
+    h[3] = .{ .name = "Content-Type", .value = "text/plain" };
+    const init_res = try doRequestWith(&app, a, "POST", "/api/fs/multipart/init", "", h);
+    try expectApiCode(init_res, 200);
+    const init_j = try json.parse(a, init_res.buf.slice());
+    const upload_id = init_j.getPath("data.upload_id").?.asStr().?;
+
+    // ① 模拟在途 chunk：拿一份引用。
+    const s = (mpAcquire(&app, upload_id)) orelse return error.TestUnexpectedResult;
+
+    // ② 并发 abort：摘表 + 置 aborted，**不得**销毁 s。
+    const ah = try a.alloc(Header, 2);
+    ah[0] = .{ .name = "Authorization", .value = auth };
+    ah[1] = .{ .name = "X-Upload-Id", .value = upload_id };
+    const abort_res = try doRequestWith(&app, a, "POST", "/api/fs/multipart/abort", "", ah);
+    try expectApiCode(abort_res, 200);
+    try testing.expectEqual(@as(u32, 0), app.mp_sessions.count());
+
+    // ③ abort 返回后 s 必须仍然可用（旧代码这里是已释放内存）。
+    try testing.expectEqualStrings(upload_id, s.id);
+    try testing.expectEqual(MpState.aborted, s.state);
+    try testing.expectEqualStrings("aborted by client", s.err_msg);
+    // 只剩我们这一份引用（表基准已被 abort 归还）。
+    try testing.expectEqual(@as(u32, 1), s.refs.load(.acquire));
+
+    // ④ 最后一刀：归零销毁。DebugAllocator 会盯住每一次 free。
+    mpRelease(&app, s);
+    try testing.expectEqual(@as(u32, 0), app.mp_sessions.count());
+    // 会话全销毁之后把表的桶数组也还回去（put 时分配、remove 不缩）。
+    app.mp_sessions.deinit(app.alloc);
+}
+
+test "AUDIT #1: acquire/abort/release race stress keeps the session alive" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fe = try frontend_mod.initFromHtml(a, .{}, ROUTING_SHELL);
+    defer fe.deinit();
+
+    var content_tmp = testing.tmpDir(.{});
+    defer content_tmp.cleanup();
+    var spool_tmp = testing.tmpDir(.{});
+    defer spool_tmp.cleanup();
+    const content_root = try std.Io.Dir.realPathFileAlloc(content_tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(content_root);
+    const spool_root = try std.Io.Dir.realPathFileAlloc(spool_tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(spool_root);
+
+    var local_drv = @import("drivers/local.zig").Local{ .alloc = a, .cfg = .{ .root_folder = content_root } };
+    var app = routingApp(testing.allocator, fe);
+    const mounts = try a.alloc(Mount, 1);
+    mounts[0] = .{
+        .storage = .{ .id = 1, .mount_path = "/local", .driver = "Local", .addition = "{}" },
+        .driver = driver.asDriver(@import("drivers/local.zig").Local, &local_drv),
+        .mount_path = "/local",
+        .label = "Local",
+    };
+    app.mounts = mounts;
+    app.mp_dir = spool_root;
+
+    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
+
+    const h = try a.alloc(Header, 4);
+    h[0] = .{ .name = "Authorization", .value = auth };
+    h[1] = .{ .name = "File-Path", .value = "%2Flocal%2Frace.bin" };
+    h[2] = .{ .name = "X-File-Size", .value = "12" };
+    h[3] = .{ .name = "Content-Type", .value = "text/plain" };
+    const init_res = try doRequestWith(&app, a, "POST", "/api/fs/multipart/init", "", h);
+    try expectApiCode(init_res, 200);
+    const init_j = try json.parse(a, init_res.buf.slice());
+    const upload_id = init_j.getPath("data.upload_id").?.asStr().?;
+
+    // 4 个 worker 反复 acquire/touch/release，与主线程的 abort 赛跑。
+    // 修复前：abort 的锁外 free 与 worker 的 touch 并发 ≈ UAF（旧实现此
+    // 形态真机可复现）；修复后：refs 不归零会话就活着。
+    const Worker = struct {
+        fn run(ap: *App, id: []const u8, rounds: usize) void {
+            var i: usize = 0;
+            while (i < rounds) : (i += 1) {
+                if (mpAcquire(ap, id)) |s| {
+                    s.touch();
+                    mpRelease(ap, s);
+                }
+            }
+        }
+    };
+    var ths: [4]std.Thread = undefined;
+    for (&ths) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &app, upload_id, 200 });
+
+    const hold = (mpAcquire(&app, upload_id)) orelse {
+        for (&ths) |t| t.join();
+        return error.TestUnexpectedResult;
+    };
+    const ah = try a.alloc(Header, 2);
+    ah[0] = .{ .name = "Authorization", .value = auth };
+    ah[1] = .{ .name = "X-Upload-Id", .value = upload_id };
+    const abort_res = try doRequestWith(&app, a, "POST", "/api/fs/multipart/abort", "", ah);
+    try expectApiCode(abort_res, 200);
+
+    for (&ths) |t| t.join();
+    // 会话内容在整场赛跑后仍完好（销毁从未发生）。
+    try testing.expectEqualStrings(upload_id, hold.id);
+    mpRelease(&app, hold);
+    try testing.expectEqual(@as(u32, 0), app.mp_sessions.count());
+    app.mp_sessions.deinit(app.alloc);
+}
+
+test "AUDIT #4: proxy pool consumes zig.max_proxy_body_mb / http_timeout / ca_bundle" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const path = try std.fs.path.join(testing.allocator, &.{ dir, "config.json" });
+    defer testing.allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(rt.io(), .{ .sub_path = path, .data =
+        \\{"jwt_secret":"k","zig":{"max_proxy_body_mb":2,"http_timeout":7,"ca_bundle":"/x.pem"},"storages":[]}
+    });
+
+    // ⚠ 必须在 load **之前**取 prev：`config.load` 自己会把单例指到新 cfg
+    //（见 config.test "unknown keys survive a save" 的同款注释），先 load 后取
+    // prev 拿到的是新 cfg 自己，恢复时就把全局指向了下面 deinit 掉的配置，
+    // 之后的任何 config.get() 都读悬空指针（下一轮全套件在此真实 segfault）。
+    const prev_cfg = config.getOpt();
+    const cfg = try config.load(testing.allocator, path);
+    defer cfg.deinit();
+    config.setForTest(cfg);
+    defer config.setForTest(prev_cfg);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fe = try frontend_mod.initFromHtml(a, .{}, ROUTING_SHELL);
+    defer fe.deinit();
+    var app = routingApp(testing.allocator, fe);
+    try app.initProxyPool(cfg);
+    defer app.deinitProxyPool();
+
+    // cap 换算与透传：池上的每一个 Client 都带上三个配置。
+    try testing.expectEqual(@as(u64, 2 * 1024 * 1024), app.proxy_cap_bytes);
+    const c1 = app.proxyClient();
+    try testing.expectEqual(@as(usize, 2 * 1024 * 1024), c1.opts.max_response_bytes);
+    try testing.expectEqual(@as(u32, 7), c1.opts.timeout_s);
+    try testing.expectEqualStrings("/x.pem", c1.opts.ca_bundle_path);
+
+    // 轮询分发：连续两取不是同一个实例。
+    const c2 = app.proxyClient();
+    try testing.expect(c1 != c2);
+}
+
 fn mintTestToken(a: std.mem.Allocator, secret: []const u8, user: []const u8, pwd_ts: i64) ![]u8 {
     const exp: i64 = 4102444800; // 2100-01-01, comfortably in the future
     const h64 = try b64Url(a, "{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
@@ -7045,19 +7404,18 @@ test "public settings carries the keys the frontend actually reads" {
     const data = parsed.getPath("data").?.object;
 
     const required = [_][]const u8{
-        "version",              "site_title",             "announcement",
-        "pagination_type",      "logo",                   "favicon",
-        "main_color",           "home_icon",              "share_icon",
-        "home_container",       "settings_layout",        "show_disk_usage_in_plain_text",
-        "audio_cover",          "audio_autoplay",         "video_autoplay",
-        "preview_download_by_default", "preview_archives_by_default",
-        "share_preview_download_by_default", "share_preview_archives_by_default",
-        "readme_autorender",    "filter_readme_scripts",  "hide_files",
-        "package_download",     "share_preview",          "share_archive_preview",
-        "share_summary_content", "search_index",          "sso_login_enabled",
-        "sso_login_platform",   "sso_compatibility_mode", "sso_postmessage_origin",
-        "ldap_login_enabled",
-        "ldap_login_tips",      "multipart_enabled",
+        "version",                           "site_title",                  "announcement",
+        "pagination_type",                   "logo",                        "favicon",
+        "main_color",                        "home_icon",                   "share_icon",
+        "home_container",                    "settings_layout",             "show_disk_usage_in_plain_text",
+        "audio_cover",                       "audio_autoplay",              "video_autoplay",
+        "preview_download_by_default",       "preview_archives_by_default", "share_preview_download_by_default",
+        "share_preview_archives_by_default", "readme_autorender",           "filter_readme_scripts",
+        "hide_files",                        "package_download",            "share_preview",
+        "share_archive_preview",             "share_summary_content",       "search_index",
+        "sso_login_enabled",                 "sso_login_platform",          "sso_compatibility_mode",
+        "sso_postmessage_origin",            "ldap_login_enabled",          "ldap_login_tips",
+        "multipart_enabled",
     };
     for (required) |k| {
         const v = data.get(k) orelse return error.MissingPublicSettingKey;
@@ -7123,7 +7481,7 @@ test "fs list carries the envelope fields the frontend reads" {
     const parsed = try json.parse(a, res.buf.slice());
     const data = parsed.getPath("data").?.object;
     for ([_][]const u8{
-        "content", "total", "readme", "header",
+        "content", "total",                "readme",   "header",
         "write",   "write_content_bypass", "provider",
     }) |k| {
         if (data.get(k) == null) return error.MissingFsListField;
@@ -8096,7 +8454,7 @@ test "fs/get raw_url: 本站 URL 是绝对的（GetApiUrl）" {
         .method = "GET",
         .path = "/api/fs/get",
         .target = "/api/fs/get",
-        .headers = try a.dupe(Header, &.{ .{ .name = "Host", .value = "192.168.1.1:15244" } }),
+        .headers = try a.dupe(Header, &.{.{ .name = "Host", .value = "192.168.1.1:15244" }}),
         .query = "",
     };
     try testing.expectEqualStrings("http://192.168.1.1:15244/olz", try apiUrlFor(&app, a, &req4));
@@ -8259,9 +8617,9 @@ test "storage admin CRUD round trip persists to cfg.json and remounts live" {
         const add_doc = try json.parse(a, data.strAt("addition").?);
         try testing.expectEqualStrings(data_dir, add_doc.strAt("root_folder_path").?);
         for ([_][]const u8{
-            "id", "mount_path", "order", "driver", "status", "addition",
-            "remark", "modified", "order_by", "order_direction",
-            "extract_folder", "web_proxy", "webdav_policy", "disabled",
+            "id",            "mount_path", "order",    "driver",          "status",         "addition",
+            "remark",        "modified",   "order_by", "order_direction", "extract_folder", "web_proxy",
+            "webdav_policy", "disabled",
         }) |k| {
             if (data.getPath(k) == null) return error.MissingStorageField;
         }
@@ -8668,7 +9026,7 @@ test "buildMountsFromConfig skips broken records but keeps them visible to the a
 /// 实测返回 500 而不是 200（这个坑值得记一笔：**临时目录的生命周期必须长过
 /// 会写它的配置对象**）。cleanup 只删目录，cfg 的内存归调用方 alloc 管。
 fn testConfig(alloc: std.mem.Allocator) !struct { prev: ?*config.Config, cfg: *config.Config, tmp: testing.TmpDir } {
-    const tmp = testing.tmpDir(.{});  // 可变性由调用方 tc.tmp 提供（cleanup 取 &tc.tmp）
+    const tmp = testing.tmpDir(.{}); // 可变性由调用方 tc.tmp 提供（cleanup 取 &tc.tmp）
     const root = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", alloc);
     const cfg_path = try std.fmt.allocPrint(alloc, "{s}/config.json", .{root});
     const prev = config.getOpt();
@@ -8720,7 +9078,7 @@ test "me/update changes the password and invalidates old tokens" {
     defer arena.deinit();
     const a = arena.allocator();
     var tc = try testConfig(a);
-    defer tc.tmp.cleanup();  // 最先执行（LIFO）；cfg 的内存另由 deinit 释放
+    defer tc.tmp.cleanup(); // 最先执行（LIFO）；cfg 的内存另由 deinit 释放
     defer config.setForTest(tc.prev);
     defer tc.cfg.deinit();
     const fe = try frontend_mod.initFromHtml(a, .{}, "");
@@ -8736,8 +9094,7 @@ test "me/update changes the password and invalidates old tokens" {
 
     // 改密码（对齐 Go UpdateCurrent：Password != "" 才改）
     {
-        const res = try doRequestJson(&app, a, "POST", "/api/me/update",
-            "{\"username\":\"admin\",\"password\":\"newpass123\"}", hdrs);
+        const res = try doRequestJson(&app, a, "POST", "/api/me/update", "{\"username\":\"admin\",\"password\":\"newpass123\"}", hdrs);
         try testing.expectEqual(@as(u16, 200), res.status);
         _ = try json.parse(a, res.buf.slice());
     }
@@ -8756,8 +9113,7 @@ test "me/update changes the password and invalidates old tokens" {
 
     // 改用户名：登录名随之变（新名字能签出有效令牌，旧名字不能）
     {
-        const res = try doRequestJson(&app, a, "POST", "/api/me/update",
-            "{\"username\":\"root\",\"password\":\"\"}", hdrs2);
+        const res = try doRequestJson(&app, a, "POST", "/api/me/update", "{\"username\":\"root\",\"password\":\"\"}", hdrs2);
         try testing.expectEqual(@as(u16, 200), res.status);
     }
     try testing.expectEqualStrings("root", app.admin_user);
@@ -8773,7 +9129,7 @@ test "me/update rejects bad input" {
     defer arena.deinit();
     const a = arena.allocator();
     var tc = try testConfig(a);
-    defer tc.tmp.cleanup();  // 最先执行（LIFO）；cfg 的内存另由 deinit 释放
+    defer tc.tmp.cleanup(); // 最先执行（LIFO）；cfg 的内存另由 deinit 释放
     defer config.setForTest(tc.prev);
     defer tc.cfg.deinit();
     const fe = try frontend_mod.initFromHtml(a, .{}, "");
@@ -8782,21 +9138,18 @@ test "me/update rejects bad input" {
 
     // 密码太短：沿用 InitSetup 的 4 位下限，避免"能建不能改"的不一致。
     {
-        const res = try doRequestJson(&app, a, "POST", "/api/me/update",
-            "{\"username\":\"admin\",\"password\":\"ab\"}", hdrs);
+        const res = try doRequestJson(&app, a, "POST", "/api/me/update", "{\"username\":\"admin\",\"password\":\"ab\"}", hdrs);
         try expectApiCode(res, 400);
     }
     // 空用户名：单管理员下不接受（Go 无条件赋值，但那会造出无法登录的账号）
     {
-        const res = try doRequestJson(&app, a, "POST", "/api/me/update",
-            "{\"username\":\"\",\"password\":\"\"}", hdrs);
+        const res = try doRequestJson(&app, a, "POST", "/api/me/update", "{\"username\":\"\",\"password\":\"\"}", hdrs);
         try expectApiCode(res, 400);
     }
     // 未认证
     {
-        const none = try a.alloc(Header, 0);  // []Header，零长度
-        const res = try doRequestJson(&app, a, "POST", "/api/me/update",
-            "{\"username\":\"admin\",\"password\":\"x\"}", none);
+        const none = try a.alloc(Header, 0); // []Header，零长度
+        const res = try doRequestJson(&app, a, "POST", "/api/me/update", "{\"username\":\"admin\",\"password\":\"x\"}", none);
         try expectApiCode(res, 401);
     }
     // 上面这些失败都不该改动状态
@@ -8808,7 +9161,7 @@ test "auth/logout returns success like Go's LogOut" {
     defer arena.deinit();
     const a = arena.allocator();
     var tc = try testConfig(a);
-    defer tc.tmp.cleanup();  // 最先执行（LIFO）；cfg 的内存另由 deinit 释放
+    defer tc.tmp.cleanup(); // 最先执行（LIFO）；cfg 的内存另由 deinit 释放
     defer config.setForTest(tc.prev);
     defer tc.cfg.deinit();
     const fe = try frontend_mod.initFromHtml(a, .{}, "");
@@ -8820,7 +9173,7 @@ test "auth/logout returns success like Go's LogOut" {
     _ = try json.parse(a, res.buf.slice());
 
     // 未认证应被拒（路由在 handleAuthed 之下）
-    const none = try a.alloc(Header, 0);  // []Header，零长度
+    const none = try a.alloc(Header, 0); // []Header，零长度
     const res2 = try doRequestWith(&app, a, "GET", "/api/auth/logout", "", none);
     try expectApiCode(res2, 401);
 }
