@@ -36,7 +36,6 @@ const driver = @import("driver.zig");
 const http = @import("http.zig");
 const urlmod = @import("util/url.zig");
 const cookiejar = @import("cookiejar.zig");
-const client_mod = @import("client.zig");
 const log = @import("log.zig");
 const rt = @import("rt.zig");
 const Buf = @import("util/buf.zig").Buf;
@@ -412,7 +411,7 @@ fn getOrHead(app: *App, req: *http.Request, res: *http.Response, is_head: bool) 
                     };
                     api.streamRange(res, a, file, rg.start, rg.end) catch return webdavStatus(res, 500);
                 } else if (lk.text) |txt| {
-                    try res.write(txt[rg.start..rg.end + 1]);
+                    try res.write(txt[rg.start .. rg.end + 1]);
                 }
                 return;
             },
@@ -431,9 +430,9 @@ fn getOrHead(app: *App, req: *http.Request, res: *http.Response, is_head: bool) 
     }
 
     // ---- 远程：透明代理（Go `common.Proxy` 的 `maps.Copy` + C-D 分支）----
-    var jar = cookiejar.Jar.init(a);
-    var client = client_mod.Client.init(a, .{}, &jar);
-    defer client.deinit();
+    // AUDIT-2026-11-27 #4：共享代理池（api.App），不再每请求现开 Client；
+    // 响应体由 `zig.max_proxy_body_mb` 闸住（超出 → 507 而不是 OOM）。
+    const pclient = app.proxyClient();
     // W01：把客户端的 Range **原样**透传给上游。
     //
     // ⚠ 这里刻意**不**做本端的 Range 解析/切片/416 合成：Go 的透明代理分支
@@ -450,7 +449,7 @@ fn getOrHead(app: *App, req: *http.Request, res: *http.Response, is_head: bool) 
         try hdrs.append(.{ .name = "Range", .value = rh });
     }
 
-    const up = client.send(a, .{
+    const up = pclient.send(a, .{
         // Go `net.RequestHttp(ctx, r.Method, ...)`：方法照抄（HEAD 就是 HEAD），
         // 拿到响应后 `if r.Method == HEAD { return nil }` 不发正文。
         .method = req.method,
@@ -458,7 +457,13 @@ fn getOrHead(app: *App, req: *http.Request, res: *http.Response, is_head: bool) 
         .headers = hdrs.slice(),
         // N02：回源跟随 3xx，CDN 用 302 转边缘节点，不跟随就变 502。
         .follow_redirects = true,
+        // 共享池不记 cookie：Cookie 已由驱动放进 lk.header（Go 同款无 Jar）。
+        .use_cookies = false,
     }) catch |e| {
+        if (e == error.ResponseTooLarge) {
+            log.warn("webdav: proxy {s}: body over zig.max_proxy_body_mb", .{lk.url});
+            return webdavStatus(res, 507);
+        }
         log.warn("webdav: proxy {s}: {s}", .{ lk.url, @errorName(e) });
         return webdavStatus(res, 500);
     };
@@ -699,13 +704,24 @@ fn copy(app: *App, req: *http.Request, res: *http.Response) !void {
         try res.write("Not Implemented");
         return;
     }
+    // AUDIT-2026-11-27 #5：COPY 是「整份下载进内存再上传」，单文件大小超
+    // `zig.max_proxy_body_mb` 直接 507（RFC 4918 Insufficient Storage）——
+    // 别把 2 GiB 的视频拷进 512 MB 的光猫。比 fetchBytes 更早判，本地
+    // local_path 与远程链接一视同仁（两者都是整份进内存）。
+    if (app.proxy_cap_bytes > 0 and f.size > 0 and @as(u64, @intCast(f.size)) > app.proxy_cap_bytes) {
+        log.warn("webdav: copy {s}: {d} bytes over zig.max_proxy_body_mb", .{ cm.src, f.size });
+        res.setStatus(507);
+        try res.set("Content-Type", "text/plain; charset=utf-8");
+        try res.write("Insufficient Storage: file exceeds zig.max_proxy_body_mb; copy in smaller pieces or raise the setting");
+        return;
+    }
     const lk = sr.mount.driver.link(&sctx, sr.rel, .{
         .redirect = false,
         .headers = req.headers,
     }) catch {
         return webdavStatus(res, 500);
     };
-    const data = fetchBytes(a, lk) catch |e| {
+    const data = fetchBytes(app, a, lk) catch |e| {
         log.warn("webdav: copy fetch {s}: {s}", .{ cm.src, @errorName(e) });
         return webdavStatus(res, 500);
     };
@@ -723,8 +739,8 @@ fn copy(app: *App, req: *http.Request, res: *http.Response) !void {
 
 /// Read a link's bytes into memory. Used by COPY (and would be by a future
 /// ranged GET). Local files are read straight off disk; remote links are
-/// fetched through the shared client.
-fn fetchBytes(a: std.mem.Allocator, lk: model.Link) ![]u8 {
+/// fetched through the shared proxy pool (AUDIT #4).
+fn fetchBytes(app: *App, a: std.mem.Allocator, lk: model.Link) ![]u8 {
     if (lk.local_path) |lp| {
         const file = std.Io.Dir.cwd().openFile(rt.io(), lp, .{}) catch return error.CannotOpen;
         defer file.close(rt.io());
@@ -737,10 +753,8 @@ fn fetchBytes(a: std.mem.Allocator, lk: model.Link) ![]u8 {
         }
         return buf;
     }
-    var jar = cookiejar.Jar.init(a);
-    var client = client_mod.Client.init(a, .{}, &jar);
-    defer client.deinit();
-    const up = try client.send(a, .{ .method = "GET", .url = lk.url, .headers = lk.header });
+    const pclient = app.proxyClient();
+    const up = try pclient.send(a, .{ .method = "GET", .url = lk.url, .headers = lk.header, .use_cookies = false });
     if (up.status != 200) return error.UpstreamError;
     return try a.dupe(u8, up.body);
 }
@@ -779,11 +793,18 @@ fn vpathOf(rp: []const u8) []const u8 {
 
 fn davHref(alloc: std.mem.Allocator, vpath: []const u8, is_dir: bool) ![]u8 {
     const enc = try urlmod.encode(alloc, vpath, .path);
+    // AUDIT-2026-11-27 #2：`.path` 编码集按 RFC 3986 保留 `&` 与 `'`
+    // （url.zig 的 needsEscape），但 `&` 对 XML 是保留字 —— 文件名含 `&`
+    // 时（"Tom & Jerry.mp4"）href 会产出非良构 XML，严格解析器（部分
+    // Java/Python WebDAV 客户端）直接把整个 PROPFIND 判为解析失败。
+    // `displayname` 一直走 xmlEscape，href 此前漏了。编码已把 `<`/`>`/`"`
+    // 转成 %XX，这里统一再过一遍 xmlEscape 兜底（也防将来编码集变动）。
+    var b = Buf.init(alloc);
+    try b.append("/dav");
+    try xmlEscape(&b, enc);
     // 与 Go 一致：集合补尾斜杠，根（"/"）不补。
-    if (is_dir and !eql(u8, vpath, "/")) {
-        return std.fmt.allocPrint(alloc, "/dav{s}/", .{enc});
-    }
-    return std.fmt.allocPrint(alloc, "/dav{s}", .{enc});
+    if (is_dir and !eql(u8, vpath, "/")) try b.appendByte('/');
+    return b.toOwned();
 }
 
 fn destVpath(a: std.mem.Allocator, dest: []const u8) !?[]u8 {
@@ -907,6 +928,56 @@ test "xmlEscape covers the five predefined entities" {
     var b = Buf.init(arena.allocator());
     try xmlEscape(&b, "<a&b'c\"d>");
     try testing.expectEqualStrings("&lt;a&amp;b&apos;c&quot;d&gt;", b.slice());
+}
+
+test "AUDIT 2026-11-27 #2: href escapes '&' so PROPFIND stays well-formed XML" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `.path` 编码集按 RFC 3986 保留 `&`，但 href 是 XML 元素内容 —— 必须是
+    // &amp;。修复前文件名含 & 的条目让整个目录列表在严格解析器下直接报错。
+    const f = try davHref(a, "/local/Tom & Jerry.mp4", false);
+    try testing.expectEqualStrings("/dav/local/Tom%20&amp;%20Jerry.mp4", f);
+    const d = try davHref(a, "/local/a & b", true);
+    try testing.expectEqualStrings("/dav/local/a%20&amp;%20b/", d);
+
+    // 整条 response 渲染出来再喂给真解析器：非良构 XML 在这一步就会炸。
+    var out = Buf.init(a);
+    try out.append("<D:multistatus xmlns:D=\"DAV:\">");
+    try writeObjEntry(a, &out, "/local/Tom & Jerry.mp4", .{ .name = "Tom & Jerry.mp4", .size = 1 });
+    try out.append("</D:multistatus>");
+    _ = try @import("util/xml.zig").parse(a, out.slice());
+}
+
+test "AUDIT 2026-11-27 #5: COPY over zig.max_proxy_body_mb is 507 before any fetch" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    defer api.authThrottleReset();
+
+    var app = try mkApp(a);
+    // Stub 的 details 对文件恒报 size=10；闸值压到 5 ⇒ 进 fetchBytes 之前就
+    // 507（修复前会把 2 GiB 级文件整份读进内存 —— fetchBytes 无上限 alloc）。
+    app.proxy_cap_bytes = 5;
+
+    var hs = [_]model.Header{
+        .{ .name = "Authorization", .value = "Basic YWRtaW46cGFzcw==" },
+        .{ .name = "Destination", .value = "/dav/v/b.txt" },
+    };
+    var req = http.Request{ .arena = a, .method = "COPY", .path = "/dav/v/a.txt", .target = "/dav/v/a.txt", .headers = &hs };
+    var res = http.Response.init(a);
+    try handle(&app, &req, &res);
+    try testing.expectEqual(@as(u16, 507), res.status);
+    try testing.expect(std.mem.indexOf(u8, res.buf.slice(), "zig.max_proxy_body_mb") != null);
+
+    // 闸值 0（不限）时不在此截断：会走到 link/fetch —— Stub 的 local_path
+    // 指向不存在的 /tmp/x，结果 500；这里只断言「不是 507」，保持跨平台。
+    app.proxy_cap_bytes = 0;
+    var req2 = http.Request{ .arena = a, .method = "COPY", .path = "/dav/v/a.txt", .target = "/dav/v/a.txt", .headers = &hs };
+    var res2 = http.Response.init(a);
+    try handle(&app, &req2, &res2);
+    try testing.expect(res2.status != 507);
 }
 
 test "webdav: PROPFIND requires auth and lists a mounted directory" {
