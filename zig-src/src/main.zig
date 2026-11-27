@@ -303,6 +303,16 @@ pub fn main(init: std.process.Init) !void {
     // init 还在飞的时候释放它脚下的内存。驱动的每个上游请求都有超时兜底
     // （N01），正常几秒内就会置位。
     waitForMountsReady();
+
+    // AUDIT-2026-11-27 #6：drain 超时后仍有连接在飞时，宁可跳过全部 defer
+    // 清理也不能让「连接线程读已释放的 Server/App」变成 UAF。下面的
+    // defer（server.deinit / app.deinit，以及 main 栈帧弹出）与在飞线程对
+    // `self.opts`、handler ctx 的最后一个访问之间没有任何同步 —— 与
+    // waitForMountsReady 的 exit(0) 同款取舍：跳过清理交 OS 回收。
+    if (server.inFlight() > 0) {
+        log.warn("http: {d} connection(s) still active at exit; skipping deferred cleanup", .{server.inFlight()});
+        std.process.exit(0);
+    }
 }
 
 fn handleRequest(ctx: *anyopaque, req: *http.Request, res: *http.Response) anyerror!void {
@@ -467,7 +477,7 @@ fn onFatalSignal(sig: std.posix.SIG, info: *const std.posix.siginfo_t, _: ?*anyo
     var buf: [192]u8 = undefined;
     const addr: usize = @intFromPtr(info.fields.sigfault.addr);
     const msg = std.fmt.bufPrint(&buf, "[FATAL] signal {d} ({s}) si_code={d} fault_addr=0x{x} pid={d} — restoring default disposition, process will now die\n", .{
-        @intFromEnum(sig),
+        @backingInt(sig),
         @tagName(sig),
         info.code,
         addr,

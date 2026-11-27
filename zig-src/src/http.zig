@@ -51,6 +51,19 @@ pub const Options = struct {
     spool_dir: []const u8 = "data/temp",
     /// Idle/read timeout in seconds. 0 disables (not recommended).
     read_timeout_s: u32 = 300,
+    /// AUDIT-2026-11-27 #3：请求头阶段的**总限时**（秒；从首个字节起，0 =
+    /// 关闭）。单次 socket 超时防不住 slowloris（每 <read_timeout 秒滴一个
+    /// 字节，每次 read 都按时返回），必须按整头计墙钟。首字节之后同时把
+    /// socket 超时钳到 min(head_timeout, read_timeout)，行内 stall 也有界。
+    /// 锚点=首字节而非进入读循环，空闲 keep-alive 连接不受影响。默认 30s，
+    /// 对齐 SFTP 的 pre-auth 预算（channel.zig）。
+    head_timeout_s: u32 = 30,
+    /// AUDIT-2026-11-27 #3：请求体阶段两读之间的空闲上限（秒；0 = 关闭）。
+    /// 通过把 socket 超时钳到该值实现（仅 POSIX；Windows 构建的超时本来就
+    /// 整体 no-op）。默认 60s，任何真实上传都不会间隔这么久。
+    /// 已知残留：每 <60s 滴 1 字节的 body 滴灌仍能存活，代价受
+    /// max_connections 闸门约束 —— 见 AUDIT 报告 #3。
+    body_idle_timeout_s: u32 = 60,
     /// Max requests to serve on one connection before closing it.
     max_keepalive: u32 = 100,
     /// T5：收到关停信号、accept 循环退出后，等待**在飞连接**结束的最长秒数。
@@ -475,6 +488,7 @@ pub fn statusText(code: u16) []const u8 {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         409 => "Conflict",
         412 => "Precondition Failed",
         416 => "Requested Range Not Satisfiable",
@@ -484,6 +498,7 @@ pub fn statusText(code: u16) []const u8 {
         501 => "Not Implemented",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
+        507 => "Insufficient Storage",
         else => "",
     };
 }
@@ -543,6 +558,13 @@ pub const Server = struct {
     /// T5：在飞连接计数。accept 成功即 +1，连接线程结束时 -1。
     /// 关停时 accept 循环退出后由 `drain()` 等它归零（有上限）。
     in_flight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    /// AUDIT-2026-11-27 #6：drain 超时后 main 据此决定是否跳过 defer 清理
+    /// （剩余连接线程仍在读 Server/App 的字段，正常 return 会把它们脚下
+    /// 的内存拆掉；详见 main.zig 的 exit 分支注释）。
+    pub fn inFlight(self: *Server) u32 {
+        return self.in_flight.load(.acquire);
+    }
 
     pub fn init(allocator: std.mem.Allocator, opts: Options, handler: Handler, ctx: *anyopaque) !Server {
         const addr = try resolveBindAddress(opts.address, opts.port);
@@ -697,8 +719,14 @@ pub const Server = struct {
             const a = arena.allocator();
 
             var req = Request{ .arena = a, .peer_ip = peer_ip };
-            const parsed = self.readRequest(rd, a, &req) catch |e| switch (e) {
+            const parsed = self.readRequest(stream, rd, a, &req) catch |e| switch (e) {
                 error.ConnectionClosed => return,
+                // AUDIT-2026-11-27 #3：slowloris 截断（RFC 7231 §6.5.：客户端
+                // 在服务器预备等待的时间内没有产出完整请求）。
+                error.HeadTimeout => {
+                    writeSimpleError(stream, 408, "Request Timeout") catch {};
+                    return;
+                },
                 error.HeaderTooLarge => {
                     try writeSimpleError(stream, 431, "Request Header Fields Too Large");
                     return;
@@ -716,6 +744,10 @@ pub const Server = struct {
             };
             if (!parsed) return; // clean EOF before a request line
             defer req.body.deinit();
+
+            // AUDIT-2026-11-27 #3：头/体阶段把 socket 超时钳短了，响应阶段
+            // 恢复全局 read_timeout（下载写满缓冲时的 SEND 阻塞也靠它兜底）。
+            applyTimeouts(stream, self.opts.read_timeout_s);
 
             var res = Response.init(a);
             var close_after = false;
@@ -762,11 +794,23 @@ pub const Server = struct {
         }
     }
 
-    fn readRequest(self: *Server, rd: *std.Io.Reader, a: std.mem.Allocator, req: *Request) !bool {
+    fn readRequest(self: *Server, stream: std.Io.net.Stream, rd: *std.Io.Reader, a: std.mem.Allocator, req: *Request) !bool {
         var line = Buf.init(a);
 
+        // AUDIT-2026-11-27 #3：整头总限时（首字节起计）。锚点不在进入本函数
+        // 之时，否则空闲 keep-alive 连接会被误杀 —— 锚定动作在 readLine 里
+        // 「拿到过字节」之后才发生。
+        var hb = HeadBudget{
+            .timeout_ms = @as(i64, self.opts.head_timeout_s) * 1000,
+            .stream = stream,
+            .clamp_s = if (self.opts.head_timeout_s > 0)
+                @min(self.opts.head_timeout_s, self.opts.read_timeout_s)
+            else
+                0,
+        };
+
         // --- request line ---
-        if (!try readLine(rd, &line, MAX_HEADER_BYTES)) return false;
+        if (!try readLine(rd, &line, MAX_HEADER_BYTES, &hb)) return false;
         if (line.len == 0) return false;
         var it = std.mem.splitScalar(u8, line.slice(), ' ');
         req.method = try a.dupe(u8, it.next() orelse return error.BadRequest);
@@ -796,7 +840,7 @@ pub const Server = struct {
         var total: usize = line.len;
         while (true) {
             line.clearRetainingCapacity();
-            if (!try readLine(rd, &line, MAX_HEADER_BYTES)) return error.ConnectionClosed;
+            if (!try readLine(rd, &line, MAX_HEADER_BYTES, &hb)) return error.ConnectionClosed;
             if (line.len == 0) break;
             total += line.len;
             if (total > MAX_HEADER_BYTES) return error.HeaderTooLarge;
@@ -837,7 +881,7 @@ pub const Server = struct {
 
         if (te.len > 0) {
             if (!teEndsWithChunked(te)) return error.BadRequest;
-            try self.readChunkedBody(rd, a, req);
+            try self.readChunkedBody(stream, rd, a, req);
         } else if (cl_hdr) |cl| {
             // 重复的 Content-Length 且取值不一致，同样是定界歧义。
             const all = try req.headersAll(a, "Content-Length");
@@ -849,7 +893,7 @@ pub const Server = struct {
             }
             const n = std.fmt.parseInt(u64, std.mem.trim(u8, cl, " \t"), 10) catch return error.BadRequest;
             if (n > self.opts.max_body) return error.BodyTooLarge;
-            try self.readSizedBody(rd, a, req, n);
+            try self.readSizedBody(stream, rd, a, req, n);
         }
         return true;
     }
@@ -865,10 +909,15 @@ pub const Server = struct {
         return std.ascii.eqlIgnoreCase(last, "chunked");
     }
 
-    fn readSizedBody(self: *Server, rd: *std.Io.Reader, a: std.mem.Allocator, req: *Request, n: u64) !void {
+    fn readSizedBody(self: *Server, stream: std.Io.net.Stream, rd: *std.Io.Reader, a: std.mem.Allocator, req: *Request, n: u64) !void {
         if (n == 0) {
             req.body = .none;
             return;
+        }
+        // AUDIT-2026-11-27 #3：body 阶段钳短 socket 超时（两读之间的空闲上
+        // 限）；readRequest 返回后 serveConn 恢复全局值。
+        if (self.opts.body_idle_timeout_s > 0) {
+            applyTimeouts(stream, @min(self.opts.body_idle_timeout_s, self.opts.read_timeout_s));
         }
         if (n <= self.opts.max_body_memory) {
             const mem = try a.alloc(u8, @intCast(n));
@@ -896,9 +945,13 @@ pub const Server = struct {
         req.body = .{ .file = spool };
     }
 
-    fn readChunkedBody(self: *Server, rd: *std.Io.Reader, a: std.mem.Allocator, req: *Request) !void {
+    fn readChunkedBody(self: *Server, stream: std.Io.net.Stream, rd: *std.Io.Reader, a: std.mem.Allocator, req: *Request) !void {
         // Chunked uploads always spool: we cannot know the size up front, and
         // the drivers need random access anyway.
+        // AUDIT-2026-11-27 #3：body 阶段同 readSizedBody 的钳短。
+        if (self.opts.body_idle_timeout_s > 0) {
+            applyTimeouts(stream, @min(self.opts.body_idle_timeout_s, self.opts.read_timeout_s));
+        }
         var spool = try self.openSpool(a);
         // H03：失败时只 close 不 delete，会在 spool 目录里留下垃圾文件；
         // 设备闪存很小，上传失败几次就堆满了。
@@ -911,7 +964,7 @@ pub const Server = struct {
         var total: u64 = 0;
         while (true) {
             line.clearRetainingCapacity();
-            if (!try readLine(rd, &line, 4096)) return error.ConnectionClosed;
+            if (!try readLine(rd, &line, 4096, null)) return error.ConnectionClosed;
             const s = line.slice();
             const semi = std.mem.indexOfScalar(u8, s, ';') orelse s.len;
             const size = std.fmt.parseInt(u64, std.mem.trim(u8, s[0..semi], " \t"), 16) catch return error.BadRequest;
@@ -919,7 +972,7 @@ pub const Server = struct {
                 // trailer section: read until blank line
                 while (true) {
                     line.clearRetainingCapacity();
-                    if (!try readLine(rd, &line, MAX_HEADER_BYTES)) return error.ConnectionClosed;
+                    if (!try readLine(rd, &line, MAX_HEADER_BYTES, null)) return error.ConnectionClosed;
                     if (line.len == 0) break;
                 }
                 break;
@@ -940,7 +993,7 @@ pub const Server = struct {
             // CRLF after each chunk —— H02：原来只读一行却不校验内容，块后面
             // 跟垃圾字节也会被接受，后续解析随之错位。块后必须是空行。
             line.clearRetainingCapacity();
-            if (!try readLine(rd, &line, 8)) return error.ConnectionClosed;
+            if (!try readLine(rd, &line, 8, null)) return error.ConnectionClosed;
             if (line.len != 0) return error.BadRequest;
         }
         spool.size = total;
@@ -1225,7 +1278,12 @@ fn writeBodyTooLarge(stream: std.Io.net.Stream, max_body: u64) !void {
 /// Returns false on a clean EOF at a line boundary. Lines longer than `max`
 /// fail with `error.HeaderTooLarge` rather than being silently truncated, which
 /// is what keeps a hostile client from making us allocate without bound.
-fn readLine(rd: *std.Io.Reader, out: *Buf, max: usize) !bool {
+///
+/// `hb`（可选）是请求头阶段的墙钟预算（AUDIT-2026-11-27 #3）：在缓冲区里
+/// 已经见过字节之后锚定/检查。挂在 refill 循环里而不是 readLine 调用方，
+/// 因为慢速攻击者是**在一行内**滴滴答答 —— 只有进入 peek 循环才能逐次
+/// 查墙钟。
+fn readLine(rd: *std.Io.Reader, out: *Buf, max: usize, hb: ?*HeadBudget) !bool {
     while (true) {
         const avail = rd.buffered();
         if (std.mem.indexOfScalar(u8, avail, '\n')) |nl| {
@@ -1240,6 +1298,10 @@ fn readLine(rd: *std.Io.Reader, out: *Buf, max: usize) !bool {
         try out.append(avail);
         rd.toss(avail.len);
         if (out.len > max) return error.HeaderTooLarge;
+        // 这里有字节在路上 → 锚定/检查头部预算。⚠ 锚定只认「缓冲区里真
+        // 有字节」：空运转（空闲 keep-alive 等首字节）不锚定，否则 30s 预算
+        // 会把空闲连接误杀。
+        if (hb) |h| try h.arm(avail.len > 0);
         _ = rd.peek(1) catch |e| switch (e) {
             error.EndOfStream => {
                 if (out.len == 0) return false;
@@ -1249,6 +1311,30 @@ fn readLine(rd: *std.Io.Reader, out: *Buf, max: usize) !bool {
         };
     }
 }
+
+/// AUDIT-2026-11-27 #3：请求头阶段的墙钟预算（见 readLine 的注释）。timeout
+/// 为 0 时整个机制关闭；clamp_s 首字节后钳到 socket 超时（0 = 不钳）。
+const HeadBudget = struct {
+    timeout_ms: i64,
+    stream: std.Io.net.Stream,
+    clamp_s: u32,
+    started: bool = false,
+    deadline: i64 = 0,
+
+    /// `got_bytes` = 本次 refill 时缓冲区里真有新字节。首字节才锚定；
+    /// 锚定之后每次 refill 都查墙钟。
+    fn arm(self: *HeadBudget, got_bytes: bool) error{HeadTimeout}!void {
+        if (self.timeout_ms <= 0) return;
+        if (!self.started) {
+            if (!got_bytes) return; // 空转不算首字节
+            self.started = true;
+            self.deadline = rt.nowMillis() + self.timeout_ms;
+            if (self.clamp_s > 0) applyTimeouts(self.stream, self.clamp_s);
+            return;
+        }
+        if (rt.nowMillis() > self.deadline) return error.HeadTimeout;
+    }
+};
 
 /// Read up to `out.len` bytes. Returns 0 at end of stream.
 fn readUpTo(rd: *std.Io.Reader, out: []u8) !usize {
@@ -1449,6 +1535,68 @@ test "T5: run() returns after shutdown once connections drain" {
 
 fn runWorker(server: *Server) void {
     server.run() catch {};
+}
+
+test "AUDIT #3: a dribbling partial header is cut at head_timeout_s" {
+    // 复现形态：slowloris —— 半行头 + 每 100ms 滴一个字节，整头永远不完整。
+    // 旧实现只有 socket 级单次超时（read_timeout），每次 read 都按时返回，
+    // 线程可被无限占用。新实现按「首字节起的整头墙钟」截断（408 + 关连接）。
+    // 墙钟检查在 readLine 的 refill 循环里逐次执行。
+    //
+    // 与上面两个 T5 测试同款限制：绑监听 socket + accept 线程在 Windows 的
+    // 测试后端（std.testing.io）下行为不可靠（accept 无法被 shutdown 唤醒、
+    // 网络操作出现 0xc000013b 一类假错），本机 Windows 跳过；Linux 原生跑
+    // （build_remote.py 的 zig build test 即覆盖）。
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var server = Server{
+        .allocator = testing.allocator,
+        .listener = try t5Bind(45714),
+        .handler = t5Handler,
+        .opts = .{ .head_timeout_s = 1, .read_timeout_s = 2, .drain_timeout_s = 1 },
+        .ctx = undefined,
+    };
+    defer server.deinit();
+    const t = try std.Thread.spawn(.{}, runWorker, .{&server});
+    defer t.join();
+    defer server.shutdown();
+
+    const io = rt.io();
+    var cli = (try std.Io.net.IpAddress.parse("127.0.0.1", 45714)).connect(io, .{ .mode = .stream }) catch |e| {
+        std.debug.print("head-timeout skip: connect failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+    var cli_open = true;
+    defer if (cli_open) cli.close(io);
+    var wbuf: [256]u8 = undefined;
+    var sw = cli.writer(io, &wbuf);
+    try sw.interface.writeAll("GET / HTTP/1.1\r\nHost: x\r\nX-Slow: ");
+    try sw.interface.flush();
+
+    // 40 × 100ms = 4s 滴灌，预算 1s —— 服务器必须在中途断开。
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        sw.interface.writeAll("a") catch break; // 服务器先断开 → 后续写失败，循环终止
+        sw.interface.flush() catch break;
+        rt.sleepMillis(100);
+    }
+
+    // 连接线程收尾（408 路径会写完响应再 return）。有界等待，不裸赌。
+    var waited_ms: i64 = 0;
+    while (server.in_flight.load(.acquire) != 0 and waited_ms < 5000) : (waited_ms += 50) {
+        rt.sleepMillis(50);
+    }
+    try testing.expectEqual(@as(u32, 0), server.in_flight.load(.acquire));
+
+    // 服务器已收尾：此时读要么拿到 408，要么拿到 EOF —— 不能再挂。
+    var rbuf_s: [128]u8 = undefined;
+    var srd = cli.reader(io, &rbuf_s);
+    var read_buf: [256]u8 = undefined;
+    const n = srd.interface.readSliceShort(&read_buf) catch 0;
+    const got_408 = n > 0 and std.mem.startsWith(u8, read_buf[0..n], "HTTP/1.1 408");
+    const closed = n == 0;
+    try testing.expect(got_408 or closed);
+    cli.close(io);
+    cli_open = false;
 }
 
 test "413 body is a JSON envelope carrying the limit in MiB" {
