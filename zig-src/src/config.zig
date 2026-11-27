@@ -22,6 +22,13 @@ const rt = @import("rt.zig");
 pub const Config = struct {
     /// Owns every string in this struct and the whole parsed document.
     arena: std.heap.ArenaAllocator,
+    /// AUDIT-2026-11-27 #11：`syncStorages` 重建的 storages JSON 子树专用
+    /// arena。旧实现每次 save 都在主 arena 里重建整棵子树，旧子树永久滞留
+    /// —— itvsh 每刷一次 token/cookie 就 save 一次，长跑内存单调上涨
+    /// （M04 只把序列化文本挪进了 scratch，树重建没跟上）。子树只有
+    /// `root["storages"]` 一个挂点且无人跨 save 持有其指针（消费方读的是
+    /// `self.storages` 的记录本体，在主 arena），换装后旧子树可整块回收。
+    storages_a: std.heap.ArenaAllocator,
     root: json.Value,
     path: []const u8,
 
@@ -174,6 +181,7 @@ pub const Config = struct {
     /// Frees everything `load` allocated, including the `Config` itself.
     pub fn deinit(self: *Config) void {
         const child = self.arena.child_allocator;
+        self.storages_a.deinit();
         self.arena.deinit();
         child.destroy(self);
     }
@@ -314,14 +322,6 @@ pub const Config = struct {
             (std.fmt.allocPrint(a, "{s}: {s}", .{ name, d }) catch "");
     }
 
-    /// Set a top-level config key (used by the settings PUT for `site_url`,
-    /// `cdn`, `token_expires_in`, ...). Values must already live in the config
-    /// arena — see the callers in `api.zig`, which dupe into `cfg.allocator()`.
-    pub fn setTopLevel(self: *Config, key: []const u8, val: json.Value) !void {
-        const a = self.arena.allocator();
-        try setTopLevelRaw(a, &self.root, key, val);
-    }
-
     /// Serialize the document back to disk atomically (tmp + rename), so a
     /// power cut mid-write cannot leave a truncated config on the device.
     ///
@@ -373,7 +373,15 @@ pub const Config = struct {
         storages_mutex.lockUncancelable(io);
         defer storages_mutex.unlock(io);
 
-        const a = self.arena.allocator();
+        // AUDIT-2026-11-27 #11：新子树整体建进**独立 fresh arena**（挂在主
+        // arena 同一父分配器下）。构建阶段 root["storages"] 仍指向旧内存，
+        // 任何一步失败对现有文档零影响（errdefer 回收 fresh）；换装成功后
+        // 把 self.storages_a 换成 fresh 并 deinit 旧的 —— 旧子树整块回收，
+        // 不再永久滞留主 arena。首次 sync 的旧子树是 load 的解析产物（在主
+        // arena 里）只能一次性滞留，后续每次 save 都是零残留。
+        var fresh = std.heap.ArenaAllocator.init(self.storages_a.child_allocator);
+        errdefer fresh.deinit();
+        const a = fresh.allocator();
         var vals = List(json.Value).init(a);
         for (self.storages) |s| {
             const keys = try a.dupe([]const u8, &.{
@@ -400,7 +408,30 @@ pub const Config = struct {
             try vals.append(.{ .object = .{ .keys = keys, .vals = fields } });
         }
         const arr = json.Value{ .array = try a.dupe(json.Value, vals.slice()) };
-        try setTopLevelRaw(a, &self.root, "storages", arr);
+
+        // 顶层键已存在（稳态：load 解析过或上次 sync 过）⇒ setTopLevelRaw 只做
+        // `vals[i] = arr` 指针替换，零分配，fresh 不承载 root 生命周期数据。
+        // 键不存在（罕见：手编配置删掉了 storages）⇒ root 的 keys/vals 数组
+        // 增长必须落**主 arena**（它们是 root 的生命周期，不能寄居在被回收
+        // 的子 arena），子树本身照用 fresh。
+        var has_key = false;
+        if (self.root.asObject()) |obj| {
+            for (obj.keys) |k| {
+                if (std.mem.eql(u8, k, "storages")) {
+                    has_key = true;
+                    break;
+                }
+            }
+        }
+        if (has_key) {
+            try setTopLevelRaw(a, &self.root, "storages", arr);
+        } else {
+            try setTopLevelRaw(self.arena.allocator(), &self.root, "storages", arr);
+        }
+
+        const old = self.storages_a;
+        self.storages_a = fresh;
+        old.deinit();
     }
 };
 
@@ -568,6 +599,8 @@ pub fn load(alloc: std.mem.Allocator, path: []const u8) !*Config {
     errdefer alloc.destroy(cfg);
     cfg.arena = std.heap.ArenaAllocator.init(alloc);
     errdefer cfg.arena.deinit();
+    cfg.storages_a = std.heap.ArenaAllocator.init(alloc);
+    errdefer cfg.storages_a.deinit();
     const a = cfg.arena.allocator();
     cfg.path = try a.dupe(u8, path);
 
@@ -1194,6 +1227,53 @@ test "storages parse with addition as a string" {
     try testing.expectEqualStrings("/nas", cfg.storages[0].mount_path);
     // addition stays a string, exactly as the Go build stores it
     try testing.expectEqualStrings("{\"mobile\":\"13800000000\"}", cfg.storages[0].addition);
+}
+
+test "AUDIT #11: repeated saves do not grow the config arena" {
+    // 回归：旧 syncStorages 每次 save 在主 arena 重建整棵 storages 子树、
+    // 旧子树永不回收 —— itvsh 这类「每刷一次 token/cookie 就 save 一次」的
+    // 驱动让长跑内存单调上涨（M04 只修了序列化文本，树重建没跟上）。
+    // 修复后子树走专用子 arena（换装整块回收），稳态 save 主 arena 零增长。
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.Io.Dir.realPathFileAlloc(tmp.dir, rt.io(), ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const path = try std.fs.path.join(testing.allocator, &.{ dir, "config.json" });
+    defer testing.allocator.free(path);
+
+    try std.Io.Dir.cwd().writeFile(rt.io(), .{ .sub_path = path, .data =
+        \\{"jwt_secret":"x","storages":[
+        \\ {"id":1,"mount_path":"/nas","order":0,"driver":"Itvsh",
+        \\  "addition":"{\"mobile\":\"13800000000\"}","status":"work"}]}
+    });
+
+    const cfg = try load(testing.allocator, path);
+    defer cfg.deinit();
+    setForTest(cfg);
+    defer setForTest(null);
+    try testing.expectEqual(@as(usize, 1), cfg.storages.len);
+
+    // 首轮 save：load 解析出的旧子树一次性滞留主 arena（无法回收），此后
+    // 子树全部走专用子 arena。
+    try cfg.save();
+    const cap1 = cfg.arena.queryCapacity();
+
+    // 稳态：再来 5 轮 save（模拟驱动 persist 高频回写），主 arena 容量
+    // 必须逐字节不涨。
+    var i: usize = 0;
+    while (i < 5) : (i += 1) try cfg.save();
+    try testing.expectEqual(cap1, cfg.arena.queryCapacity());
+
+    // 盘上内容稳定：storages 仍在、字段完整（round-trip）。
+    const back = try std.Io.Dir.cwd().readFileAlloc(rt.io(), path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(back);
+    var pdoc_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer pdoc_arena.deinit();
+    const doc = try json.parse(pdoc_arena.allocator(), back);
+    const items = doc.getPath("storages").?.asArray().?;
+    try testing.expectEqual(@as(usize, 1), items.len);
+    try testing.expectEqualStrings("/nas", items[0].strAt("mount_path").?);
+    try testing.expectEqualStrings("Itvsh", items[0].strAt("driver").?);
 }
 
 test "storages parse web_proxy, defaulting to false" {
