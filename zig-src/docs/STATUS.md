@@ -6167,4 +6167,44 @@ P1 六卡提交后推送 `f223f0d6`，连续完成打包机复跑与对账：
 > 8fac3896 +11,464 B（+0.79%）。旧件可从 db9300bf 树经 build_remote.py
 > 复现，回滚流程见 openlist_start.sh 头部 ②。
 
+---
+
+## 60.46 P2 批次开工（AUDIT 路线图 #15-#17）：M1 multipart.zig 落地
+
+机主拍板「先部署再动 P2」后执行；本批范围 **#15 全程 + #16**，#17（client
+流式出口）按审计单独排期不启动。
+
+### M1（#15 第一步）：multipart 域整体搬出（提交 0030675c）
+
+* 新建 `src/multipart.zig`（**1,518 行**）：状态机（MpState/MpChunk/MpSession
+  + mp* 生命周期与锁协议）、五个 handler（init/chunk/complete/status/abort）、
+  FakeMpDriver 协议测试与 AUDIT #1 引用计数回归测试，全部自 api.zig **三块
+  纯搬运逐行未动**（2269-3168 / 3170-3589 / 6903-7052）；
+* api.zig **9,898 → 8,427 行**：仅留 App 的会话表字段（mp_mu/mp_seq/
+  mp_sessions，类型改指 `multipart.MpSession`）、路由分发行
+  （`multipart.handleMultipart`）与代理池常量回迁（`proxy_pool_size`/
+  `ProxySlot` 与 App 同体）；api↔multipart 双向 import 与既有 api↔webdav
+  同形；被引用的 12 个 api.zig 本地声明补 `pub`（Header/mimeFor 原已 pub，
+  `ArchiveFileSource.source` 补 pub）——纯可见性变化；
+* **零行为验证（最强形态）**：569 pass + 5 skip（574 总）与搬出前**逐字
+  一致**（总数不变 = 测试从新文件被发现且无重复执行）；aarch64 产物
+  **1,455,088 B / SHA256 `62878FDD` 与生产在跑二进制逐字节相同** —— 纯
+  搬运后机器码一位未变，pub 化不进 codegen；**生产无需再部署**（当前树
+  即产物）。
+
+### 后续里程碑（已定坐标待执行）
+
+* **M2 sign/auth.zig + 解 api↔webdav 环**：webdav 反向引用面实测比审计
+  摘要宽——`authThrottle*`/`twoHashPwd`/`generateDownProxyURL` 属 M2；
+  `mimeFor`/`contentDisposition`/`etagFor`/`ParsedRange`/`preconditionGate`/
+  `streamRange`/`isWebdavPolicy` 属 M6 download.zig——**完整解环在 M6 闭环**，
+  M2 先收 auth+sign 面（api.zig 现址：signKey 740 / LoginThrottle 1436 /
+  InvalidatedTokens 2548 / staticHash·twoHashPwd 4802 / mintTestToken 5633）；
+* M3 storage_admin → M4 mounts → M5 router（顺带收敛路由四表手工同步，
+  历史 /me/update 404 前科）→ M6 download（707 行 RFC 7232）；
+* #16 drivers/common 收敛：persist×7 机械迁移（thunder 样板已在
+  §60.44 #10）+ dupeOr×10 / ObjWriter×7 / SigV4×2 / 并发框架×3 对拍。
+* 本批 DoD 不变：每步测试集零变化 + 574/574 + 交叉编译 + 一步一卡；
+  纯搬运步骤追加「产物逐字节不变」验证（M1 已达成）。
+
 > AI生成

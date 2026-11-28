@@ -259,7 +259,8 @@ response; a streaming response reader remains a known follow-up"（** README
 > P0+P1 全量产物 **62878FDD 已于 2026-11-28 完成隔离实例回归并切入生产**
 > （§60.45）。#14 打包机对账已于 2026-11-28 闭环（§60.44 对账小节）：
 > 复现逐字节相同 ⇒ 环境漂移排除，+88 B 定性为真实代码增量 + std 口径差。
-> **#15-#17（P2）未动。**
+> **P2 已开工（2026-11-28）：#15-M1 multipart.zig 已落地（§60.46，产物与
+> 生产逐字节不变）；#15 M2-M6 与 #16 推进中；#17 单独排期未动。**
 > 测试侧两处踩坑（config 单例 prev 必须在 load 前取、mp_sessions 桶数组
 > 测试需显式 deinit）也已记入 §60.43。
 
@@ -279,7 +280,7 @@ response; a streaming response reader remains a known follow-up"（** README
 | 12 | TLS 握手超时 | P1 | 1 天 | ✅ 验证后记档（§60.44 #12，未改码） | std 0.17 无干净挂载点：`ConnectTcpOptions.timeout` 声明后从未被消费、握手期无超时注入 API；结论与残余风险记入 client.zig applySocketTimeout 注释，待 std 提供入口后接入 |
 | 13 | thunder 分片重试 | P1 | 0.5 天 | ✅ 已落地（§60.44 #13） | 单传 PUT / CreateMultipartUpload / 分片 PUT / Complete 四操作全部 3 次退避（1s·2ⁿ，对齐 Go 侧 aws sdk 默认 retryer）；网络错误与非 2xx 皆重试，确定性失败不重试 |
 | 14 | 打包机产物对账（88 B 漂移） | P1 | 0.5 天 | ✅ 已落地（2026-11-28，§60.44 对账小节） | build_remote.py 复跑：Linux 原生 574/574（0 跳过）；权威产物 1,455,088 B / `62878FDD`，本机 §5 配方复现逐字节相同；环境漂移排除，+88 B = 真实代码增量 + std 口径差，结论已回写 STATUS 基线行 |
-| 15 | api.zig 拆分 | P2 | 3-5 天 | 未动 | 序：multipart.zig（可随已修的 #1 整体搬走）→ sign/auth（解环）→ storage_admin → mounts → router → download |
+| 15 | api.zig 拆分 | P2 | 3-5 天 | 🔧 进行中（M1 已落地，§60.46） | multipart.zig 已搬出（1,518 行纯搬运，产物与生产逐字节不变）；序：multipart.zig ✅ → sign/auth（解环）→ storage_admin → mounts → router → download |
 | 16 | drivers/common 机械重复收敛 | P2 | 2-3 天 | 未动 | ~600 行（dupeOr/ObjWriter/SigV4/并发框架/persist 模式） |
 | 17 | client 流式出口 | P2 | 3-5 天 | 未动 | 价值最高、工作量最大，单独排期；#4 的 256MiB 闸已把该路径从 OOM 收口为明确 507 |
 
