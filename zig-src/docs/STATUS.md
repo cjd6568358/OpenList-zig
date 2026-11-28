@@ -6169,7 +6169,7 @@ P1 六卡提交后推送 `f223f0d6`，连续完成打包机复跑与对账：
 
 ---
 
-## 60.46 P2 批次（AUDIT 路线图 #15-#17）：M1 multipart + M2 auth + M3 storage_admin + M4 mounts 落地
+## 60.46 P2 批次（AUDIT 路线图 #15-#17）：M1 multipart + M2 auth + M3 storage_admin + M4 mounts + M5 router 落地
 
 机主拍板「先部署再动 P2」后执行；本批范围 **#15 全程 + #16**，#17（client
 流式出口）按审计单独排期不启动。
@@ -6226,8 +6226,9 @@ P1 六卡提交后推送 `f223f0d6`，连续完成打包机复跑与对账：
   `streamRange`/`isWebdavPolicy` 仍属 M6 download.zig——**完整解环在 M6 闭环**；
 * M3 storage_admin ~~待执行~~ **已完成**（提交 240730a8，见上节）；
 * M4 mounts ~~待执行~~ **已完成**（提交 a6bd08de，见上节）；
-* M5 router（顺带收敛路由四表手工同步，历史 /me/update 404 前科）→
-  M6 download（707 行 RFC 7232，**完整解环在此闭环**：
+* M5 router ~~待执行~~ **已完成**（提交 06eb760d，见上节；M5b 路由四表
+  收敛为语义级重构单独排期）；
+* M6 download（707 行 RFC 7232，**完整解环在此闭环**：
   mimeFor/contentDisposition/etagFor/ParsedRange/preconditionGate/
   streamRange/isWebdavPolicy 随迁）；
 * #16 drivers/common 收敛：persist×7 机械迁移（thunder 样板已在
