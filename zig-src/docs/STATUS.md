@@ -6237,4 +6237,19 @@ P1 六卡提交后推送 `f223f0d6`，连续完成打包机复跑与对账：
 * 本批 DoD 不变：每步测试集零变化 + 574/574 + 交叉编译 + 一步一卡；
   纯搬运步骤追加「产物逐字节不变」验证（M1、M2 均已达成）。
 
+### 文档同步（六步拆分后的全局陈述，2026-11-28）
+
+代码结构落地后同步四处现行陈述（历史章节中的 api.zig 行号引用是对账
+证据，按纪律不回写）：
+
+* `README.md` 目录树：api.zig 描述改为「端点 handler + App/挂载表 +
+  公共业务辅助（#15 六步拆分后仅此留守）」，补 router/auth/
+  storage_admin/mounts/multipart/download 六行；
+* `api.zig` 模块头：补「模块结构」段（六模块职责图 + 传递闭包测试
+  收集 + 解环闭环声明），endpoint 清单原样保留（API 面未变）；
+* `tests.zig` App 段：补注释说明六模块经 api.zig import 链可达、
+  测试由传递闭包自动收集（574 总在六步前后逐字不变即为证明）；
+* `driver.zig` 模块头：`handleMultipart` 的指向自 api.zig 改为
+  multipart.zig（#15-M1 搬迁随记）。
+
 > AI生成

@@ -14,8 +14,9 @@
 //! (`null` = the upstream driver's `Copy` is `NotSupport`), `space` is
 //! optional too (null = no quota), and the `mp_*` chunked-direct-upload
 //! quartet is optional as a whole (2026-10-30; implemented by 189pc —
-//! other drivers fall back to the generic spool path, see api.zig
-//! `handleMultipart` / STATUS §57). Still absent: `putURL`, `getArchive`,
+//! other drivers fall back to the generic spool path, see multipart.zig
+//! `handleMultipart` / STATUS §57 — 2026-11-28 拆分前在 api.zig，现随 #15-M1
+//! 搬至 multipart.zig). Still absent: `putURL`, `getArchive`,
 //! `extractArchive`, `mkdir`-with-recursion, and every optional capability
 //! interface (`ObjThumb`, `ObjUpload`, `ObjReader`, `ArchiveReader`, `Other`,
 //! `DirectUploader`, ...). Each of those is a documented, budgeted extension

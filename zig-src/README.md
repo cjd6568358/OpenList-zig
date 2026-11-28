@@ -62,7 +62,14 @@ src/
   client.zig         上游 HTTP 客户端（std.http 的唯一接触面）
   frontend.zig       前端服务：CDN / dist_dir / 内置占位页三选一
   cookiejar.zig      cookie jar（Go http.Cookie 兼容持久化）
-  api.zig            /api/* 路由、挂载解析、JWT 鉴权、静态资源与 SPA 兜底
+  api.zig            /api/* 端点 handler（fs/me/login/setting/driver/config）
+                     + App/挂载表 + 各域共用的业务辅助（#15 六步拆分后仅此留守）
+  router.zig         HTTP 路由分发（handle/handleAuthed 双层表 + noRoute + CORS）
+  auth.zig           认证与签名原语（登录限速/凭据哈希/JWT/下载签名/作废令牌表）
+  storage_admin.zig  /api/admin/storage/* 存储管理面（CRUD + load_all 后台重建）
+  mounts.zig         挂载构建（fixAndCleanPath/dupeStorage/buildMount*/republish）
+  multipart.zig      分片上传（init/chunk/complete/status/abort + 会话状态机）
+  download.zig       /d/ /p/ 下载（handleDownload + RFC 7232 + Range + MIME 表）
   webdav.zig         WebDAV **服务端**（/dav：PROPFIND/MKCOL/GET/PUT/COPY/MOVE…）
   archive.zig        本地 ZIP/TAR 只读浏览（读中央目录，不整包进内存）
   util/

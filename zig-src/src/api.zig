@@ -1,6 +1,15 @@
 //! HTTP API surface, shaped to match OpenList's `/api/*` so the existing web
 //! frontend works against this binary unchanged.
 //!
+//! **模块结构（AUDIT 2026-11-27 #15 六步拆分，2026-11-28 落地，STATUS §60.46）**：
+//! 本文件承载各端点的 handler（fs/me/login/setting/driver/config/task）与
+//! App/挂载表、公共业务辅助（parseBodyJson/writeObj/mapDriverError/
+//! public_setting_defaults 等）；路由分发在 `router.zig`，认证/签名原语在
+//! `auth.zig`，存储管理面在 `storage_admin.zig`，挂载构建在 `mounts.zig`，
+//! 分片上传在 `multipart.zig`，下载（/d/ /p/ + RFC 7232 + MIME）在
+//! `download.zig`——六模块均经本文件的 import 链可达（tests.zig 的传递
+//! 闭包自动收集其测试）。API 不再 import webdav.zig（解环闭环）。
+//!
 //! Implemented (the subset the frontend actually calls for browsing,
 //! downloading and uploading):
 //!   GET  /ping                         liveness

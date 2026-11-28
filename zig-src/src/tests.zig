@@ -61,6 +61,10 @@ test {
     _ = @import("drivers/thunder.zig");
 
     // App
+    // 2026-11-28（AUDIT #15 六步拆分，STATUS §60.46）：router/auth/
+    // storage_admin/mounts/multipart/download 六模块经 api.zig 的 import
+    // 链可达，其测试由这里的传递闭包自动收集——574 总在六步纯搬运前后
+    // 逐字不变即为证明，故无需在此逐一列出。
     _ = @import("api.zig");
     _ = @import("webdav.zig");
     _ = @import("main.zig");
