@@ -170,24 +170,24 @@ pub const Addition = struct {
         const o = v orelse return a;
         if (o.asObject() == null) return a;
 
-        a.login_type = try dupeOr(alloc, o.strAt("login_type"), "password");
-        a.username = try dupeOr(alloc, o.strAt("username"), "");
-        a.password = try dupeOr(alloc, o.strAt("password"), "");
-        a.validate_code = try dupeOr(alloc, o.strAt("validate_code"), "");
-        a.sms_code = try dupeOr(alloc, o.strAt("sms_code"), "");
-        a.access_token = try dupeOr(alloc, o.strAt("access_token"), "");
-        a.refresh_token = try dupeOr(alloc, o.strAt("refresh_token"), "");
-        a.device_id = try dupeOr(alloc, o.strAt("device_id"), "");
-        a.client_sn = try dupeOr(alloc, o.strAt("client_sn"), "");
-        a.jg_open_id = try dupeOr(alloc, o.strAt("jg_open_id"), "");
-        a.user_finger = try dupeOr(alloc, o.strAt("user_finger"), "");
-        a.root_folder_id = try dupeOr(alloc, o.strAt("root_folder_id"), default_personal_root);
-        a.order_by = try dupeOr(alloc, o.strAt("order_by"), "filename");
-        a.order_direction = try dupeOr(alloc, o.strAt("order_direction"), "asc");
-        a.type = try dupeOr(alloc, o.strAt("type"), "personal");
-        a.family_id = try dupeOr(alloc, o.strAt("family_id"), "");
-        a.upload_method = try dupeOr(alloc, o.strAt("upload_method"), "stream");
-        a.upload_thread = try dupeOr(alloc, o.strAt("upload_thread"), "3");
+        a.login_type = try driver.dupeOr(alloc, o.strAt("login_type"), "password");
+        a.username = try driver.dupeOr(alloc, o.strAt("username"), "");
+        a.password = try driver.dupeOr(alloc, o.strAt("password"), "");
+        a.validate_code = try driver.dupeOr(alloc, o.strAt("validate_code"), "");
+        a.sms_code = try driver.dupeOr(alloc, o.strAt("sms_code"), "");
+        a.access_token = try driver.dupeOr(alloc, o.strAt("access_token"), "");
+        a.refresh_token = try driver.dupeOr(alloc, o.strAt("refresh_token"), "");
+        a.device_id = try driver.dupeOr(alloc, o.strAt("device_id"), "");
+        a.client_sn = try driver.dupeOr(alloc, o.strAt("client_sn"), "");
+        a.jg_open_id = try driver.dupeOr(alloc, o.strAt("jg_open_id"), "");
+        a.user_finger = try driver.dupeOr(alloc, o.strAt("user_finger"), "");
+        a.root_folder_id = try driver.dupeOr(alloc, o.strAt("root_folder_id"), default_personal_root);
+        a.order_by = try driver.dupeOr(alloc, o.strAt("order_by"), "filename");
+        a.order_direction = try driver.dupeOr(alloc, o.strAt("order_direction"), "asc");
+        a.type = try driver.dupeOr(alloc, o.strAt("type"), "personal");
+        a.family_id = try driver.dupeOr(alloc, o.strAt("family_id"), "");
+        a.upload_method = try driver.dupeOr(alloc, o.strAt("upload_method"), "stream");
+        a.upload_thread = try driver.dupeOr(alloc, o.strAt("upload_thread"), "3");
         if (boolAt(o, "family_transfer")) |b| a.family_transfer = b;
         if (boolAt(o, "rapid_upload")) |b| a.rapid_upload = b;
         if (boolAt(o, "no_use_ocr")) |b| a.no_use_ocr = b;
@@ -236,11 +236,6 @@ pub const Addition = struct {
         return n;
     }
 };
-
-fn dupeOr(alloc: std.mem.Allocator, v: ?[]const u8, fallback: []const u8) ![]const u8 {
-    return alloc.dupe(u8, v orelse fallback);
-}
-
 fn boolAt(v: *const json.Value, path: []const u8) ?bool {
     const p = v.getPath(path) orelse return null;
     return p.asBool();

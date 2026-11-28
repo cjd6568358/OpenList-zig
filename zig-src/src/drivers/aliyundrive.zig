@@ -274,26 +274,26 @@ pub const Addition = struct {
         const o = v orelse return a;
         if (o.asObject() == null) return a;
 
-        a.drive_type = try dupeOr(alloc, o.strAt("drive_type"), "");
-        a.root_folder_id = try dupeOr(alloc, o.strAt("root_folder_id"), default_root);
-        a.refresh_token = try dupeOr(alloc, o.strAt("refresh_token"), "");
-        a.order_by = try dupeOr(alloc, o.strAt("order_by"), "name");
-        a.order_direction = try dupeOr(alloc, o.strAt("order_direction"), "ASC");
+        a.drive_type = try driver.dupeOr(alloc, o.strAt("drive_type"), "");
+        a.root_folder_id = try driver.dupeOr(alloc, o.strAt("root_folder_id"), default_root);
+        a.refresh_token = try driver.dupeOr(alloc, o.strAt("refresh_token"), "");
+        a.order_by = try driver.dupeOr(alloc, o.strAt("order_by"), "name");
+        a.order_direction = try driver.dupeOr(alloc, o.strAt("order_direction"), "ASC");
         if (boolAt(o, "use_online_api")) |b| a.use_online_api = b;
-        a.alipan_type = try dupeOr(alloc, o.strAt("alipan_type"), "default");
-        a.api_url_address = try dupeOr(alloc, o.strAt("api_url_address"), default_api_address);
-        a.client_id = try dupeOr(alloc, o.strAt("client_id"), "");
-        a.client_secret = try dupeOr(alloc, o.strAt("client_secret"), "");
-        a.remove_way = try dupeOr(alloc, o.strAt("remove_way"), "trash");
+        a.alipan_type = try driver.dupeOr(alloc, o.strAt("alipan_type"), "default");
+        a.api_url_address = try driver.dupeOr(alloc, o.strAt("api_url_address"), default_api_address);
+        a.client_id = try driver.dupeOr(alloc, o.strAt("client_id"), "");
+        a.client_secret = try driver.dupeOr(alloc, o.strAt("client_secret"), "");
+        a.remove_way = try driver.dupeOr(alloc, o.strAt("remove_way"), "trash");
         if (boolAt(o, "rapid_upload")) |b| a.rapid_upload = b;
         if (boolAt(o, "internal_upload")) |b| a.internal_upload = b;
-        a.livp_download_format = try dupeOr(alloc, o.strAt("livp_download_format"), "jpeg");
+        a.livp_download_format = try driver.dupeOr(alloc, o.strAt("livp_download_format"), "jpeg");
         if (o.intAt("callback_concurrency")) |n| a.callback_concurrency = n;
         // T3：Go 的 `AccessToken` 字段**没有 json tag**（drivers/aliyundrive_open/
         // meta.go:23），`encoding/json` 以字段名本身为键 —— 用户备份 storage #5
         // 里就是大写的 `AccessToken`。只认小写 `access_token` 会把用户已经
         // 授权过的 token 读丢，每次启动都得重新刷新。Go 名优先，小写兜底。
-        a.access_token = try dupeOr(alloc, o.strAt("AccessToken") orelse o.strAt("access_token"), "");
+        a.access_token = try driver.dupeOr(alloc, o.strAt("AccessToken") orelse o.strAt("access_token"), "");
         return a;
     }
 
@@ -327,12 +327,6 @@ pub const Addition = struct {
         return std.mem.eql(u8, self.remove_way, "delete");
     }
 };
-
-fn dupeOr(alloc: std.mem.Allocator, v: ?[]const u8, fallback: []const u8) ![]const u8 {
-    const s = v orelse return alloc.dupe(u8, fallback);
-    return alloc.dupe(u8, s);
-}
-
 fn boolAt(v: *const json.Value, path: []const u8) ?bool {
     const p = v.getPath(path) orelse return null;
     return p.asBool();

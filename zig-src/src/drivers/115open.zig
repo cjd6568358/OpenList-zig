@@ -154,9 +154,9 @@ pub const Addition = struct {
         const o = v orelse return a;
         if (o.asObject() == null) return a;
 
-        a.root_folder_id = try dupeOr(alloc, o.strAt("root_folder_id"), default_root);
-        a.order_by = try dupeOr(alloc, o.strAt("order_by"), "file_name");
-        a.order_direction = try dupeOr(alloc, o.strAt("order_direction"), "asc");
+        a.root_folder_id = try driver.dupeOr(alloc, o.strAt("root_folder_id"), default_root);
+        a.order_by = try driver.dupeOr(alloc, o.strAt("order_by"), "file_name");
+        a.order_direction = try driver.dupeOr(alloc, o.strAt("order_direction"), "asc");
         if (o.getPath("limit_rate")) |p| {
             if (p.asFloat()) |f| a.limit_rate = f else if (p.asInt()) |i| {
                 a.limit_rate = @floatFromInt(i);
@@ -167,8 +167,8 @@ pub const Addition = struct {
                 a.page_size = @intFromFloat(f);
             }
         }
-        a.access_token = try dupeOr(alloc, o.strAt("access_token"), "");
-        a.refresh_token = try dupeOr(alloc, o.strAt("refresh_token"), "");
+        a.access_token = try driver.dupeOr(alloc, o.strAt("access_token"), "");
+        a.refresh_token = try driver.dupeOr(alloc, o.strAt("refresh_token"), "");
         return a;
     }
 
@@ -193,12 +193,6 @@ pub const Addition = struct {
         return std.mem.eql(u8, self.order_direction, "asc");
     }
 };
-
-fn dupeOr(alloc: std.mem.Allocator, v: ?[]const u8, fallback: []const u8) ![]const u8 {
-    const s = v orelse return alloc.dupe(u8, fallback);
-    return alloc.dupe(u8, s);
-}
-
 fn boolAt(v: *const json.Value, path: []const u8) ?bool {
     const p = v.getPath(path) orelse return null;
     return p.asBool();

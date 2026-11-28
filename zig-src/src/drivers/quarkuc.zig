@@ -113,10 +113,10 @@ pub const Addition = struct {
         var a = Addition{};
         const o = v orelse return a;
         if (o.asObject() == null) return a;
-        a.cookie = try dupeOr(alloc, o.strAt("cookie"), "");
-        a.root_folder_id = try dupeOr(alloc, o.strAt("root_folder_id"), default_root);
-        a.order_by = try dupeOr(alloc, o.strAt("order_by"), "none");
-        a.order_direction = try dupeOr(alloc, o.strAt("order_direction"), "asc");
+        a.cookie = try driver.dupeOr(alloc, o.strAt("cookie"), "");
+        a.root_folder_id = try driver.dupeOr(alloc, o.strAt("root_folder_id"), default_root);
+        a.order_by = try driver.dupeOr(alloc, o.strAt("order_by"), "none");
+        a.order_direction = try driver.dupeOr(alloc, o.strAt("order_direction"), "asc");
         if (boolAt(o, "use_transcoding_address")) |b| a.use_transcoding_address = b;
         if (boolAt(o, "only_list_video_file")) |b| a.only_list_video_file = b;
         if (o.intAt("AdditionVersion")) |n| a.addition_version = n;
@@ -140,11 +140,6 @@ pub const Addition = struct {
         return b.toOwned();
     }
 };
-
-fn dupeOr(alloc: std.mem.Allocator, v: ?[]const u8, fallback: []const u8) ![]const u8 {
-    return alloc.dupe(u8, v orelse fallback);
-}
-
 fn boolAt(v: *const json.Value, path: []const u8) ?bool {
     if (v.getPath(path)) |x| return x.asBool();
     return null;

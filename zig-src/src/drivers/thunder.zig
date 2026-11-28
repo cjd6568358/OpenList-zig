@@ -268,27 +268,27 @@ pub const Addition = struct {
         const o = v orelse return a;
         if (o.asObject() == null) return a;
 
-        a.root_folder_id = try dupeOr(alloc, o.strAt("root_folder_id"), "");
-        a.username = try dupeOr(alloc, o.strAt("username"), "");
-        a.password = try dupeOr(alloc, o.strAt("password"), "");
-        a.captcha_token = try dupeOr(alloc, o.strAt("captcha_token"), "");
-        a.credit_key = try dupeOr(alloc, o.strAt("credit_key"), "");
-        a.device_id = try dupeOr(alloc, o.strAt("device_id"), "");
-        a.space = try dupeOr(alloc, o.strAt("space"), "");
+        a.root_folder_id = try driver.dupeOr(alloc, o.strAt("root_folder_id"), "");
+        a.username = try driver.dupeOr(alloc, o.strAt("username"), "");
+        a.password = try driver.dupeOr(alloc, o.strAt("password"), "");
+        a.captcha_token = try driver.dupeOr(alloc, o.strAt("captcha_token"), "");
+        a.credit_key = try driver.dupeOr(alloc, o.strAt("credit_key"), "");
+        a.device_id = try driver.dupeOr(alloc, o.strAt("device_id"), "");
+        a.space = try driver.dupeOr(alloc, o.strAt("space"), "");
 
         if (variant != .normal) {
-            a.login_type = try dupeOr(alloc, o.strAt("login_type"), d.login_type);
-            a.sign_type = try dupeOr(alloc, o.strAt("sign_type"), "algorithms");
-            a.refresh_token = try dupeOr(alloc, o.strAt("refresh_token"), "");
-            a.algorithms = try dupeOr(alloc, o.strAt("algorithms"), d.algorithms);
-            a.captcha_sign = try dupeOr(alloc, o.strAt("captcha_sign"), "");
-            a.timestamp = try dupeOr(alloc, o.strAt("timestamp"), "");
-            a.client_id = try dupeOr(alloc, o.strAt("client_id"), d.client_id);
-            a.client_secret = try dupeOr(alloc, o.strAt("client_secret"), d.client_secret);
-            a.client_version = try dupeOr(alloc, o.strAt("client_version"), d.client_version);
-            a.package_name = try dupeOr(alloc, o.strAt("package_name"), d.package_name);
-            a.user_agent = try dupeOr(alloc, o.strAt("user_agent"), d.user_agent);
-            a.download_user_agent = try dupeOr(alloc, o.strAt("download_user_agent"), d.download_user_agent);
+            a.login_type = try driver.dupeOr(alloc, o.strAt("login_type"), d.login_type);
+            a.sign_type = try driver.dupeOr(alloc, o.strAt("sign_type"), "algorithms");
+            a.refresh_token = try driver.dupeOr(alloc, o.strAt("refresh_token"), "");
+            a.algorithms = try driver.dupeOr(alloc, o.strAt("algorithms"), d.algorithms);
+            a.captcha_sign = try driver.dupeOr(alloc, o.strAt("captcha_sign"), "");
+            a.timestamp = try driver.dupeOr(alloc, o.strAt("timestamp"), "");
+            a.client_id = try driver.dupeOr(alloc, o.strAt("client_id"), d.client_id);
+            a.client_secret = try driver.dupeOr(alloc, o.strAt("client_secret"), d.client_secret);
+            a.client_version = try driver.dupeOr(alloc, o.strAt("client_version"), d.client_version);
+            a.package_name = try driver.dupeOr(alloc, o.strAt("package_name"), d.package_name);
+            a.user_agent = try driver.dupeOr(alloc, o.strAt("user_agent"), d.user_agent);
+            a.download_user_agent = try driver.dupeOr(alloc, o.strAt("download_user_agent"), d.download_user_agent);
             a.use_video_url = o.getPath("use_video_url") != null and
                 (o.getPath("use_video_url").?.asBool() orelse false);
         }
@@ -349,11 +349,6 @@ pub const Addition = struct {
         return b.toOwned();
     }
 };
-
-fn dupeOr(alloc: std.mem.Allocator, v: ?[]const u8, fallback: []const u8) ![]const u8 {
-    return alloc.dupe(u8, v orelse fallback);
-}
-
 /// 各变体的 `addition` 默认值。抽出来是为了让 `parse` 只有一处「默认值来源」，
 /// 加新变体时不会漏字段（web 与 expert 的差异全部集中在这张表）。
 const Defaults = struct {

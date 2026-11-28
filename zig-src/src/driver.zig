@@ -242,6 +242,16 @@ pub fn persist(storage_id: i64, addition_json: []const u8) void {
     if (persist_hook) |h| h(storage_id, addition_json);
 }
 
+/// AUDIT-2026-11-27 #16：dupeOr —— `alloc.dupe(v orelse fallback)` 的
+/// 十家同形收敛（quark/thunder/pan115/quarkuc/pan123/123open/115open/
+/// aliyundrive/cloud189/cloud189pc 各持一份私有副本，两形态语义等价）。
+/// 解 optional 并按 fallback 兜底 dupe；**总是新分配**（调用方拿到的一定
+/// 归 alloc 所有，不与 optional 的源共享所有权）。
+pub fn dupeOr(alloc: std.mem.Allocator, v: ?[]const u8, fallback: []const u8) ![]const u8 {
+    return alloc.dupe(u8, v orelse fallback);
+}
+
+
 /// AUDIT-2026-11-27 #10：persist-if-changed —— 会话类驱动（token/cookie 滚动
 /// 刷新回写配置）的落盘去重公共层。
 ///

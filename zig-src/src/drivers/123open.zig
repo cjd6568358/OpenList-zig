@@ -127,17 +127,17 @@ pub const Addition = struct {
         const o = v orelse return a;
         if (o.asObject() == null) return a;
 
-        a.client_id = try dupeOr(alloc, o.strAt("ClientID"), "");
-        a.client_secret = try dupeOr(alloc, o.strAt("ClientSecret"), "");
-        a.access_token = try dupeOr(alloc, o.strAt("AccessToken"), "");
-        a.refresh_token = try dupeOr(alloc, o.strAt("RefreshToken"), "");
+        a.client_id = try driver.dupeOr(alloc, o.strAt("ClientID"), "");
+        a.client_secret = try driver.dupeOr(alloc, o.strAt("ClientSecret"), "");
+        a.access_token = try driver.dupeOr(alloc, o.strAt("AccessToken"), "");
+        a.refresh_token = try driver.dupeOr(alloc, o.strAt("RefreshToken"), "");
         if (boolAt(o, "use_online_api")) |b| a.use_online_api = b;
-        a.api_url_address = try dupeOr(alloc, o.strAt("api_url_address"), default_api_address);
+        a.api_url_address = try driver.dupeOr(alloc, o.strAt("api_url_address"), default_api_address);
         if (o.intAt("UploadThread")) |n| a.upload_thread = n;
         if (boolAt(o, "DirectLink")) |b| a.direct_link = b;
-        a.direct_link_private_key = try dupeOr(alloc, o.strAt("DirectLinkPrivateKey"), "");
+        a.direct_link_private_key = try driver.dupeOr(alloc, o.strAt("DirectLinkPrivateKey"), "");
         if (o.intAt("DirectLinkValidDuration")) |n| a.direct_link_valid_duration = n;
-        a.root_folder_id = try dupeOr(alloc, o.strAt("root_folder_id"), "0");
+        a.root_folder_id = try driver.dupeOr(alloc, o.strAt("root_folder_id"), "0");
         return a;
     }
 
@@ -161,12 +161,6 @@ pub const Addition = struct {
         return b.toOwned();
     }
 };
-
-fn dupeOr(alloc: std.mem.Allocator, v: ?[]const u8, fallback: []const u8) ![]const u8 {
-    const s = v orelse return alloc.dupe(u8, fallback);
-    return alloc.dupe(u8, s);
-}
-
 /// ASCII 小写副本。Go 在 `upload.go:35` 用 `strings.ToLower(etag)`；上传路径
 /// 传进来的 MD5 本来是小写，但 `copy()` 传的是列表记录里的原始 `etag`（可能
 /// 大写），所以统一在 `create()` 里降一次，保证与 Go 逐字节一致。

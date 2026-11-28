@@ -120,12 +120,12 @@ pub const Addition = struct {
         var a = Addition{};
         const o = v orelse return a;
         if (o.asObject() == null) return a;
-        a.username = try dupeOr(alloc, o.strAt("username"), "");
-        a.password = try dupeOr(alloc, o.strAt("password"), "");
-        a.access_token = try dupeOr(alloc, o.strAt("AccessToken"), "");
+        a.username = try driver.dupeOr(alloc, o.strAt("username"), "");
+        a.password = try driver.dupeOr(alloc, o.strAt("password"), "");
+        a.access_token = try driver.dupeOr(alloc, o.strAt("AccessToken"), "");
         if (o.intAt("UploadThread")) |t| a.upload_thread = t;
-        a.platform = try dupeOr(alloc, o.strAt("platform"), "web");
-        a.root_folder_id = try dupeOr(alloc, o.strAt("root_folder_id"), default_root);
+        a.platform = try driver.dupeOr(alloc, o.strAt("platform"), "web");
+        a.root_folder_id = try driver.dupeOr(alloc, o.strAt("root_folder_id"), default_root);
         return a;
     }
 
@@ -148,11 +148,6 @@ pub const Addition = struct {
         return b.toOwned();
     }
 };
-
-fn dupeOr(alloc: std.mem.Allocator, v: ?[]const u8, fallback: []const u8) ![]const u8 {
-    return alloc.dupe(u8, v orelse fallback);
-}
-
 fn boolOr(v: *const json.Value, path: []const u8) bool {
     if (v.getPath(path)) |x| {
         if (x.asBool()) |b| return b;

@@ -113,15 +113,15 @@ pub const Addition = struct {
         const o = v orelse return a;
         if (o.asObject() == null) return a;
 
-        a.root_folder_id = try dupeOr(alloc, o.strAt("root_folder_id"), "0");
-        a.order_by = try dupeOr(alloc, o.strAt("order_by"), "none");
-        a.order_direction = try dupeOr(alloc, o.strAt("order_direction"), "asc");
+        a.root_folder_id = try driver.dupeOr(alloc, o.strAt("root_folder_id"), "0");
+        a.order_by = try driver.dupeOr(alloc, o.strAt("order_by"), "none");
+        a.order_direction = try driver.dupeOr(alloc, o.strAt("order_direction"), "asc");
         if (boolAt(o, "use_online_api")) |b| a.use_online_api = b;
-        a.api_url_address = try dupeOr(alloc, o.strAt("api_url_address"), default_api_address);
-        a.access_token = try dupeOr(alloc, o.strAt("access_token"), "");
-        a.refresh_token = try dupeOr(alloc, o.strAt("refresh_token"), "");
-        a.app_id = try dupeOr(alloc, o.strAt("app_id"), "");
-        a.sign_key = try dupeOr(alloc, o.strAt("sign_key"), "");
+        a.api_url_address = try driver.dupeOr(alloc, o.strAt("api_url_address"), default_api_address);
+        a.access_token = try driver.dupeOr(alloc, o.strAt("access_token"), "");
+        a.refresh_token = try driver.dupeOr(alloc, o.strAt("refresh_token"), "");
+        a.app_id = try driver.dupeOr(alloc, o.strAt("app_id"), "");
+        a.sign_key = try driver.dupeOr(alloc, o.strAt("sign_key"), "");
         return a;
     }
 
@@ -148,12 +148,6 @@ pub const Addition = struct {
         return std.fmt.allocPrint(alloc, "{s}:{s}", .{ self.order_by, self.order_direction });
     }
 };
-
-fn dupeOr(alloc: std.mem.Allocator, v: ?[]const u8, fallback: []const u8) ![]const u8 {
-    const s = v orelse return alloc.dupe(u8, fallback);
-    return alloc.dupe(u8, s);
-}
-
 fn boolAt(v: *const json.Value, path: []const u8) ?bool {
     const p = v.getPath(path) orelse return null;
     return p.asBool();

@@ -110,10 +110,10 @@ pub const Addition = struct {
         var a = Addition{};
         const o = v orelse return a;
         if (o.asObject() == null) return a;
-        a.cookie = try dupeOr(alloc, o.strAt("cookie"), "");
-        a.qrcode_token = try dupeOr(alloc, o.strAt("qrcode_token"), "");
-        a.qrcode_source = try dupeOr(alloc, o.strAt("qrcode_source"), "linux");
-        a.root_folder_id = try dupeOr(alloc, o.strAt("root_folder_id"), default_root);
+        a.cookie = try driver.dupeOr(alloc, o.strAt("cookie"), "");
+        a.qrcode_token = try driver.dupeOr(alloc, o.strAt("qrcode_token"), "");
+        a.qrcode_source = try driver.dupeOr(alloc, o.strAt("qrcode_source"), "linux");
+        a.root_folder_id = try driver.dupeOr(alloc, o.strAt("root_folder_id"), default_root);
         if (o.intAt("page_size")) |n| a.page_size = n;
         if (o.getPath("limit_rate")) |x| {
             if (x.asFloat()) |f| a.limit_rate = f;
@@ -136,11 +136,6 @@ pub const Addition = struct {
         return b.toOwned();
     }
 };
-
-fn dupeOr(alloc: std.mem.Allocator, v: ?[]const u8, fallback: []const u8) ![]const u8 {
-    return alloc.dupe(u8, v orelse fallback);
-}
-
 fn arrAt(v: *const json.Value, path: []const u8) []json.Value {
     const x = v.getPath(path) orelse return &.{};
     return x.asArray() orelse &.{};
@@ -1035,13 +1030,13 @@ fn rapidUpload(
 
         const result = UploadInit{
             .status = status,
-            .pickcode = try dupeOr(arena, v.strAt("pickcode"), ""),
-            .sign_key = try dupeOr(arena, v.strAt("sign_key"), ""),
-            .sign_check = try dupeOr(arena, v.strAt("sign_check"), ""),
-            .bucket = try dupeOr(arena, v.strAt("bucket"), ""),
-            .object = try dupeOr(arena, v.strAt("object"), ""),
-            .callback = try dupeOr(arena, v.strAt("callback.callback"), ""),
-            .callback_var = try dupeOr(arena, v.strAt("callback.callback_var"), ""),
+            .pickcode = try driver.dupeOr(arena, v.strAt("pickcode"), ""),
+            .sign_key = try driver.dupeOr(arena, v.strAt("sign_key"), ""),
+            .sign_check = try driver.dupeOr(arena, v.strAt("sign_check"), ""),
+            .bucket = try driver.dupeOr(arena, v.strAt("bucket"), ""),
+            .object = try driver.dupeOr(arena, v.strAt("object"), ""),
+            .callback = try driver.dupeOr(arena, v.strAt("callback.callback"), ""),
+            .callback_var = try driver.dupeOr(arena, v.strAt("callback.callback_var"), ""),
         };
 
         if (status == 7) {
