@@ -259,11 +259,13 @@ response; a streaming response reader remains a known follow-up"（** README
 > P0+P1 全量产物 **62878FDD 已于 2026-11-28 完成隔离实例回归并切入生产**
 > （§60.45）。#14 打包机对账已于 2026-11-28 闭环（§60.44 对账小节）：
 > 复现逐字节相同 ⇒ 环境漂移排除，+88 B 定性为真实代码增量 + std 口径差。
-> **P2 已开工（2026-11-28）：#15 六步拆分全部完成（§60.46）——multipart/
+> **P2 已收口（2026-11-28）：#15 六步拆分全部完成（§60.46）——multipart/
 > auth/storage_admin/mounts/router/download 六模块均纯搬运、产物与生产逐字
 > 节不变（六连），api↔webdav 解环闭环，api.zig 9,898→5,870 行（-40.7%）；
-> M5b 路由四表收敛单独排期；#16 机械收敛项已落地（persist/dupeOr/pathBase/
-> parentOf，§60.46），SigV4 等语义级合并与 #17 另行排期。**
+> #16 机械收敛项已落地（persist/dupeOr/pathBase/parentOf，§60.46）；批末
+> 打包机复跑 574/574 + 产物 1,454,200 B / `2F34035B`（较生产 −888 B，行为
+> 面等价或增强）；M5b 路由四表收敛、#16 语义级合并（SigV4 等）与 #17
+> 另行排期。审计路线图 #1-#16 全部落地（#16 语义级部分挂起）。**
 > 测试侧两处踩坑（config 单例 prev 必须在 load 前取、mp_sessions 桶数组
 > 测试需显式 deinit）也已记入 §60.43。
 
