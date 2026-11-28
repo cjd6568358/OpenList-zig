@@ -24,6 +24,7 @@ const Buf = @import("util/buf.zig").Buf;
 const List = @import("util/buf.zig").List;
 const rt = @import("rt.zig");
 const api = @import("api.zig");
+const auth_mod = @import("auth.zig");
 
 // api.zig 本地声明的别名（对应处已在 api.zig 加 pub，零行为变化）：
 // 类型（App/Mount/ArchiveFileSource/Header）与零散业务/测试辅助。
@@ -38,7 +39,7 @@ const notifyObjsUpdateAfterWrite = api.notifyObjsUpdateAfterWrite;
 const doRequestWith = api.doRequestWith;
 const doRequestJson = api.doRequestJson;
 const expectApiCode = api.expectApiCode;
-const mintTestToken = api.mintTestToken;
+const mintTestToken = auth_mod.mintTestToken;
 const routingApp = api.routingApp;
 const ROUTING_SHELL = api.ROUTING_SHELL;
 const testing = std.testing;

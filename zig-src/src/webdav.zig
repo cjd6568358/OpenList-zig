@@ -24,7 +24,7 @@
 //!
 //! ⚠️ `admin_hash` is **not** a bare SHA-256 of the password: it is Go's
 //! `model.TwoHashPwd` = `sha256(sha256(pw + "-" + StaticHashSalt) + "-" +
-//! salt)` (see `api.twoHashPwd` and the `admin_hash` doc comment in api.zig).
+//! salt)` (see `auth_mod.twoHashPwd` and the `admin_hash` doc comment in api.zig).
 //! Comparing `sha256(pw)` against it can never succeed — that was a real bug
 //! (every WebDAV client got a 401) until the e2e regression caught it
 //! 2026-10-16. The JSON login path was always right; this path now shares the
@@ -41,6 +41,7 @@ const rt = @import("rt.zig");
 const Buf = @import("util/buf.zig").Buf;
 const List = @import("util/buf.zig").List;
 const api = @import("api.zig");
+const auth_mod = @import("auth.zig");
 const App = api.App;
 
 const eql = std.mem.eql;
@@ -61,7 +62,7 @@ pub fn handle(app: *App, req: *http.Request, res: *http.Response) !void {
     // `curl -u admin:猜 /dav/` 可以无限次试，5 次锁定形同虚设；而且每次失败都要
     // 跑一遍 `twoHashPwd`（双层加盐），等于白送一个 CPU 放大面。
     const peer = req.peer_ip;
-    if (!api.authThrottleAllow(peer)) {
+    if (!auth_mod.authThrottleAllow(peer)) {
         // 锁定期内**每个请求**都会走到这里：keep-alive 单连接一秒能刷出成百
         // 上千条日志，而 `log.warn` 每条都要过全局日志锁 + 落 stderr —— 生产
         // 在光猫上由 supervisor 收进闪存，高频扫描日增 GB 级日志能直接写穿
@@ -84,12 +85,12 @@ pub fn handle(app: *App, req: *http.Request, res: *http.Response) !void {
             return;
         },
         .invalid => {
-            api.authThrottleFailure(peer);
+            auth_mod.authThrottleFailure(peer);
             try rejectBasic(res);
             return;
         },
     }
-    api.authThrottleSuccess(peer);
+    auth_mod.authThrottleSuccess(peer);
 
     const m = req.method;
     if (eql(u8, m, "PROPFIND")) return propfind(app, req, res);
@@ -352,7 +353,7 @@ fn getOrHead(app: *App, req: *http.Request, res: *http.Response, is_head: bool) 
         // 验签走 `signKey()`（`zig.token` 优先）⇒ 两把钥匙不同，302 出去的
         // `?sign=` 必然 SignInvalid 401；② expire 硬编码 0，上游读
         // `link_expiration`；③ 编码用 `.path` 宽集，上游是 `EncodePath(true)`。
-        const u = try api.generateDownProxyURL(app, a, &r.mount.storage, vpath);
+        const u = try auth_mod.generateDownProxyURL(app, a, &r.mount.storage, vpath);
         if (u.len > 0) {
             try res.set("Cache-Control", "max-age=0, no-cache, no-store, must-revalidate");
             target = u;
@@ -883,7 +884,7 @@ fn checkBasic(app: *App, req: *http.Request) !BasicResult {
     // HashPwd. `admin_salt` empty (older configs / test doubles) would make
     // twoHashPwd disagree with however the hash was produced, so require it.
     if (app.admin_salt.len == 0) return .invalid;
-    const expect = api.twoHashPwd(req.arena, pass, app.admin_salt) catch return .invalid;
+    const expect = auth_mod.twoHashPwd(req.arena, pass, app.admin_salt) catch return .invalid;
     return if (ctEqual(expect, app.admin_hash)) .ok else .invalid;
 }
 
@@ -954,7 +955,7 @@ test "AUDIT 2026-11-27 #5: COPY over zig.max_proxy_body_mb is 507 before any fet
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    defer api.authThrottleReset();
+    defer auth_mod.authThrottleReset();
 
     var app = try mkApp(a);
     // Stub 的 details 对文件恒报 size=10；闸值压到 5 ⇒ 进 fetchBytes 之前就
@@ -1178,7 +1179,7 @@ fn mkApp(a: std.mem.Allocator) !App {
     return .{
         .alloc = a,
         .mounts = mounts,
-        .admin_hash = try api.twoHashPwd(a, "pass", salt),
+        .admin_hash = try auth_mod.twoHashPwd(a, "pass", salt),
         .admin_salt = salt,
         .admin_user = "admin",
         .admin_pwd_ts = 0,
@@ -1247,7 +1248,7 @@ test "webdav: 错凭据计入失败数，到阈值后连正确凭据也 429" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    defer api.authThrottleReset();
+    defer auth_mod.authThrottleReset();
 
     var app = try mkApp(a);
     const peer = "203.0.113.55";
@@ -1291,7 +1292,7 @@ test "webdav: 不带凭据的 401 不计数（否则任何扫描器都能锁掉�
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    defer api.authThrottleReset();
+    defer auth_mod.authThrottleReset();
 
     var app = try mkApp(a);
     const peer = "203.0.113.56";

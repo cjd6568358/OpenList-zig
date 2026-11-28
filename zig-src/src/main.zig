@@ -22,6 +22,7 @@ const frontend_mod = @import("frontend.zig");
 const log = @import("log.zig");
 const http = @import("http.zig");
 const api = @import("api.zig");
+const auth_mod = @import("auth.zig");
 const client = @import("client.zig");
 const cookiejar = @import("cookiejar.zig");
 const List = @import("util/buf.zig").List;
@@ -519,8 +520,8 @@ fn initAdminFromEnv(init: std.process.Init, cfg: *config.Config) !void {
 
     const ca = cfg.allocator();
     // 对齐 Go `User.SetPassword`：现生成 16 位 salt，存 `TwoHashPwd(pwd, salt)`。
-    const salt = try api.randomSalt(ca);
-    const hash = try api.twoHashPwd(ca, pwd, salt);
+    const salt = try auth_mod.randomSalt(ca);
+    const hash = try auth_mod.twoHashPwd(ca, pwd, salt);
     try cfg.putZig("admin_user", .{ .string = try ca.dupe(u8, "admin") });
     try cfg.putZig("admin_salt", .{ .string = salt });
     try cfg.putZig("admin_password_hash", .{ .string = hash });
@@ -633,8 +634,8 @@ fn notifyReload(cfg: *config.Config, gpa: std.mem.Allocator) void {
 fn setAdminPassword(cfg: *config.Config, pwd: []const u8) !void {
     const ca = cfg.allocator();
     // 对齐 Go `User.SetPassword`：改密就换 salt，重算 `TwoHashPwd`。
-    const salt = try api.randomSalt(ca);
-    const hash = try api.twoHashPwd(ca, pwd, salt);
+    const salt = try auth_mod.randomSalt(ca);
+    const hash = try auth_mod.twoHashPwd(ca, pwd, salt);
     try cfg.putZig("admin_salt", .{ .string = salt });
     try cfg.putZig("admin_password_hash", .{ .string = hash });
     // 推进口令版本：所有**已签发**的旧令牌立即失效（对齐 Go 的 `user.PwdTS`）。
@@ -865,7 +866,7 @@ test "admin set/random persist a verifiable hash and bump the password version" 
     const salt = cfg.raw("zig.admin_salt").?.asStr().?;
     try testing.expectEqual(@as(usize, 16), salt.len);
     try testing.expectEqualStrings(
-        try api.twoHashPwd(a, "new-password", salt),
+        try auth_mod.twoHashPwd(a, "new-password", salt),
         cfg.raw("zig.admin_password_hash").?.asStr().?,
     );
     try testing.expect(cfg.raw("zig.admin_pwd_ts").?.asInt().? >= before);
@@ -883,8 +884,8 @@ test "staticHash reproduces the exact hash the frontend sends" {
     const a = arena.allocator();
     try testing.expectEqualStrings(
         "7f3de24cc533f6ab126704856bec0e499b323e106e7f9dbf53f476d0ae26ec6b",
-        try api.staticHash(a, "verify-pass-2"),
+        try auth_mod.staticHash(a, "verify-pass-2"),
     );
     // Go `model.StaticHashSalt`（internal/model/user.go:24）必须逐字节一致。
-    try testing.expectEqualStrings("https://github.com/alist-org/alist", api.static_hash_salt);
+    try testing.expectEqualStrings("https://github.com/alist-org/alist", auth_mod.static_hash_salt);
 }

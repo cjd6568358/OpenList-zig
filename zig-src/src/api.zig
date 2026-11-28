@@ -83,6 +83,7 @@ const Buf = @import("util/buf.zig").Buf;
 const List = @import("util/buf.zig").List;
 const rt = @import("rt.zig");
 const multipart = @import("multipart.zig");
+const auth_mod = @import("auth.zig");
 
 pub const Header = model.Header;
 
@@ -731,14 +732,7 @@ fn bridgeSign(ctx: *anyopaque, alloc: std.mem.Allocator, path: []const u8) ![]co
     // Go `internal/sign.Sign`（sign.go:12-19）—— **会**读 `link_expiration`，
     // 不是"永不过期"。Strm 的 `withSign`（util.go:114-116）走的就是它，
     // 所以 `link_expiration != 0` 时 .strm 里的链接也会过期，与上游同形。
-    return signPath(app, alloc, path);
-}
-
-/// 下载签名密钥：`zig.token`（Go 的 `token` 设置），空串时回退 jwt_secret。
-/// 单独一个函数是为了让所有签名/验签点**只有一处**取密钥 —— 换密钥（
-/// reset_token）时不会漏掉某条路径。
-fn signKey(app: *const App) []const u8 {
-    return if (app.sign_secret.len > 0) app.sign_secret else app.jwt_secret;
+    return auth_mod.signPath(app, alloc, path);
 }
 
 fn bridgeSiteUrl(ctx: *anyopaque) []const u8 {
@@ -1308,8 +1302,8 @@ fn handleInitSetup(app: *App, req: *http.Request, res: *http.Response) !void {
     // 存的是 `TwoHashPwd(pwd, salt)` —— 不是裸 sha256。前端登录页发的是
     // `StaticHash(pwd)`，服务端再套一层 `HashPwd(·, salt)` 比对，所以缺了 salt
     // 这一层就永远对不上。
-    const salt = try randomSalt(ca);
-    const hash = try twoHashPwd(ca, password, salt);
+    const salt = try auth_mod.randomSalt(ca);
+    const hash = try auth_mod.twoHashPwd(ca, password, salt);
     try cfg.putZig("admin_user", .{ .string = try ca.dupe(u8, username) });
     try cfg.putZig("admin_salt", .{ .string = salt });
     try cfg.putZig("admin_password_hash", .{ .string = hash });
@@ -1396,167 +1390,9 @@ fn handleLoginHash(app: *App, req: *http.Request, res: *http.Response) !void {
     return loginCommon(app, req, res, true);
 }
 
-/// `already_static` = 收到的 password 是否已经过 `StaticHash`。
-/// M11：登录防爆破。对齐 Go `model.LoginCache`（internal/model/user.go:33-37）：
-/// 失败计数 ≥5 锁 5 分钟、期间返回 429 `TooManyAttempts`，成功清零。
-///
-/// ## 按来源分桶（2026-11-01）
-///
-/// Go 用 `c.ClientIP()` 分桶。这里过去是**全局**计数 —— 因为拿不到对端地址。
-/// 全局计数的副作用很实在：任何人反复试错 5 次就能把管理员账户锁 5 分钟
-/// （HTTP 和 SSH 还会互相牵连）。现在 `util/peeraddr.zig` 在 POSIX 上能拿到
-/// IP，于是照 Go 的语义分桶；拿不到（Windows，或 socket 已断）就退回全局桶，
-/// 行为与以前一致，不会因为「没 IP」而放行任何人。
-///
-/// ⚠ 桶键**必须用纯 IP、不带端口**。上游 Go 的 HTTP 登录用的是 `c.ClientIP()`
-/// （gin 会剥掉端口，所以天然是纯 IP），**但它的 FTP 用的是
-/// `cc.RemoteAddr().String()` —— 这个带端口**，扫描器每次源端口都不同 ⇒ 每个
-/// 连接一个新桶 ⇒ 计数永远到不了阈值，限速形同虚设（`docs/STATUS.md` §9）。
-/// 也就是说这条规则不是从 HTTP 那条路径抄来的，而是从 FTP 那个坑反推出来的。
-const ThrottleBucket = struct {
-    /// `false` = 从未使用。**不能**用「key 为空」判断：全局桶的 key 本来就是
-    /// 空串，用 key_len == 0 当空闲标记会让全局桶被别人覆盖掉。
-    used: bool = false,
-    key: [peeraddr.max_len]u8 = @splat(0),
-    key_len: u8 = 0,
-    fails: u32 = 0,
-    locked_until: i64 = 0,
-    /// 最近一次使用（秒）。表满时淘汰最久未用的那个。
-    seen: i64 = 0,
-
-    fn name(self: *const ThrottleBucket) []const u8 {
-        return self.key[0..self.key_len];
-    }
-};
-
-/// 同时跟踪多少个来源。单管理员部署实际上只有一两个；表满了淘汰最久未用
-/// 的桶，于是「大量来源轮番爆破」最多占用这么多内存（每个桶 ~90 字节）。
-const throttle_buckets = 64;
-
-const LoginThrottle = struct {
-    mu: std.Io.Mutex = .init,
-    buckets: [throttle_buckets]ThrottleBucket = @splat(.{}),
-
-    /// 找已存在的桶，**不**新建。成功路径用它：一次成功登录不该占用一个桶位，
-    /// 否则表满时会把某个正在锁定的来源淘汰掉（等于给攻击者一次重试）。
-    fn find(self: *LoginThrottle, key: []const u8) ?*ThrottleBucket {
-        for (&self.buckets) |*b| {
-            if (b.used and b.key_len == key.len and std.mem.eql(u8, b.name(), key)) return b;
-        }
-        return null;
-    }
-
-    /// 找到 `key` 的桶；没有就占用一个空位/最久未用的位置。
-    /// 调用方必须持锁。
-    fn slot(self: *LoginThrottle, key: []const u8, now: i64) *ThrottleBucket {
-        var first_free: ?usize = null;
-        var lru: usize = 0; // 所有桶都占用时才用得上，此时它一定是 used 的
-
-        for (&self.buckets, 0..) |*b, i| {
-            if (b.used and b.key_len == key.len and std.mem.eql(u8, b.name(), key)) return b;
-            if (!b.used) {
-                if (first_free == null) first_free = i;
-            } else if (b.seen < self.buckets[lru].seen) {
-                lru = i;
-            }
-        }
-
-        const b = &self.buckets[first_free orelse lru];
-        // 键过长（理论上不会：IP 文本 ≤ 45 字节）就截断，宁可把两个来源
-        // 并进同一个桶（更严），也不能越界。
-        const n = @min(key.len, peeraddr.max_len);
-        @memcpy(b.key[0..n], key[0..n]);
-        b.key_len = @intCast(n);
-        b.used = true;
-        b.fails = 0;
-        b.locked_until = 0;
-        b.seen = now;
-        return b;
-    }
-
-    /// true = 允许继续尝试；false = 处于锁定期，应回 429。
-    fn allow(self: *LoginThrottle, key: []const u8) bool {
-        self.mu.lockUncancelable(rt.io());
-        defer self.mu.unlock(rt.io());
-        const now = rt.nowSeconds();
-        const b = self.slot(key, now);
-        b.seen = now;
-        if (b.locked_until > now) {
-            // 锁定期内**每次**尝试都续期（Go `LoginCache.Expire(ip, 5min)`，
-            // server/handles/auth.go:52）。不续期的话锁定就是一个固定 5 分钟
-            // 的窗口，攻击者可以精确按节奏继续爆破；续期后越试锁得越久。
-            b.locked_until = now + lock_duration_s;
-            return false;
-        }
-        if (b.locked_until != 0) {
-            // 锁定期满（Go `LoginCache.Expire` 的语义）：重新计数。
-            b.fails = 0;
-            b.locked_until = 0;
-        }
-        return true;
-    }
-
-    fn recordFailure(self: *LoginThrottle, key: []const u8) void {
-        self.mu.lockUncancelable(rt.io());
-        defer self.mu.unlock(rt.io());
-        const now = rt.nowSeconds();
-        const b = self.slot(key, now);
-        b.seen = now;
-        b.fails += 1;
-        if (b.fails >= max_auth_retries) {
-            b.locked_until = now + lock_duration_s;
-            // 锁定**进入**时告警一次（带来源）。拒绝路径上不再打日志：HTTP 侧
-            // 锁定期内每个请求都会被拒，逐请求打日志等于给扫描器一个「写穿
-            // 闪存」的放大面（stderr 落盘，光猫小容量 flash）；SSH 侧虽然每
-            // 次拒绝都对应一次完整握手、量级小得多，但也统一走这一条。
-            log.warn("auth: {s} locked for {d}s after {d} failed logins", .{
-                b.name(), lock_duration_s, b.fails,
-            });
-        }
-    }
-
-    fn recordSuccess(self: *LoginThrottle, key: []const u8) void {
-        self.mu.lockUncancelable(rt.io());
-        defer self.mu.unlock(rt.io());
-        // 只清已有的桶：成功登录不该新建桶（见 `find` 的注释）。
-        const b = self.find(key) orelse return;
-        b.fails = 0;
-        b.locked_until = 0;
-        b.seen = rt.nowSeconds();
-    }
-};
-
-/// 登录限速：`key` = 对端 IP（不带端口），空串 = 全局桶。
-///
-/// HTTP 登录与 SSH 认证**共用同一份计数**：换协议不能绕过限速。同一个来源
-/// 用两种协议各试 3 次，加起来照样到阈值。
-pub fn authThrottleAllow(key: []const u8) bool {
-    return login_throttle.allow(key);
-}
-
-pub fn authThrottleFailure(key: []const u8) void {
-    login_throttle.recordFailure(key);
-}
-
-pub fn authThrottleSuccess(key: []const u8) void {
-    login_throttle.recordSuccess(key);
-}
-
-pub fn authThrottleReset() void {
-    login_throttle.mu.lockUncancelable(rt.io());
-    defer login_throttle.mu.unlock(rt.io());
-    login_throttle.buckets = @splat(.{});
-}
-
-/// Go `model.DefaultMaxAuthRetries`。
-const max_auth_retries: u32 = 5;
-/// Go `model.DefaultLockDuration` = 5 分钟。
-const lock_duration_s: i64 = 5 * 60;
 /// Go `model.InvalidUsernameOrPassword` / `model.TooManyAttempts`（逐字）。
 const msg_login_failed = "Invalid username or password";
 const msg_too_many = "Too many unsuccessful sign-in attempts have been made using an incorrect username or password, Try again later.";
-
-var login_throttle = LoginThrottle{};
 
 fn loginCommon(app: *App, req: *http.Request, res: *http.Response, already_static: bool) !void {
     if (app.admin_hash.len == 0) return res.jsonError(400, "no administrator yet; run setup first");
@@ -1567,7 +1403,7 @@ fn loginCommon(app: *App, req: *http.Request, res: *http.Response, already_stati
     // 桶键 = 对端 IP（不带端口）；拿不到时是空串 = 全局桶。
     const key = req.peer_ip;
     // M11：锁定期内直接 429，不进入凭据比对（Go loginHash 的检查顺序一致）。
-    if (!login_throttle.allow(key)) {
+    if (!auth_mod.login_throttle.allow(key)) {
         return res.jsonError(429, msg_too_many);
     }
     // AUDIT #7：凭据比对整体持 creds_mu（读全组 user/salt/hash）—— 并发
@@ -1577,22 +1413,22 @@ fn loginCommon(app: *App, req: *http.Request, res: *http.Response, already_stati
         app.creds_mu.lockUncancelable(io);
         defer app.creds_mu.unlock(io);
         if (!std.mem.eql(u8, username, app.admin_user)) {
-            login_throttle.recordFailure(key);
+            auth_mod.login_throttle.recordFailure(key);
             return res.jsonError(401, msg_login_failed);
         }
         // Go `User.ValidatePwd` / `ValidatePwdStaticHash`（internal/model/user.go:83-94）：
         //     PwdHash == HashPwd(<static hash>, Salt)
         // 明文接口先做一次 StaticHash；`/login/hash` 直接拿收到的 static hash 用。
-        const static = if (already_static) password else try staticHash(a, password);
-        const expect = try hashPwd(a, static, app.admin_salt);
+        const static = if (already_static) password else try auth_mod.staticHash(a, password);
+        const expect = try auth_mod.hashPwd(a, static, app.admin_salt);
         // Constant-time compare. A plain `std.mem.eql` would leak the position of
         // the first differing byte; a length check first would leak the length.
         if (!ctEqual(expect, app.admin_hash)) {
-            login_throttle.recordFailure(key);
+            auth_mod.login_throttle.recordFailure(key);
             return res.jsonError(401, msg_login_failed);
         }
     }
-    login_throttle.recordSuccess(key);
+    auth_mod.login_throttle.recordSuccess(key);
     return issueToken(app, a, res, username);
 }
 
@@ -1609,7 +1445,7 @@ fn issueToken(app: *App, a: std.mem.Allocator, res: *http.Response, username: []
     const now = rt.nowSeconds();
     const exp = now + app.token_expires_in_hours * 3600;
 
-    const h64 = try b64Url(a, "{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
+    const h64 = try auth_mod.b64Url(a, "{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
 
     // AUDIT #7：pwd_ts 属于凭据组，锁内读。
     const pwd_ts: i64 = blk: {
@@ -1625,12 +1461,12 @@ fn issueToken(app: *App, a: std.mem.Allocator, res: *http.Response, username: []
     try payload.print(",\"pwd_ts\":{d},\"exp\":{d},\"iat\":{d},\"nbf\":{d}}}", .{
         pwd_ts, exp, now, now,
     });
-    const p64 = try b64Url(a, payload.slice());
+    const p64 = try auth_mod.b64Url(a, payload.slice());
 
     // 签名覆盖 "header.payload"（不含末尾的点），这是 JWT 的规定。
     const signing_input = try std.fmt.allocPrint(a, "{s}.{s}", .{ h64, p64 });
-    const sig = try hmacSha256(a, app.jwt_secret, signing_input);
-    const s64 = try b64Url(a, &sig);
+    const sig = try auth_mod.hmacSha256(a, app.jwt_secret, signing_input);
+    const s64 = try auth_mod.b64Url(a, &sig);
     const token = try std.fmt.allocPrint(a, "{s}.{s}", .{ signing_input, s64 });
 
     var b = Buf.init(a);
@@ -1713,7 +1549,7 @@ fn checkAuth(app: *App, req: *http.Request) !bool {
 
     // 签名覆盖 "header.payload"。
     const signing_input = try std.fmt.allocPrint(req.arena, "{s}.{s}", .{ h64, p64 });
-    const expected = try hmacSha256(req.arena, app.jwt_secret, signing_input);
+    const expected = try auth_mod.hmacSha256(req.arena, app.jwt_secret, signing_input);
     const got_raw = b64UrlDecode(req.arena, s64) catch return false;
 
     // A02：长度先判，绝不把长度差窄化进 u8；再常量时间比较。
@@ -1722,7 +1558,7 @@ fn checkAuth(app: *App, req: *http.Request) !bool {
 
     // M14：签名对得上之后才查作废表 —— 只有真令牌能被登记（登出本身要先
     // 过鉴权），所以这里不存在「伪造签名把别人的令牌作废」的路径。
-    if (g_invalidated_tokens.contains(s64)) {
+    if (auth_mod.g_invalidated_tokens.contains(s64)) {
         log.info("api: token rejected: logged out", .{});
         return false;
     }
@@ -1921,27 +1757,6 @@ fn mustProxyForStorage(driver_key: []const u8) bool {
     return f.mustProxy();
 }
 
-/// Go `common.GenerateDownProxyURL`（server/common/proxy.go:151-163）。
-/// 没配 `down_proxy_url` 时返回**空串** —— 与上游一致（fsread.go:319 判
-/// `if rawURL == ""` 再回落本站 `/p`）。
-pub fn generateDownProxyURL(
-    app: *App,
-    a: std.mem.Allocator,
-    storage: *const model.Storage,
-    path: []const u8,
-) ![]const u8 {
-    if (storage.down_proxy_url.len == 0) return "";
-    // Go `strings.Split(s, "\n")[0]` —— 多行只取第一行。
-    const base = if (std.mem.indexOfScalar(u8, storage.down_proxy_url, '\n')) |i|
-        storage.down_proxy_url[0..i]
-    else
-        storage.down_proxy_url;
-    const enc = try urlmod.pathEscape(a, path);
-    if (storage.disable_proxy_sign) return std.fmt.allocPrint(a, "{s}{s}", .{ base, enc });
-    // `?sign=` + `sign.Sign(reqPath)`（**不看 sign_all**）。
-    return std.fmt.allocPrint(a, "{s}{s}?sign={s}", .{ base, enc, try signPath(app, a, path) });
-}
-
 /// Go `common.GetApiUrl(c)`（值由中间件按 `GetApiUrlFromRequest` 算出，
 /// server/common/base.go:13-31）：SiteURL 以 http 开头就直接用；否则取请求的
 /// scheme://Host（优先 X-Forwarded-Proto / X-Forwarded-Host）再拼上 SiteURL。
@@ -2013,7 +1828,7 @@ fn handleFsGet(app: *App, req: *http.Request, res: *http.Response) !void {
     // `sign_all` 开（或 meta 加密）时签完整路径。fs/get 的 `sign` 字段与
     // raw_url 上带的 `?sign=` 必须是同一个值 —— 前端音频/视频播放器直接用
     // raw_url，不带 sign 的 `/p` 在 sign_all 部署下会被 401（实测踩过）。
-    const sign_val = try signForObj(app, a, f.is_dir, path);
+    const sign_val = try auth_mod.signForObj(app, a, f.is_dir, path);
 
     // Go `server/handles/fsread.go:314-341` 逐分支对齐：
     //   * 判据是**存储/驱动级**的 `storage.Config().MustProxy() ||
@@ -2030,7 +1845,7 @@ fn handleFsGet(app: *App, req: *http.Request, res: *http.Response) !void {
     var raw_url: []const u8 = "";
     if (!f.is_dir) {
         if (mustProxyForStorage(r.mount.storage.driver) or r.mount.storage.web_proxy) {
-            const down = try generateDownProxyURL(app, a, &r.mount.storage, path);
+            const down = try auth_mod.generateDownProxyURL(app, a, &r.mount.storage, path);
             raw_url = if (down.len > 0) down else blk: {
                 const api = try apiUrlFor(app, a, req);
                 const enc = try urlmod.pathEscape(a, path);
@@ -2446,8 +2261,8 @@ fn handleMeUpdate(app: *App, req: *http.Request, res: *http.Response) !void {
     if (password.len > 0) {
         if (password.len < 4) return res.jsonError(400, "password must be at least 4 characters");
         // 复用建号时的同一条路径：新 salt + TwoHashPwd，与 Go SetPassword 一致。
-        const salt = try randomSalt(ca);
-        const hash = try twoHashPwd(ca, password, salt);
+        const salt = try auth_mod.randomSalt(ca);
+        const hash = try auth_mod.twoHashPwd(ca, password, salt);
         try cfg.putZig("admin_salt", .{ .string = salt });
         try cfg.putZig("admin_password_hash", .{ .string = hash });
         // 推进口令版本 ⇒ 已签发的令牌全部失效。
@@ -2514,71 +2329,12 @@ fn handleLogout(app: *App, req: *http.Request, res: *http.Response) !void {
     // 只作废**这一个**令牌（不是推进 `admin_pwd_ts` —— 那会把所有会话一起
     // 踢掉，比 Go 强得多，语义不对）。记录的是签名段：它是整串里唯一既
     // 定长又能唯一标识一枚令牌的部分。
-    if (jwtSignatureOf(req)) |sig| {
-        g_invalidated_tokens.add(sig);
+    if (auth_mod.jwtSignatureOf(req)) |sig| {
+        auth_mod.g_invalidated_tokens.add(sig);
     }
     // Go 传的是整个 Authorization 头；空 token 时它直接返回 nil（不报错）。
     try res.jsonOk("null");
 }
-
-/// 从 `Authorization` 里抠出 JWT 的第三段（签名）。拿不到就返回 null
-/// （空 token / admin token / `?token=` 形式都走不到这里，与 Go 的
-/// "空 token 直接返回 nil" 一致）。
-fn jwtSignatureOf(req: *http.Request) ?[]const u8 {
-    const h = req.header("Authorization") orelse return null;
-    var token: []const u8 = h;
-    const prefix = "Bearer ";
-    if (h.len > prefix.len and std.ascii.eqlIgnoreCase(h[0..prefix.len], prefix)) {
-        token = h[prefix.len..];
-    }
-    var parts = std.mem.splitScalar(u8, token, '.');
-    _ = parts.next() orelse return null;
-    _ = parts.next() orelse return null;
-    const sig = parts.next() orelse return null;
-    if (parts.next() != null) return null;
-    if (sig.len == 0) return null;
-    return sig;
-}
-
-/// M14：已作废令牌的**签名段**登记表。
-///
-/// 对齐 Go `validTokenCache`（server/common/auth.go）：进程内的、重启即清空的
-/// 内存结构。容量有界（FIFO 淘汰），只存签名段（43 字节的 base64url），
-/// 线性扫描 —— 单管理员场景下登出是极低频操作，256 条足够覆盖。
-const InvalidatedTokens = struct {
-    const cap = 256;
-    const max_len = 128;
-
-    mu: std.Io.Mutex = .init,
-    buf: [cap][max_len]u8 = undefined,
-    lens: [cap]usize = @splat(0),
-    head: usize = 0,
-    count: usize = 0,
-
-    fn add(self: *InvalidatedTokens, sig: []const u8) void {
-        if (sig.len == 0 or sig.len > max_len) return;
-        self.mu.lockUncancelable(rt.io());
-        defer self.mu.unlock(rt.io());
-        @memcpy(self.buf[self.head][0..sig.len], sig);
-        self.lens[self.head] = sig.len;
-        self.head = (self.head + 1) % cap;
-        if (self.count < cap) self.count += 1;
-    }
-
-    fn contains(self: *InvalidatedTokens, sig: []const u8) bool {
-        if (sig.len == 0 or sig.len > max_len) return false;
-        self.mu.lockUncancelable(rt.io());
-        defer self.mu.unlock(rt.io());
-        var i: usize = 0;
-        while (i < self.count) : (i += 1) {
-            const n = self.lens[i];
-            if (n == sig.len and std.mem.eql(u8, self.buf[i][0..n], sig)) return true;
-        }
-        return false;
-    }
-};
-
-var g_invalidated_tokens: InvalidatedTokens = .{ .buf = undefined };
 
 // ---------------------------------------------------------------------------
 // Storage admin（/api/admin/storage/*）
@@ -4685,7 +4441,7 @@ fn writeObj(app: *App, b: *Buf, o: model.Obj, path: []const u8) !void {
     // 直接输出为空串，否则前端日期格式化会得到 NaN。
     try json.writeString(b, try fmtTime(b.alloc, if (o.created == 0) o.modified else o.created));
     try b.append(",\"sign\":");
-    try json.writeString(b, try signForObj(app, b.alloc, o.is_dir, path));
+    try json.writeString(b, try auth_mod.signForObj(app, b.alloc, o.is_dir, path));
     try b.append(",\"thumb\":");
     try json.writeString(b, o.thumb);
     try b.print(",\"type\":{d}", .{@backingInt(o.typeEnum())});
@@ -4787,149 +4543,6 @@ pub fn mapDriverError(res: *http.Response, e: anyerror, ctx: ?*driver.Ctx) !void
     };
 }
 
-fn sha256Hex(a: std.mem.Allocator, s: []const u8) ![]const u8 {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(s, &digest, .{});
-    const out = try a.alloc(u8, 64);
-    const hex = "0123456789abcdef";
-    for (digest, 0..) |c, i| {
-        out[i * 2] = hex[c >> 4];
-        out[i * 2 + 1] = hex[c & 0x0F];
-    }
-    return out;
-}
-
-/// Go `model.StaticHashSalt`（`internal/model/user.go:24`）。
-/// 前端登录页会先用它把明文口令算成 "static hash"，再 POST 到
-/// `/api/auth/login/hash` —— 所以这个常量必须与 Go **逐字节**一致，
-/// 否则前端永远登不上（这正是 2026-10-13 那次「登录失败」的根因）。
-pub const static_hash_salt = "https://github.com/alist-org/alist";
-
-/// Go `model.StaticHash` = `sha256(password + "-" + StaticHashSalt)`。
-pub fn staticHash(a: std.mem.Allocator, pwd: []const u8) ![]const u8 {
-    const s = try std.fmt.allocPrint(a, "{s}-{s}", .{ pwd, static_hash_salt });
-    return sha256Hex(a, s);
-}
-
-/// Go `model.HashPwd(static, salt)` = `sha256(static + "-" + salt)`。
-pub fn hashPwd(a: std.mem.Allocator, static: []const u8, salt: []const u8) ![]const u8 {
-    const s = try std.fmt.allocPrint(a, "{s}-{s}", .{ static, salt });
-    return sha256Hex(a, s);
-}
-
-/// Go `model.TwoHashPwd(pwd, salt)` = `HashPwd(StaticHash(pwd), salt)`。
-/// **这才是 Go 存进库里的形态**（`User.SetPassword`，`internal/model/user.go:96`）。
-pub fn twoHashPwd(a: std.mem.Allocator, pwd: []const u8, salt: []const u8) ![]const u8 {
-    const st = try staticHash(a, pwd);
-    return hashPwd(a, st, salt);
-}
-
-/// Go `random.String(16)` —— `User.SetPassword` 给每个用户现生成 16 位随机 salt。
-pub fn randomSalt(a: std.mem.Allocator) ![]const u8 {
-    const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    const out = try a.alloc(u8, 16);
-    var raw: [1]u8 = undefined;
-    for (out) |*c| {
-        rt.io().random(&raw);
-        c.* = letters[raw[0] % letters.len];
-    }
-    return out;
-}
-
-fn hmacSha256(a: std.mem.Allocator, key: []const u8, msg: []const u8) ![32]u8 {
-    var mac: [32]u8 = undefined;
-    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, msg, key);
-    _ = a;
-    return mac;
-}
-
-fn b64Url(a: std.mem.Allocator, data: []const u8) ![]const u8 {
-    const enc = std.base64.url_safe_no_pad.Encoder;
-    const out = try a.alloc(u8, enc.calcSize(data.len));
-    return enc.encode(out, data);
-}
-
-// ---------------------------------------------------------------------------
-// 下载签名（对齐 Go `pkg/sign/hmac.go` + `server/common/sign.go`）
-// ---------------------------------------------------------------------------
-
-/// 与上游逐字段一致的四个错误（`pkg/sign/sign.go:12-17`）。
-pub const SignError = error{
-    SignExpired,
-    SignInvalid,
-    ExpireInvalid,
-    ExpireMissing,
-};
-
-/// `Sign(data, expire)` = `base64url(HMAC-SHA256(secret, data + ":" + expire))`
-/// 拼上 `":" + expire`。
-///
-/// ⚠️ 编码用**带 padding 的 URL-safe base64**（`std.base64.url_safe`）—— Go 是
-/// `base64.URLEncoding`（`pkg/sign/hmac.go:26`），而 JWT 那边的
-/// `base64.RawURLEncoding` 是无 padding 的。两者差一个 `=`，混用会让签名对不上。
-/// `b64Url`（无 padding）留给 JWT 用，不要在这里复用。
-pub fn signValue(a: std.mem.Allocator, secret: []const u8, data: []const u8, expire: i64) ![]const u8 {
-    const expire_str = try std.fmt.allocPrint(a, "{d}", .{expire});
-    var mac: [32]u8 = undefined;
-    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, try std.fmt.allocPrint(a, "{s}:{s}", .{ data, expire_str }), secret);
-    const b64 = std.base64.url_safe.Encoder;
-    const raw = try a.alloc(u8, b64.calcSize(mac.len));
-    return std.fmt.allocPrint(a, "{s}:{s}", .{ b64.encode(raw, &mac), expire_str });
-}
-
-/// Go `internal/sign.Sign(data)`（internal/sign/sign.go:12-19）。
-///
-/// ⚠️ 它**不看 `sign_all`** —— 上游的 `sign.Sign` 是无条件签，用不用由调用方
-/// 决定（`common.Sign` 看 `sign_all`，`GenerateDownProxyURL` 与 Strm 的
-/// `withSign` 不看）。读 `link_expiration`（小时）：0 ⇒ 永不过期（`expire=0`），
-/// 否则 `now + N*3600`。
-fn signPath(app: *App, a: std.mem.Allocator, path: []const u8) ![]const u8 {
-    // 没有加载配置（单元测试 / 极早期启动）时按「不过期」处理 —— 与 Go 的
-    // `setting.GetInt` 在 settings 表未初始化时返回零值同形。
-    const cfg = config.getOpt() orelse return signValue(a, signKey(app), path, 0);
-    const expire_hours = cfg.link_expiration;
-    if (expire_hours == 0) return signValue(a, signKey(app), path, 0);
-    // 溢出防护：`link_expiration` 是用户可配的，配个巨大值不能让服务崩在
-    // 一次列目录上。算不出来就按「不过期」处理。
-    const expire = std.math.mul(i64, expire_hours, 3600) catch {
-        log.warn("[api] link_expiration={d} overflows; signing without expiry", .{expire_hours});
-        return signValue(a, signKey(app), path, 0);
-    };
-    return signValue(a, signKey(app), path, rt.nowSeconds() + expire);
-}
-
-/// 给 `fs/list` / `fs/get` 的对象签一个下载签名。
-///
-/// 对齐 Go `server/common/sign.go:13-18`：目录不签；非目录时
-/// `!encrypt && !sign_all` 也不签（本工程没有 meta 加密，所以只看 `sign_all`）。
-fn signForObj(app: *App, a: std.mem.Allocator, is_dir: bool, path: []const u8) ![]const u8 {
-    if (is_dir) return "";
-    // 没有加载配置（单元测试 / 极早期启动）时按「不签」处理 —— 与 Go 的
-    // `setting.GetBool` 在 settings 表未初始化时返回零值同形。
-    const cfg = config.getOpt() orelse return "";
-    if (!cfg.sign_all) return "";
-    return signPath(app, a, path);
-}
-
-/// `Verify(data, sign)` —— 逐条对齐 Go `pkg/sign/hmac.go:34-56`。
-fn verifySign(app: *App, a: std.mem.Allocator, data: []const u8, sign: []const u8) !void {
-    // Go `HMACSign.Verify`（pkg/sign/hmac.go:32-50）：`exp := sign[LastIndex(":")+1:]`
-    // —— 没有 ':' 时 LastIndex=-1，整个 sign 都算 exp。逐例对齐：
-    //   ""      → exp=""     → ExpireMissing（"expire missing"）
-    //   "abc"   → exp="abc"  → ParseInt 失败 → ExpireInvalid（"expire invalid"）
-    //   "xxx:"  → exp=""     → ExpireMissing
-    // 此前实现把"无 ':'"也归为 ExpireMissing，是错的（2026-10-17 对账修正）。
-    const exp_str = if (std.mem.lastIndexOfScalar(u8, sign, ':')) |i| sign[i + 1 ..] else sign;
-    if (exp_str.len == 0) return SignError.ExpireMissing;
-    const expires = std.fmt.parseInt(i64, exp_str, 10) catch return SignError.ExpireInvalid;
-    // 0 表示「永不过期」；负数视为已过期。
-    if (expires != 0 and expires < rt.nowSeconds()) return SignError.SignExpired;
-    const expect = try signValue(a, signKey(app), data, expires);
-    // L1：`std.mem.eql` 会在第一个不同字节处提前返回，等于把"前几个字节对
-    // 不对"用响应时间泄漏出去。签名比较必须常量时间（同文件已有 `ctEqual`）。
-    if (!ctEqual(expect, sign)) return SignError.SignInvalid;
-}
-
 /// `/d/`、`/p/` 的鉴权失败（对齐 Go `middlewares.Down` + `pkg/sign` 的四种
 /// 错误）。返回 null = 放行。
 pub const DownloadAuthError = enum { expire_missing, expire_invalid, sign_expired, sign_invalid };
@@ -4958,13 +4571,13 @@ fn downloadAuthError(app: *App, req: *http.Request, raw_path: []const u8) ?Downl
         return .sign_invalid;
     } orelse "";
     const s = if (std.mem.endsWith(u8, raw, "/")) raw[0 .. raw.len - 1] else raw;
-    verifySign(app, req.arena, raw_path, s) catch |e| {
+    auth_mod.verifySign(app, req.arena, raw_path, s) catch |e| {
         log.warn("[api] /d/ sign rejected for {s}: {s}", .{ raw_path, @errorName(e) });
         return switch (e) {
-            SignError.ExpireMissing => .expire_missing,
-            SignError.ExpireInvalid => .expire_invalid,
-            SignError.SignExpired => .sign_expired,
-            SignError.SignInvalid => .sign_invalid,
+            auth_mod.SignError.ExpireMissing => .expire_missing,
+            auth_mod.SignError.ExpireInvalid => .expire_invalid,
+            auth_mod.SignError.SignExpired => .sign_expired,
+            auth_mod.SignError.SignInvalid => .sign_invalid,
             // `verifySign` 会分配（HMAC + 拼接），所以它的错误集里还有
             // OutOfMemory。那是资源问题而不是签名问题，但**绝不能因此放行** ——
             // 按"鉴权未通过"处理，并单独打一条 err（与签名失败区分开）。
@@ -5190,10 +4803,10 @@ test "sha256 hex and base64url round trip" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const h = try sha256Hex(a, "abc");
+    const h = try auth_mod.sha256Hex(a, "abc");
     try testing.expectEqualStrings("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", h);
 
-    const enc = try b64Url(a, "hello\xff");
+    const enc = try auth_mod.b64Url(a, "hello\xff");
     const dec = try b64UrlDecode(a, enc);
     try testing.expectEqualStrings("hello\xff", dec);
 }
@@ -5269,7 +4882,7 @@ test "raw_url from fs/get is directly playable: carries sign and a media content
     tcfg.sign_all = true;
     tcfg.link_expiration = 0;
 
-    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const token = try auth_mod.mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
     const hdrs = try a.alloc(Header, 1);
     hdrs[0] = .{ .name = "Authorization", .value = try std.fmt.allocPrint(a, "Bearer {s}", .{token}) };
 
@@ -5630,20 +5243,6 @@ test "AUDIT #4: proxy pool consumes zig.max_proxy_body_mb / http_timeout / ca_bu
     try testing.expect(c1 != c2);
 }
 
-pub fn mintTestToken(a: std.mem.Allocator, secret: []const u8, user: []const u8, pwd_ts: i64) ![]u8 {
-    const exp: i64 = 4102444800; // 2100-01-01, comfortably in the future
-    const h64 = try b64Url(a, "{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
-    var payload = Buf.init(a);
-    try payload.append("{\"username\":");
-    try json.writeString(&payload, user);
-    try payload.print(",\"pwd_ts\":{d},\"exp\":{d}}}", .{ pwd_ts, exp });
-    const p64 = try b64Url(a, payload.slice());
-    const signing_input = try std.fmt.allocPrint(a, "{s}.{s}", .{ h64, p64 });
-    const sig = try hmacSha256(a, secret, signing_input);
-    const s64 = try b64Url(a, &sig);
-    return std.fmt.allocPrint(a, "{s}.{s}", .{ signing_input, s64 });
-}
-
 test "local download Range streams only the requested byte window" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -5671,7 +5270,7 @@ test "local download Range streams only the requested byte window" {
     };
     app.mounts = mounts;
 
-    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const token = try auth_mod.mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const range_headers = try a.alloc(Header, 2);
     range_headers[0] = .{ .name = "Authorization", .value = auth };
@@ -5811,7 +5410,7 @@ test "routing: authed admin endpoints return data, unauthed is 401" {
 
     // Mint a token with the same secret/shape `issueToken` uses, so the auth
     // gate in `handleAuthed` accepts it.
-    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const token = try auth_mod.mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const hdrs = try a.alloc(Header, 1);
     hdrs[0] = .{ .name = "Authorization", .value = auth };
@@ -5938,7 +5537,7 @@ test "every JSON endpoint emits strict, parseable JSON" {
     config.setForTest(tcfg);
     defer config.setForTest(prev_cfg);
 
-    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const token = try auth_mod.mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const hdrs = try a.alloc(Header, 1);
     hdrs[0] = .{ .name = "Authorization", .value = auth };
@@ -6156,7 +5755,7 @@ test "fs list carries the envelope fields the frontend reads" {
     defer fe.deinit();
     var app = routingApp(a, fe);
 
-    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const token = try auth_mod.mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const hdrs = try a.alloc(Header, 1);
     hdrs[0] = .{ .name = "Authorization", .value = auth };
@@ -6189,7 +5788,7 @@ test "fs move/copy/remove/rename reject relative names like Go checkRelativePath
     defer fe.deinit();
     var app = routingApp(a, fe);
 
-    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const token = try auth_mod.mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const hdrs = try a.alloc(Header, 1);
     hdrs[0] = .{ .name = "Authorization", .value = auth };
@@ -6409,7 +6008,7 @@ test "AUDIT #7: me/update publishes credentials atomically and retires the old s
     const old_salt = app.admin_salt;
 
     // 改密码 + 用户名：新凭据锁内一次性可见。
-    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const token = try auth_mod.mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     {
         var hs = [_]Header{.{ .name = "Authorization", .value = auth }};
@@ -6446,7 +6045,7 @@ test "login/hash accepts the static hash the frontend actually sends" {
     const salt = "abcdefghijklmnop";
     app.admin_user = "admin";
     app.admin_salt = salt;
-    app.admin_hash = try twoHashPwd(a, "hunter2", salt);
+    app.admin_hash = try auth_mod.twoHashPwd(a, "hunter2", salt);
 
     const post = struct {
         fn call(app_: *App, a_: std.mem.Allocator, path: []const u8, body: []const u8) !*http.Response {
@@ -6459,7 +6058,7 @@ test "login/hash accepts the static hash the frontend actually sends" {
     }.call;
 
     // 1) 前端路径：发 StaticHash，必须换到 token
-    const static = try staticHash(a, "hunter2");
+    const static = try auth_mod.staticHash(a, "hunter2");
     const body_hash = try std.fmt.allocPrint(a, "{{\"username\":\"admin\",\"password\":\"{s}\",\"otp_code\":\"\"}}", .{static});
     const res_hash = try post(&app, a, "/api/auth/login/hash", body_hash);
     try testing.expectEqual(@as(u16, 200), res_hash.status);
@@ -6487,145 +6086,7 @@ test "login/hash accepts the static hash the frontend actually sends" {
     }
     const locked = try post(&app, a, "/api/auth/login", "{\"username\":\"admin\",\"password\":\"hunter2\"}");
     try expectApiCode(locked, 429);
-    login_throttle.recordSuccess(""); // 复位，避免污染同进程其他用例
-}
-
-test "auth/throttle: 失败计数按来源分桶，锁一个不影响另一个" {
-    // 这是「按 IP 分桶」存在的全部意义：全局计数下，任何人试错 5 次就能把
-    // 管理员锁 5 分钟。桶键必须是**纯 IP**（端口每次都变，带上就等于每个连接
-    // 一个桶 —— 上游 FTP 的 `RemoteAddr().String()` 就是这么失效的）。
-    defer authThrottleReset();
-    authThrottleReset();
-
-    const bad = "203.0.113.7";
-    var i: usize = 0;
-    while (i < max_auth_retries) : (i += 1) {
-        try testing.expect(authThrottleAllow(bad));
-        authThrottleFailure(bad);
-    }
-    try testing.expect(!authThrottleAllow(bad)); // 第 6 次：锁住
-
-    // 另一个来源、以及全局桶（空键 = 拿不到 IP 的平台）都不受影响。
-    try testing.expect(authThrottleAllow("203.0.113.8"));
-    try testing.expect(authThrottleAllow(""));
-}
-
-test "auth/throttle: 空键是独立桶，不会和「空位」混淆" {
-    // 空串既是全局桶的键，也是桶未使用时的初始状态。用 `key_len == 0` 判断
-    // 「空位」会让全局桶被第一个来源覆盖掉 —— 这条用例就是钉住 `used` 标志。
-    defer authThrottleReset();
-    authThrottleReset();
-
-    var i: usize = 0;
-    while (i < max_auth_retries) : (i += 1) {
-        try testing.expect(authThrottleAllow(""));
-        authThrottleFailure("");
-    }
-    try testing.expect(!authThrottleAllow("")); // 全局桶确实被锁
-    try testing.expect(authThrottleAllow("192.0.2.1")); // 有 IP 的来源另算
-}
-
-test "auth/throttle: 成功一次清零，之后重新攒满才锁" {
-    defer authThrottleReset();
-    authThrottleReset();
-
-    const ip = "198.51.100.4";
-    var i: usize = 0;
-    while (i < max_auth_retries - 1) : (i += 1) {
-        try testing.expect(authThrottleAllow(ip));
-        authThrottleFailure(ip);
-    }
-    authThrottleSuccess(ip);
-    // 清零后还能再失败满 5 次，第 6 次才锁 —— 证明计数真的归零了。
-    i = 0;
-    while (i < max_auth_retries) : (i += 1) {
-        try testing.expect(authThrottleAllow(ip));
-        authThrottleFailure(ip);
-    }
-    try testing.expect(!authThrottleAllow(ip));
-}
-
-test "auth/throttle: 锁定期满自动重新计数（Go `LoginCache` 过期语义）" {
-    defer authThrottleReset();
-    authThrottleReset();
-
-    const ip = "198.51.100.9";
-    var i: usize = 0;
-    while (i < max_auth_retries) : (i += 1) {
-        _ = authThrottleAllow(ip);
-        authThrottleFailure(ip);
-    }
-    try testing.expect(!authThrottleAllow(ip));
-
-    // 把锁定期拨到过去，模拟 5 分钟过去。不这样做就只能等真实的 5 分钟。
-    const now = rt.nowSeconds();
-    for (&login_throttle.buckets) |*b| {
-        if (b.used and std.mem.eql(u8, b.name(), ip)) b.locked_until = now - 1;
-    }
-    try testing.expect(authThrottleAllow(ip)); // 过期 ⇒ 放行
-    // 而且是**重新计数**，不是「剩 1 次」：再失败满 5 次才会锁。
-    i = 0;
-    while (i < max_auth_retries) : (i += 1) {
-        try testing.expect(authThrottleAllow(ip));
-        authThrottleFailure(ip);
-    }
-    try testing.expect(!authThrottleAllow(ip));
-}
-
-test "auth/throttle: 锁定期内继续尝试会续期（越试锁得越久）" {
-    // Go `LoginCache.Expire(ip, 5min)` 在锁定分支里**每次**都执行，所以持续
-    // 爆破会把锁定一直往后推。不续期的话锁定只是一个固定的 5 分钟窗口，
-    // 攻击者按节奏打就能拿到稳定的尝试配额。
-    defer authThrottleReset();
-    authThrottleReset();
-
-    const ip = "198.51.100.11";
-    var i: usize = 0;
-    while (i < max_auth_retries) : (i += 1) {
-        _ = authThrottleAllow(ip);
-        authThrottleFailure(ip);
-    }
-
-    // 把锁定期压到「只剩 100 秒」，再试一次。
-    const now = rt.nowSeconds();
-    for (&login_throttle.buckets) |*b| {
-        if (b.used and std.mem.eql(u8, b.name(), ip)) b.locked_until = now + 100;
-    }
-    try testing.expect(!authThrottleAllow(ip));
-
-    const after = rt.nowSeconds();
-    for (&login_throttle.buckets) |*b| {
-        if (b.used and std.mem.eql(u8, b.name(), ip)) {
-            // 续期到「当前 + 完整锁定时长」；±1 秒是时间戳跨秒的抖动。
-            try testing.expect(b.locked_until >= after + lock_duration_s - 1);
-            try testing.expect(b.locked_until <= after + lock_duration_s + 1);
-        }
-    }
-}
-
-test "auth/throttle: 表满淘汰最久未用的来源，内存有界" {
-    // 64 个桶、每个约 90 字节。表满了必须淘汰，否则「大量来源轮番爆破」会把
-    // 内存撑爆；同时淘汰顺序要稳定（LRU），不能随机丢掉正在锁定的桶。
-    defer authThrottleReset();
-    authThrottleReset();
-
-    var buf: [peeraddr.max_len]u8 = undefined;
-    var i: usize = 0;
-    while (i < throttle_buckets) : (i += 1) {
-        const key = try std.fmt.bufPrint(&buf, "10.0.{d}.1", .{i});
-        _ = authThrottleAllow(key);
-        authThrottleFailure(key);
-    }
-    // 第 65 个来源进来：所有桶的 `seen` 都在同一秒，LRU 取最早的那个（10.0.0.1）。
-    _ = authThrottleAllow("10.0.99.1");
-    authThrottleFailure("10.0.99.1");
-
-    // 被淘汰的来源从 0 重新计数：还能再试满 5 次。
-    i = 0;
-    while (i < max_auth_retries) : (i += 1) {
-        try testing.expect(authThrottleAllow("10.0.0.1"));
-        authThrottleFailure("10.0.0.1");
-    }
+    auth_mod.login_throttle.recordSuccess(""); // 复位，避免污染同进程其他用例
 }
 
 test "fs/get / returns the virtual root like Go" {
@@ -6640,7 +6101,7 @@ test "fs/get / returns the virtual root like Go" {
     defer fe.deinit();
     var app = routingApp(a, fe);
 
-    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const token = try auth_mod.mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const hdrs = try a.alloc(Header, 1);
     hdrs[0] = .{ .name = "Authorization", .value = auth };
@@ -6725,7 +6186,7 @@ test "tokens are standard three-part JWTs bound to the password version" {
         .frontend = undefined,
     };
 
-    const token = try mintTestToken(a, app.jwt_secret, "admin", 1000);
+    const token = try auth_mod.mintTestToken(a, app.jwt_secret, "admin", 1000);
 
     // A04：必须是**三段**标准 JWT，头部是 {"alg":"HS256","typ":"JWT"}。
     // 以前是私有两段 `payload.signature`，标准 JWT 解析器打不开。
@@ -6740,7 +6201,7 @@ test "tokens are standard three-part JWTs bound to the password version" {
 
     // 签名必须覆盖 "header.payload"（JWT 的规定），而不是只覆盖 payload。
     const signing_input = try std.fmt.allocPrint(a, "{s}.{s}", .{ h64, p64 });
-    const expect_sig = try hmacSha256(a, app.jwt_secret, signing_input);
+    const expect_sig = try auth_mod.hmacSha256(a, app.jwt_secret, signing_input);
     const got_sig = try b64UrlDecode(a, s64);
     try testing.expectEqualSlices(u8, &expect_sig, got_sig);
 
@@ -6771,12 +6232,12 @@ test "tokens are rejected for a different user or a tampered signature" {
     };
 
     // 换用户名 → 拒
-    try testing.expect(!(try authWith(a, &app, try mintTestToken(a, app.jwt_secret, "root", 1000))));
+    try testing.expect(!(try authWith(a, &app, try auth_mod.mintTestToken(a, app.jwt_secret, "root", 1000))));
     // 换口令版本 → 拒
-    try testing.expect(!(try authWith(a, &app, try mintTestToken(a, app.jwt_secret, "admin", 999))));
+    try testing.expect(!(try authWith(a, &app, try auth_mod.mintTestToken(a, app.jwt_secret, "admin", 999))));
 
     // 篡改签名（用别的密钥签）→ 拒
-    try testing.expect(!(try authWith(a, &app, try mintTestToken(a, "wrong-secret", "admin", 1000))));
+    try testing.expect(!(try authWith(a, &app, try auth_mod.mintTestToken(a, "wrong-secret", "admin", 1000))));
 
     // 结构不对（只有两段）→ 拒
     try testing.expect(!(try authWith(a, &app, "aaaa.bbbb")));
@@ -6798,14 +6259,14 @@ test "sign: Sign matches the Go HMAC format byte for byte" {
 
     try testing.expectEqualStrings(
         "m2Ujh34JCH5bNVHL36HjwKmbmg1HKeQZ8fEViuD4xlA=:0",
-        try signValue(a, secret, "/local/a.txt", 0),
+        try auth_mod.signValue(a, secret, "/local/a.txt", 0),
     );
     try testing.expectEqualStrings(
         "3o7DsCxwWhzlnSDZRENsu9rfNU38tdVFhu84CULfHPc=:0",
-        try signValue(a, secret, "/itvsh/dir/f.bin", 0),
+        try auth_mod.signValue(a, secret, "/itvsh/dir/f.bin", 0),
     );
     // 未来与过去的时间戳都只是字符串的一部分，签名本身都能算出来。
-    const future = try signValue(a, secret, "/local/a.txt", 4102444800);
+    const future = try auth_mod.signValue(a, secret, "/local/a.txt", 4102444800);
     try testing.expect(std.mem.endsWith(u8, future, ":4102444800"));
 }
 
@@ -6815,13 +6276,13 @@ test "sign: verifySign accepts a valid signature and rejects tampering" {
     const a = arena.allocator();
     var app = routingApp(a, try frontend_mod.initFromHtml(a, .{}, ""));
 
-    const good = try signValue(a, app.jwt_secret, "/local/a.txt", 0);
-    try verifySign(&app, a, "/local/a.txt", good);
+    const good = try auth_mod.signValue(a, app.jwt_secret, "/local/a.txt", 0);
+    try auth_mod.verifySign(&app, a, "/local/a.txt", good);
 
     // 路径被改一个字节 → ErrSignInvalid。
-    try testing.expectError(SignError.SignInvalid, verifySign(&app, a, "/local/b.txt", good));
+    try testing.expectError(auth_mod.SignError.SignInvalid, auth_mod.verifySign(&app, a, "/local/b.txt", good));
     // secret 不对 → 同样 ErrSignInvalid。
-    try testing.expectError(SignError.SignInvalid, verifySign(&app, a, "/local/a.txt", try signValue(a, "other", "/local/a.txt", 0)));
+    try testing.expectError(auth_mod.SignError.SignInvalid, auth_mod.verifySign(&app, a, "/local/a.txt", try auth_mod.signValue(a, "other", "/local/a.txt", 0)));
 }
 
 test "sign: verifySign reports Go's four expiry errors" {
@@ -6833,17 +6294,17 @@ test "sign: verifySign reports Go's four expiry errors" {
     // ⚠ 没有 ':' 时 Go 的 `LastIndex` 是 -1，`sign[0:]` 拿到的**是整个串**，
     // 于是"没有冒号"和"冒号后面不是数字"走到同一个分支 —— 都是 ExpireInvalid
     // 而不是 ExpireMissing。（早期这里按直觉判成 ExpireMissing，与上游不符。）
-    try testing.expectError(SignError.ExpireInvalid, verifySign(&app, a, "/x", "no-colon-here"));
+    try testing.expectError(auth_mod.SignError.ExpireInvalid, auth_mod.verifySign(&app, a, "/x", "no-colon-here"));
     // exp 不是数字 → ErrExpireInvalid。
-    try testing.expectError(SignError.ExpireInvalid, verifySign(&app, a, "/x", "abc:notanumber"));
+    try testing.expectError(auth_mod.SignError.ExpireInvalid, auth_mod.verifySign(&app, a, "/x", "abc:notanumber"));
     // ':' 在末尾 → exp 串为空 → ErrExpireMissing。
-    try testing.expectError(SignError.ExpireMissing, verifySign(&app, a, "/x", "abc:"));
+    try testing.expectError(auth_mod.SignError.ExpireMissing, auth_mod.verifySign(&app, a, "/x", "abc:"));
     // 空 sign → 同样 ExpireMissing。
-    try testing.expectError(SignError.ExpireMissing, verifySign(&app, a, "/x", ""));
+    try testing.expectError(auth_mod.SignError.ExpireMissing, auth_mod.verifySign(&app, a, "/x", ""));
     // exp 已过期（非 0）→ ErrSignExpired。
-    try testing.expectError(SignError.SignExpired, verifySign(&app, a, "/x", try signValue(a, app.jwt_secret, "/x", 1000000000)));
+    try testing.expectError(auth_mod.SignError.SignExpired, auth_mod.verifySign(&app, a, "/x", try auth_mod.signValue(a, app.jwt_secret, "/x", 1000000000)));
     // exp == 0 表示永不过期：远古时间戳也要能过。
-    try verifySign(&app, a, "/x", try signValue(a, app.jwt_secret, "/x", 0));
+    try auth_mod.verifySign(&app, a, "/x", try auth_mod.signValue(a, app.jwt_secret, "/x", 0));
 }
 
 test "sign: fs/get and fs/list fill a usable sign when sign_all is on" {
@@ -6855,8 +6316,8 @@ test "sign: fs/get and fs/list fill a usable sign when sign_all is on" {
     var app = routingApp(a, fe);
 
     // sign_all 默认 false：目录与文件都不签。
-    try testing.expectEqualStrings("", try signForObj(&app, a, false, "/local/a.txt"));
-    try testing.expectEqualStrings("", try signForObj(&app, a, true, "/local/dir"));
+    try testing.expectEqualStrings("", try auth_mod.signForObj(&app, a, false, "/local/a.txt"));
+    try testing.expectEqualStrings("", try auth_mod.signForObj(&app, a, true, "/local/dir"));
 
     // 打开开关。config 单例在测试里没有 load 过（可能是 null，也可能被别的
     // 测试 deinit 成悬空指针），所以 load 一份临时配置再注入。
@@ -6881,13 +6342,13 @@ test "sign: fs/get and fs/list fill a usable sign when sign_all is on" {
     tcfg.sign_all = true;
     tcfg.link_expiration = 0;
 
-    const s = try signForObj(&app, a, false, "/local/a.txt");
+    const s = try auth_mod.signForObj(&app, a, false, "/local/a.txt");
     try testing.expect(s.len > 0);
     try testing.expect(std.mem.endsWith(u8, s, ":0")); // link_expiration=0 → 不过期
     // 目录永远不签（Go common.Sign 的 obj.IsDir() 分支）。
-    try testing.expectEqualStrings("", try signForObj(&app, a, true, "/local/dir"));
+    try testing.expectEqualStrings("", try auth_mod.signForObj(&app, a, true, "/local/dir"));
     // 签出来的东西必须能验过 —— 否则前端拼上去也打不开。
-    try verifySign(&app, a, "/local/a.txt", s);
+    try auth_mod.verifySign(&app, a, "/local/a.txt", s);
 }
 
 test "sign: a '+' in the path survives /d/ verification (regression)" {
@@ -6918,13 +6379,13 @@ test "sign: a '+' in the path survives /d/ verification (regression)" {
 
     const path = "/ecloud_self/我的音乐/Trouble+Is+A+Friend.mp3";
     // 这就是服务端签出来的值（`signForObj` 在 link_expiration=0 下的形态）。
-    const good = try signForObj(&app, a, false, path);
+    const good = try auth_mod.signForObj(&app, a, false, path);
     try testing.expect(std.mem.endsWith(u8, good, ":0"));
-    try verifySign(&app, a, path, good);
+    try auth_mod.verifySign(&app, a, path, good);
 
     // 旧行为（把 '+' 折成空格）拿到的路径必须验不过 —— 这条断言就是 bug 本身。
     const folded = "/ecloud_self/我的音乐/Trouble Is A Friend.mp3";
-    try testing.expectError(SignError.SignInvalid, verifySign(&app, a, folded, good));
+    try testing.expectError(auth_mod.SignError.SignInvalid, auth_mod.verifySign(&app, a, folded, good));
 
     // 走 `downloadAuthError` 这道真正的门：解码后的路径（保留 `+`）+ 查询里
     // 的 sign ⇒ 放行。
@@ -6962,7 +6423,7 @@ test "sign: /d/ rejects a bad sign and accepts a good one" {
     defer config.setForTest(prev);
     tcfg.sign_all = true;
 
-    const good = try signValue(a, app.jwt_secret, "/local/a.txt", 0);
+    const good = try auth_mod.signValue(a, app.jwt_secret, "/local/a.txt", 0);
     const mk = struct {
         fn f(al: std.mem.Allocator, q: []const u8) http.Request {
             const hdrs = al.dupe(Header, &.{}) catch unreachable;
@@ -6991,7 +6452,7 @@ test "sign: /d/ rejects a bad sign and accepts a good one" {
     );
 
     // 换了路径（签名确实有效、只是签的不是这个文件）⇒ "sign invalid"
-    var req_other = mk(a, try std.fmt.allocPrint(a, "sign={s}", .{try signValue(a, app.jwt_secret, "/local/other.txt", 0)}));
+    var req_other = mk(a, try std.fmt.allocPrint(a, "sign={s}", .{try auth_mod.signValue(a, app.jwt_secret, "/local/other.txt", 0)}));
     try testing.expectEqual(
         @as(?DownloadAuthError, .sign_invalid),
         downloadAuthError(&app, &req_other, "/local/a.txt"),
@@ -7020,7 +6481,7 @@ test "sign: /d/ rejects a bad sign and accepts a good one" {
 
     // 过期时间在过去 ⇒ "sign expired"
     var req_expired = mk(a, try std.fmt.allocPrint(a, "sign={s}", .{
-        try signValue(a, app.jwt_secret, "/local/a.txt", 1),
+        try auth_mod.signValue(a, app.jwt_secret, "/local/a.txt", 1),
     }));
     try testing.expectEqual(
         @as(?DownloadAuthError, .sign_expired),
@@ -7055,7 +6516,7 @@ test "sign: /d/ is reachable without a token when the sign is valid" {
     tcfg.sign_all = true;
 
     // 造一个带 sign 的 /d/ 请求（无任何 Authorization 头）。
-    const good = try signValue(a, app.jwt_secret, "/local/a.txt", 0);
+    const good = try auth_mod.signValue(a, app.jwt_secret, "/local/a.txt", 0);
     const qs = try std.fmt.allocPrint(a, "sign={s}", .{good});
     const hdrs = try a.dupe(Header, &.{});
     var req = http.Request{
@@ -7114,7 +6575,7 @@ test "download: /d/ 先 FixAndCleanPath 再验签（对齐 PathParse → Down �
     tcfg.sign_all = true;
 
     // 签名按**清洗后**的路径签 —— 这就是上游 `common.Sign` 签的那串。
-    const good = try signValue(a, app.jwt_secret, "/local/a.txt", 0);
+    const good = try auth_mod.signValue(a, app.jwt_secret, "/local/a.txt", 0);
     var req = http.Request{
         .arena = a,
         .method = "GET",
@@ -7161,36 +6622,36 @@ test "fs/get raw_url: GenerateDownProxyURL 逐字节对齐上游" {
 
     var st = model.Storage{ .id = 1, .driver = "Local", .mount_path = "/local" };
     // 未配 down_proxy_url ⇒ 空串（fsread.go:319 据此回落本站 /p）。
-    try testing.expectEqualStrings("", try generateDownProxyURL(&app, a, &st, "/local/a.txt"));
+    try testing.expectEqualStrings("", try auth_mod.generateDownProxyURL(&app, a, &st, "/local/a.txt"));
 
     st.down_proxy_url = "http://down.example.com";
-    const with_sign = try generateDownProxyURL(&app, a, &st, "/local/a.txt");
+    const with_sign = try auth_mod.generateDownProxyURL(&app, a, &st, "/local/a.txt");
     // `?sign=` + sign.Sign(reqPath)（不看 sign_all）；路径用 EncodePath(true)。
     try testing.expect(std.mem.startsWith(u8, with_sign, "http://down.example.com/local/a.txt?sign="));
     const sig = with_sign["http://down.example.com/local/a.txt?sign=".len..];
-    try verifySign(&app, a, "/local/a.txt", sig);
+    try auth_mod.verifySign(&app, a, "/local/a.txt", sig);
 
-    // 钉住密钥：签名必须走 `signKey()`（`zig.token` 优先），不能是
+    // 钉住密钥：签名必须走 `auth_mod.signKey()`（`zig.token` 优先），不能是
     // `app.jwt_secret` —— 否则 `/p/` 验签（`verifySign` 也走 signKey）
     // 必然 SignInvalid。此前 webdav 的旧副本正是签错了钥匙。
     app.sign_secret = "proxy-secret";
-    const signed2 = try generateDownProxyURL(&app, a, &st, "/local/a.txt");
+    const signed2 = try auth_mod.generateDownProxyURL(&app, a, &st, "/local/a.txt");
     const pfx = "http://down.example.com/local/a.txt?sign=";
-    try verifySign(&app, a, "/local/a.txt", signed2[pfx.len..]);
+    try auth_mod.verifySign(&app, a, "/local/a.txt", signed2[pfx.len..]);
     app.sign_secret = "";
 
     // DisableProxySign ⇒ 不带 sign。
     st.disable_proxy_sign = true;
     try testing.expectEqualStrings(
         "http://down.example.com/local/a.txt",
-        try generateDownProxyURL(&app, a, &st, "/local/a.txt"),
+        try auth_mod.generateDownProxyURL(&app, a, &st, "/local/a.txt"),
     );
     // 多行只取第一行（strings.Split(s, "\n")[0]）。
     st.disable_proxy_sign = false;
     st.down_proxy_url = "http://a.example.com\nhttp://b.example.com";
     try testing.expect(std.mem.startsWith(
         u8,
-        try generateDownProxyURL(&app, a, &st, "/x.mp3"),
+        try auth_mod.generateDownProxyURL(&app, a, &st, "/x.mp3"),
         "http://a.example.com/x.mp3?sign=",
     ));
 }
@@ -7292,16 +6753,16 @@ test "sign: signPath 读 link_expiration（Strm withSign 与上游同形）" {
     defer config.setForTest(prev);
 
     tcfg.link_expiration = 0;
-    try testing.expect(std.mem.endsWith(u8, try signPath(&app, a, "/x.mp3"), ":0"));
+    try testing.expect(std.mem.endsWith(u8, try auth_mod.signPath(&app, a, "/x.mp3"), ":0"));
 
     tcfg.link_expiration = 2;
-    const s = try signPath(&app, a, "/x.mp3");
+    const s = try auth_mod.signPath(&app, a, "/x.mp3");
     try testing.expect(!std.mem.endsWith(u8, s, ":0"));
     // 签出来的必须能验过（now + 2h 未过期）。
-    try verifySign(&app, a, "/x.mp3", s);
+    try auth_mod.verifySign(&app, a, "/x.mp3", s);
     // sign_all 关闭时 signForObj 仍返回空串 —— 开关只在 common.Sign 那一层。
     tcfg.sign_all = false;
-    try testing.expectEqualStrings("", try signForObj(&app, a, false, "/x.mp3"));
+    try testing.expectEqualStrings("", try auth_mod.signForObj(&app, a, false, "/x.mp3"));
 }
 
 /// 直接驱动 `handle()`（含路由分发），返回响应。
@@ -7363,7 +6824,7 @@ test "storage admin CRUD round trip persists to cfg.json and remounts live" {
     config.setForTest(tcfg);
     defer config.setForTest(prev_cfg);
 
-    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const token = try auth_mod.mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const hdrs = try a.alloc(Header, 1);
     hdrs[0] = .{ .name = "Authorization", .value = auth };
@@ -7595,7 +7056,7 @@ test "driver list & info carry the Go Info shape the add/edit form renders" {
     defer fe.deinit();
     var app = routingApp(a, fe);
 
-    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const token = try auth_mod.mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const hdrs = try a.alloc(Header, 1);
     hdrs[0] = .{ .name = "Authorization", .value = auth };
@@ -7665,7 +7126,7 @@ test "setting save persists and setting delete resets a key to its default" {
     config.setForTest(tcfg);
     defer config.setForTest(prev_cfg);
 
-    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const token = try auth_mod.mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const hdrs = try a.alloc(Header, 1);
     hdrs[0] = .{ .name = "Authorization", .value = auth };
@@ -7734,10 +7195,10 @@ test "reset_token rotates zig.token, persists it, and invalidates old download l
     // 固定一个已知 token 并让 app 用它签名（模拟线上启动时的内存快照）。
     try tcfg.putZig("token", .{ .string = try tcfg.allocator().dupe(u8, "openlist-old-token") });
     app.sign_secret = "openlist-old-token";
-    const old_sign = try signValue(a, signKey(&app), "/local/a.txt", 0);
-    try verifySign(&app, a, "/local/a.txt", old_sign); // 旧密钥有效
+    const old_sign = try auth_mod.signValue(a, auth_mod.signKey(&app), "/local/a.txt", 0);
+    try auth_mod.verifySign(&app, a, "/local/a.txt", old_sign); // 旧密钥有效
 
-    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const token = try auth_mod.mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const hdrs = try a.alloc(Header, 1);
     hdrs[0] = .{ .name = "Authorization", .value = auth };
@@ -7760,9 +7221,9 @@ test "reset_token rotates zig.token, persists it, and invalidates old download l
     }
 
     // 旧链接立即失效（Go `sign.Instance()` 的效果），新密钥可用。
-    try testing.expectError(SignError.SignInvalid, verifySign(&app, a, "/local/a.txt", old_sign));
-    const new_sign = try signValue(a, signKey(&app), "/local/a.txt", 0);
-    try verifySign(&app, a, "/local/a.txt", new_sign);
+    try testing.expectError(auth_mod.SignError.SignInvalid, auth_mod.verifySign(&app, a, "/local/a.txt", old_sign));
+    const new_sign = try auth_mod.signValue(a, auth_mod.signKey(&app), "/local/a.txt", 0);
+    try auth_mod.verifySign(&app, a, "/local/a.txt", new_sign);
 }
 
 test "buildMountsFromConfig skips broken records but keeps them visible to the admin list" {
@@ -7836,35 +7297,10 @@ fn testConfig(alloc: std.mem.Allocator) !struct { prev: ?*config.Config, cfg: *c
     return .{ .prev = prev, .cfg = cfg, .tmp = tmp };
 }
 
-/// M14 之后**每枚测试令牌必须互不相同**。
-///
-/// `mintTestToken` 的 payload 只由 secret/user/pwd_ts/exp 决定，于是所有调用
-/// 方拿到的是**同一枚**令牌。M14 让 logout 真的作废出示的令牌之后，「登出」
-/// 测试会把并发运行的其它测试的令牌一起作废（Zig 测试执行器是并行的，
-/// 全局作废表是共享的）—— 表现为看似无关的测试突然 401。
-/// 这里给每枚令牌塞一个唯一 nonce，把它们的签名撑开。
-var g_test_token_seq = std.atomic.Value(u64).init(0);
-
-/// 带唯一 nonce 的测试令牌（payload 多一个 `nbf`，校验侧不看它）。
-fn mintTestTokenUnique(a: std.mem.Allocator, secret: []const u8, user: []const u8, pwd_ts: i64) ![]u8 {
-    const exp: i64 = 4102444800; // 2100-01-01, comfortably in the future
-    const nonce: i64 = @intCast(g_test_token_seq.fetchAdd(1, .monotonic));
-    const h64 = try b64Url(a, "{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
-    var payload = Buf.init(a);
-    try payload.append("{\"username\":");
-    try json.writeString(&payload, user);
-    try payload.print(",\"pwd_ts\":{d},\"exp\":{d},\"iat\":{d},\"nbf\":{d}}}", .{ pwd_ts, exp, nonce, nonce });
-    const p64 = try b64Url(a, payload.slice());
-    const signing_input = try std.fmt.allocPrint(a, "{s}.{s}", .{ h64, p64 });
-    const sig = try hmacSha256(a, secret, signing_input);
-    const s64 = try b64Url(a, &sig);
-    return std.fmt.allocPrint(a, "{s}.{s}", .{ signing_input, s64 });
-}
-
 /// 给测试签一枚当前有效的令牌。`routingApp` 里 `admin_hash` 为空（无法真登录），
 /// 所以认证路径的测试都靠直接签发令牌来走。
 fn testToken(a: std.mem.Allocator, app: *const App) ![]const u8 {
-    return mintTestTokenUnique(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    return auth_mod.mintTestTokenUnique(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
 }
 
 fn testAuth(a: std.mem.Allocator, app: *const App) ![]Header {
@@ -8028,7 +7464,7 @@ test "fs/list + fs/get 的 path 对齐 Go JoinBasePath（空串=根；.. → 403
     config.setForTest(tcfg);
     defer config.setForTest(prev_cfg);
 
-    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const token = try auth_mod.mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const hdrs = try a.alloc(Header, 1);
     hdrs[0] = .{ .name = "Authorization", .value = auth };
@@ -8086,7 +7522,7 @@ test "config/import+export: OpenList 备份格式 merge（新建→updated）+ �
     config.setForTest(tcfg);
     defer config.setForTest(prev_cfg);
 
-    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const token = try auth_mod.mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
     var hdrs = [_]Header{.{ .name = "Authorization", .value = try std.fmt.allocPrint(a, "Bearer {s}", .{token}) }};
 
     // ---- import #1：备份格式（disabled=true 跳过挂载构建，专注表操作）----
@@ -8171,7 +7607,7 @@ test "M12: fs/dirs returns a bare array of subdirectories (Go DirResp shape)" {
         .frontend = undefined,
     };
 
-    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const token = try auth_mod.mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const hdrs = try a.alloc(Header, 1);
     hdrs[0] = .{ .name = "Authorization", .value = auth };
@@ -8228,7 +7664,7 @@ test "M9: fs/list items carry hashinfo string and hash_info object" {
         .frontend = undefined,
     };
 
-    const token = try mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
+    const token = try auth_mod.mintTestToken(a, app.jwt_secret, app.admin_user, app.admin_pwd_ts);
     const auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token});
     const hdrs = try a.alloc(Header, 1);
     hdrs[0] = .{ .name = "Authorization", .value = auth };
@@ -8352,15 +7788,15 @@ test "M14: logout invalidates only the presented token" {
     const mint2 = struct {
         fn f(a_: std.mem.Allocator, secret: []const u8, user: []const u8, pwd_ts: i64, nbf: i64) ![]u8 {
             const exp: i64 = 4102444800; // 2100-01-01
-            const h64 = try b64Url(a_, "{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
+            const h64 = try auth_mod.b64Url(a_, "{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
             var payload = Buf.init(a_);
             try payload.append("{\"username\":");
             try json.writeString(&payload, user);
             try payload.print(",\"pwd_ts\":{d},\"exp\":{d},\"iat\":{d},\"nbf\":{d}}}", .{ pwd_ts, exp, nbf, nbf });
-            const p64 = try b64Url(a_, payload.slice());
+            const p64 = try auth_mod.b64Url(a_, payload.slice());
             const signing_input = try std.fmt.allocPrint(a_, "{s}.{s}", .{ h64, p64 });
-            const sig = try hmacSha256(a_, secret, signing_input);
-            const s64 = try b64Url(a_, &sig);
+            const sig = try auth_mod.hmacSha256(a_, secret, signing_input);
+            const s64 = try auth_mod.b64Url(a_, &sig);
             return std.fmt.allocPrint(a_, "{s}.{s}", .{ signing_input, s64 });
         }
     }.f;
@@ -8384,7 +7820,7 @@ test "M14: logout invalidates only the presented token" {
     // 签名为空 / 结构不对的令牌不会误伤（jwtSignatureOf 直接返回 null）
     const junk = try a.dupe(Header, &.{.{ .name = "Authorization", .value = "Bearer a.b" }});
     var junk_req = http.Request{ .arena = a, .method = "GET", .path = "/", .target = "/", .headers = junk };
-    try testing.expect(jwtSignatureOf(&junk_req) == null);
+    try testing.expect(auth_mod.jwtSignatureOf(&junk_req) == null);
 }
 
 test "N1: anonymous browsing stays closed unless zig.guest_browse is on" {

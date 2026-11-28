@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const api = @import("api.zig");
+const auth_mod = @import("auth.zig");
 const model = @import("model.zig");
 const client_mod = @import("client.zig");
 const cookiejar = @import("cookiejar.zig");
@@ -309,26 +310,26 @@ fn sshVerify(ctx: *anyopaque, a: std.mem.Allocator, user: []const u8, pw: []cons
     // 锁定期内直接拒绝，连哈希都不算（与 HTTP 登录的检查顺序一致）。
     // 锁定进入的那一下已经在 `api.recordFailure` 里告警过（带来源），
     // 这里只留 debug —— 逐次拒绝打日志，等于给扫描器一个刷日志的放大面。
-    if (!api.authThrottleAllow(peer)) {
+    if (!auth_mod.authThrottleAllow(peer)) {
         log.debug("ssh: auth refused — account locked (from {s})", .{if (peer.len == 0) "unknown" else peer});
         return false;
     }
 
     if (!std.mem.eql(u8, user, app.admin_user)) {
-        api.authThrottleFailure(peer);
+        auth_mod.authThrottleFailure(peer);
         return false;
     }
-    const h = api.twoHashPwd(a, pw, app.admin_salt) catch {
-        api.authThrottleFailure(peer);
+    const h = auth_mod.twoHashPwd(a, pw, app.admin_salt) catch {
+        auth_mod.authThrottleFailure(peer);
         return false;
     };
     // 与 HTTP 登录一致：用**恒定时间**比较。明文口令已经在客户端侧走完，
     // 这里比的是哈希，泄漏面比明文小得多，但没有理由和 HTTP 路径用两套。
     if (!api.ctEqual(h, app.admin_hash)) {
-        api.authThrottleFailure(peer);
+        auth_mod.authThrottleFailure(peer);
         return false;
     }
-    api.authThrottleSuccess(peer);
+    auth_mod.authThrottleSuccess(peer);
     return true;
 }
 
