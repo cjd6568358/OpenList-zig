@@ -1,8 +1,8 @@
 //! 存储管理面（/api/admin/storage/*）—— 自 api.zig 整体搬出
 //! （AUDIT-2026-11-27 路线图 #15-M3）。搬出为纯移动：存储 CRUD 七个
 //! handler、记录表 JSON 形状、load_all 后台重建与路由分发逐行未动；
-//! 挂载生命周期辅助（dupeStorage/buildMount*/republishWithEdit 等）仍留
-//! api.zig（M4 mounts 拆出时随迁），此处经别名调用。
+//! 挂载生命周期辅助（dupeStorage/buildMount*/republishWithEdit 等）已随
+//! M4 拆出至 mounts.zig，此处经别名调用。
 
 const std = @import("std");
 const http = @import("http.zig");
@@ -16,14 +16,15 @@ const rt = @import("rt.zig");
 const Buf = @import("util/buf.zig").Buf;
 
 const api = @import("api.zig");
+const mounts_mod = @import("mounts.zig");
 const App = api.App;
-const fixAndCleanPath = api.fixAndCleanPath;
-const dupeStorage = api.dupeStorage;
-const initErrText = api.initErrText;
-const buildMountFromStorage = api.buildMountFromStorage;
-const buildMountsFromConfig = api.buildMountsFromConfig;
-const republishWithEdit = api.republishWithEdit;
-const hasLiveMount = api.hasLiveMount;
+const fixAndCleanPath = mounts_mod.fixAndCleanPath;
+const dupeStorage = mounts_mod.dupeStorage;
+const initErrText = mounts_mod.initErrText;
+const buildMountFromStorage = mounts_mod.buildMountFromStorage;
+const buildMountsFromConfig = mounts_mod.buildMountsFromConfig;
+const republishWithEdit = mounts_mod.republishWithEdit;
+const hasLiveMount = mounts_mod.hasLiveMount;
 const handleDownload = api.handleDownload;
 const normalizeWebdavPolicy = api.normalizeWebdavPolicy;
 const parseBodyJson = api.parseBodyJson;

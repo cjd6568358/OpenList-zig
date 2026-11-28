@@ -23,6 +23,7 @@ const log = @import("log.zig");
 const http = @import("http.zig");
 const api = @import("api.zig");
 const auth_mod = @import("auth.zig");
+const mounts_mod = @import("mounts.zig");
 const client = @import("client.zig");
 const cookiejar = @import("cookiejar.zig");
 const List = @import("util/buf.zig").List;
@@ -364,7 +365,7 @@ fn buildMountsWorker(gpa: std.mem.Allocator, app: *api.App, cfg: *config.Config)
     const io = rt.io();
     app.storage_ops_lock.lockUncancelable(io);
     defer app.storage_ops_lock.unlock(io);
-    api.buildMountsFromConfig(gpa, app, cfg) catch |e| {
+    mounts_mod.buildMountsFromConfig(gpa, app, cfg) catch |e| {
         log.err("storage: background init failed: {s}", .{@errorName(e)});
     };
     if (app.mountsSnapshot().len == 0) {
@@ -803,10 +804,10 @@ test "fixAndCleanPath" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expectEqualStrings("/", try api.fixAndCleanPath(a, ""));
-    try testing.expectEqualStrings("/", try api.fixAndCleanPath(a, "/"));
-    try testing.expectEqualStrings("/nas", try api.fixAndCleanPath(a, "/nas/"));
-    try testing.expectEqualStrings("/a/b", try api.fixAndCleanPath(a, "//a//b"));
+    try testing.expectEqualStrings("/", try mounts_mod.fixAndCleanPath(a, ""));
+    try testing.expectEqualStrings("/", try mounts_mod.fixAndCleanPath(a, "/"));
+    try testing.expectEqualStrings("/nas", try mounts_mod.fixAndCleanPath(a, "/nas/"));
+    try testing.expectEqualStrings("/a/b", try mounts_mod.fixAndCleanPath(a, "//a//b"));
 }
 
 test "version string is non-empty" {
