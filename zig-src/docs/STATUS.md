@@ -13,19 +13,19 @@
 >   需要原文用 `git show 7356589e:<path>` 取回（见 §38.5）。
 > - **待办以 `TODO.md` 为准**；功能边界见 §22。
 >
-> **当前基线（2026-11-27；P0+P1 加固轮落地，见 §60.43–§60.44；SFTP 子系统见 §60.30–§60.42）**
+> **当前基线（2026-11-28；P0+P1 加固轮已部署生产，见 §60.43–§60.45；SFTP 子系统见 §60.30–§60.42）**
 >
 > | 项 | 值 |
 > |---|---|
 > | 单元测试 | 本机 Windows **569 pass + 5 skip**（574 总；§60.43 +8、§60.44 +6）；打包机 Linux 原生 **574/574（0 跳过）已复跑**（2026-11-28 f223f0d6，Windows 侧 5 条 skip 全部真实执行通过，含 http 滴灌超时用例的 Linux 首跑） |
 > | SFTP 服务端（SSH-2 + SFTP v3，`sftp.enable` 默认 false） | 五层落地：断点续传 / 双向 rekey / 按 IP 分桶限速（与 HTTP 共用）/ pre-auth 超时 + 64 并发上限；三客户端互通 + paramiko e2e；`--sftp-plain` 已删（§60.41） |
-> | 交叉编译（aarch64-linux-musl，`-Doptimize=small`） | 通过；**权威产物（打包机，TLS 补丁 std 口径）1,455,088 B / `62878FDD`**（2026-11-28 P0+P1 全量，**未部署**，本机按 §5 配方复现**逐字节相同**）；生产仍跑 11-02 的 1,443,624 B / `8fac3896`（§60.42），同口径较其 +11,464 B（+0.79%） |
+> | 交叉编译（aarch64-linux-musl，`-Doptimize=small`） | 通过；**权威产物（打包机，TLS 补丁 std 口径）1,455,088 B / `62878FDD`**（2026-11-28 P0+P1 全量，**已切生产**（§60.45，11-28 08:22 起，pid 7727）；本机按 §5 配方复现**逐字节相同**）；同口径较 11-02 前任 `8fac3896` +11,464 B（+0.79%） |
 > | 真机 e2e（光猫，13 挂载点） | **464 通过 / 0 失败 / 1 跳过**（跳过 = 坚果云根目录 403 服务商规则；2026-10-18 基线，本轮未重跑全量 e2e） |
 > | 真机无凭据回归（`driver_matrix.py`） | 默认产物 **27/27**；点名产物（+3 变体）**14/14** |
 > | 注册驱动 | **15 个注册项 / 12 个实现**（Quark+UC 共用 quarkuc.zig，thunder 出 3 个 factory），12/12 真机覆盖；**另 3 个变体（`123 Open`/`QuarkOpen`/`115 Open`）编译期可选**，见 §53 |
 > | 上游错误透传（`ctx.err_detail`） | **8 个驱动**（quarkuc/quark/itvsh/pan115/cloud189/cloud189pc/aliyundrive/wopan） |
 > | 下载签名密钥 | `zig.token`（对齐 Go 的 `token` 设置；`reset_token` 会作废旧链接） |
-| **光猫生产实例** | **Zig 版持久部署**（2026-10-19 起，15244）：`/opt/armbian/bin/openlist/openlist` + `config.zig.json`，开机自启走重写版 `openlist_start.sh`；Go sqfs 镜像已删（见 §47） |
+| **光猫生产实例** | **Zig 版持久部署**（2026-10-19 起，15244）：`/opt/armbian/bin/openlist/openlist`（现役 **62878FDD**，2026-11-28 §60.45 切入）+ `config.zig.json`，开机自启走重写版 `openlist_start.sh`；Go sqfs 镜像已删（见 §47） |
 > | CI（GitHub Actions `build_go_minimal.yml`） | 绿（4 构建 + sqfs + Release） |
 > | 已知 P1 缺口 | webdav SharePoint、189pc family_transfer/old 上传/torrent、local 缩略图、aliyun `Other(video_preview)` |
 
@@ -6085,11 +6085,11 @@ itvsh/189pc/pan123，单片 HTTP 失败直接 UploadFailed 整单报废。网络
 ### 验证边界（如实）
 
 * **本机 Windows 569 pass + 5 skip / 574 总，零泄漏零 crash**；
-* aarch64 交叉编译通过（数字见顶部基线表）；**未部署**，生产仍跑
-  `8fac3896`；
-* ~~打包机 Linux 原生复跑~~ 已完成（见下节 574/574）；真机隔离实例回归
-  （P0 三条新路径 + 本轮 thunder 弱网重试与 quarkuc 落盘频率观测）、
-  部署窗口两项待机主拍板。
+* aarch64 交叉编译通过（数字见顶部基线表）；~~未部署~~ **已于 2026-11-28
+  切入生产**（§60.45）；
+* ~~打包机 Linux 原生复跑~~ 已完成（见下节 574/574）；~~真机隔离实例回归
+  （P0 三条新路径 + 本轮 thunder 弱网重试与 quarkuc 落盘频率观测）、部署
+  窗口~~ 均已完成/落地（§60.45）。
 
 ### 打包机复跑与 88 B 漂移对账（2026-11-28，路线图 #14 闭环）
 
@@ -6114,5 +6114,57 @@ P1 六卡提交后推送 `f223f0d6`，连续完成打包机复跑与对账：
 * 踩坑记档：首次本机复现挂在 `ziglib_patch` —— `C:\zigcache` 父目录
   不存在而 `copytree` 不建中间目录；前置 mkdir 即解（复现脚本
   `.temp/build-local-patched.ps1` 已固化顺序，脚本本身幂等无问题）。
+
+---
+
+## 60.45 部署收口：62878FDD 隔离实例回归 + 生产切换（2026-11-28）
+
+机主拍板「先部署再动 P2」后执行：候选件先上隔离实例（15399，配置取
+生产 storages + `zig.max_proxy_body_mb=1` 压低阈值便于打边界），全部
+回归通过后切生产。
+
+### 隔离实例回归结论
+
+* **三条 P0 新路径真机全部验证通过**：
+  - **multipart 取消竞速（#1）**：init → 双线程 chunk 在飞中 abort →
+    服务存活（status 可查、settings 200），随后完整上传照常成功；
+  - **/p/ 上限闸（#4）**：2 MiB `.m3u8` vs cap=1 → **507**；64 KiB 对照
+    → **200 + 逐字节一致**（`.m3u8` 走 `proxy_types`（默认 `m3u8,url`）
+    的 canProxy 语义；普通扩展名在未开 `web_proxy` 的存储上 /p/ 回 403
+    `proxy not allowed` 属预期，初测误判为 FAIL）；
+  - **WebDAV COPY 闸（#5）**：PROPFIND 207 + COPY 2 MiB → **507**，服务端
+    日志 `2097152 bytes over zig.max_proxy_body_mb` 为证；
+* **quarkuc 落盘观测（#10）**：/quark + /uc 各 3 轮深列，cfg.json md5
+  逐字节不变（`3049515c…`）—— 去重层在真机生效；
+* **thunder（#13）**：重试封装 happy path 3 次上传全成；真弱网重试未
+  模拟（设备侧日志实拍 `HttpConnectionClosing` WARN，弱网真实存在）；
+* 初轮 5 条 FAIL 逐条甄别：/115（账号当日 12:32 在 115 生活_网页端
+  Chrome 主动退出）与 /thunder（`userinfo_expired`）在 8fac3896 生产上
+  同样 404（A/B 坐实**既有凭据态，非候选件回归**）；fs/get 3 秒可见性
+  延迟（ThunderWeb 最终一致）重验通过；md5 观测工具 bug 重测通过。
+* **工具坑记档**：`deploy_device.dd.sh` 返回**单字符串**（不同于
+  remote.py 的元组），误加 `[0]` 索引只得首字符 —— 曾让 md5 观测产出
+  「3」的假证据；一律改用 SFTP 读字节重测纠正。
+
+### 生产切换（08:21–08:22，流程照 openlist_start.sh 头部手册 + §60.42）
+
+* `remote.py --put` 上传 `openlist.new`（设备侧 sha256 = `62878fdd…59`
+  与打包机权威产物**全等**，1,455,088 B）→ 备份 `/tmp/openlist.prev` →
+  `openlist_start.sh stop`（pid 355）→ 同盘 `mv -f` → start，**pid 7727
+  attempt 1** 监听 15244；
+* 验证：进程恰 1 个不带 `(deleted)`；**13 mounts published 与切换前
+  （06:06 那次 boot）完全一致**（#18 115 Cloud、#19 ThunderExpert 为既有
+  凭据失效保持 errored）；**ThunderWeb 自动重登**（`web refresh_token
+  失效 → 手机号密码重登 → web login ok`）—— 驱动自愈路径真机验证；
+  GET / 200（内嵌外壳 4392 B）、public settings 200、/quark /thunderweb
+  /ecloud_self /wo /uc fs/list 全 200；PROPFIND /dav/ 401（WebDAV 只认
+  Basic，与隔离实例行为一致，属中间件正常响应）；
+* 收尾：验证后删 `/tmp/openlist.prev` 与 `/tmp/olz`；本机留档镜像
+  `D:/workspace/server/armbian/bin/openlist/` 已同步（二进制 1,455,088 B
+  + config 21,692 B —— thunderweb 重登后凭据已滚动，留档随之更新）。
+
+> 生产口径自此：**62878FDD（f223f0d6 树，P0×6 + P1×7 全量）**，较前任
+> 8fac3896 +11,464 B（+0.79%）。旧件可从 db9300bf 树经 build_remote.py
+> 复现，回滚流程见 openlist_start.sh 头部 ②。
 
 > AI生成
