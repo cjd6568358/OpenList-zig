@@ -86,6 +86,7 @@ const multipart = @import("multipart.zig");
 const auth_mod = @import("auth.zig");
 const storage_admin = @import("storage_admin.zig");
 const mounts_mod = @import("mounts.zig");
+const router_mod = @import("router.zig");
 
 pub const Header = model.Header;
 
@@ -537,346 +538,6 @@ pub fn notifyObjsUpdateAfterWrite(app: *App, a: std.mem.Allocator, mount: *Mount
     driver.notifyObjsUpdate(a, parent, objs);
 }
 
-pub fn handle(app: *App, req: *http.Request, res: *http.Response) !void {
-    // CORS preflight, so the frontend can be served from another origin.
-    if (std.mem.eql(u8, req.method, "OPTIONS")) {
-        try setCors(req, res);
-        const p = req.path;
-        // WebDAV capability advertisement needs the DAV header and must not be
-        // collapsed into the generic 204 preflight answer.
-        if (std.mem.eql(u8, p, "/dav") or std.mem.startsWith(u8, p, "/dav/")) {
-            return webdav.options(app, req, res);
-        }
-        res.setStatus(204);
-        return;
-    }
-    try setCors(req, res);
-
-    const p = req.path;
-
-    if (std.mem.eql(u8, p, "/ping")) return handlePing(res);
-    if (std.mem.eql(u8, p, "/api/public/settings")) return handlePublicSettings(app, res);
-    // Go 路由把这个接口放在 public 组；即使 Zig 当前没有离线下载任务管理器，
-    // 也必须返回成功的空工具列表，不能把前端能力探测打成 404。
-    if (std.mem.startsWith(u8, p, "/api/public/offline_download_tools")) return res.jsonOk("[]");
-    if (std.mem.eql(u8, p, "/api/public/archive_extensions")) return res.jsonOk("[\"zip\",\"tar\"]");
-    // Go 用 `/public/init_status` + `/public/init/setup` 做首次安装向导
-    // （server/router.go:105-106），**没有** `/auth/register`。前端 App.tsx
-    // 靠 `init_status` 决定是否跳 `/@init`，缺了它永远不会引导注册。
-    if (std.mem.eql(u8, p, "/api/public/init_status")) return handleInitStatus(app, req, res);
-    if (std.mem.eql(u8, p, "/api/public/init/setup")) return handleInitSetup(app, req, res);
-    if (std.mem.eql(u8, p, "/api/auth/login")) return handleLogin(app, req, res);
-    if (std.mem.eql(u8, p, "/api/auth/login/hash")) return handleLoginHash(app, req, res);
-    // ⚠️ Go **没有** `/api/auth/register` —— `server/router.go` 的 public 组只有
-    // settings / archive_extensions / init_status / init/setup。这里曾自造过一个，
-    // 现已删除：首次建管理员走 `/api/public/init/setup`，忘记密码走 CLI
-    // `openlist admin set NEW_PASSWORD` / `admin random`（见 docs/STATUS.md §11）。
-
-    // ---- frontend -------------------------------------------------------
-    //
-    // Everything here is unauthenticated, and deliberately so: the shell
-    // *contains* the login page, so requiring a token to fetch it would make
-    // the site unreachable. That is why this block sits before the auth gate in
-    // `handleAuthed`, mirroring how OpenList's `noRoute` handler sits outside
-    // its authenticated route group.
-    if (frontend_mod.isAssetPath(p)) return handleAsset(app, req, res);
-    if (std.mem.eql(u8, p, "/manifest.json")) return handleManifest(app, res);
-    // 内置 setup 页：本实现独有的手动入口，**先于**上游 shell 处理。
-    //
-    // 为什么需要它：配了 cdn/dist_dir 时前端是上游 SPA，而 CDN 取不到时
-    // 二进制直接拒绝启动（见 frontend.zig 的 `CdnIndexFetchFailed`）。
-    // 排查时往往只需要一个能看 `init_status`、能建管理员的页面，不该被
-    // 卡在"先修好 CDN"上。路径用 `@zig-setup` 而不是 `@init` —— 后者是
-    // 上游前端自己的安装向导路由，抢过来会让正常部署行为错乱。
-    if (std.mem.eql(u8, p, frontend_mod.Frontend.setup_path_suffix)) {
-        try res.set("Content-Type", "text/html; charset=utf-8");
-        return res.write(app.frontend.setupHtml());
-    }
-    // Upstream mounts a WebDAV server at /dav/. This build implements it — see
-    // webdav.zig — so route there instead of letting the catch-all answer a
-    // PROPFIND with the SPA shell (a 200 carrying HTML is far harder to
-    // diagnose than a proper multistatus).
-    if (std.mem.eql(u8, p, "/dav") or std.mem.startsWith(u8, p, "/dav/")) {
-        return webdav.handle(app, req, res);
-    }
-
-    // ---- authenticated API ----------------------------------------------
-    // Only the known authenticated prefixes reach `handleAuthed`; any other
-    // /api/* path falls through to the 404 catch-all below (matching upstream,
-    // which answers an unregistered API route with JSON 404, not 401).
-    // CLI（`openlist admin set/random`）改完配置文件后调它做热重载。它用
-    // `zig.token`（`openlist admin token` 可查）认证、**不是** JWT，所以必须
-    // 拦在 `handleAuthed` 前面 —— 对齐 Go：`cmd/user.go:DelUserCacheOnline`
-    // 也是拿 settings 表的 token 去 POST `/api/admin/user/del_cache`。
-    if (std.mem.eql(u8, p, "/api/admin/user/del_cache")) return handleDelUserCache(app, req, res);
-
-    if (std.mem.startsWith(u8, p, "/api/fs/")) return handleAuthed(app, req, res);
-    // `/api/me` 与 `/api/me/update`（Profile 页改资料）都走这里。
-    // 用前缀而不是精确匹配，否则新加的 `me/update` 会被上面的白名单漏掉、
-    // 落到 404 catch-all —— 实测踩过。
-    if (std.mem.startsWith(u8, p, "/api/me")) return handleAuthed(app, req, res);
-    if (std.mem.eql(u8, p, "/api/auth/logout")) return handleAuthed(app, req, res);
-    if (std.mem.startsWith(u8, p, "/api/admin/")) return handleAuthed(app, req, res);
-    if (std.mem.startsWith(u8, p, "/api/task/")) return handleAuthed(app, req, res);
-    // ⚠️ 下载路由**不能**走 `handleAuthed`：那里面第一件事就是 `checkAuth`，
-    // 而 `?sign=` 下载压根不带 `Authorization` 头 —— 会在进到
-    // `handleDownload` 里的签名校验之前就被 401 拦下（真机实测：sign 生成了、
-    // 也正确，但 /d/ 恒 401，日志里连一条 "sign rejected" 都没有）。
-    //
-    // 对齐 Go：`/d/`、`/p/` 挂在 Down 中间件（`server/middlewares/down.go`）
-    // 上，与 auth 中间件是两条独立的链；sign 通过即放行，失败才回落 token。
-    if (std.mem.startsWith(u8, p, "/d/")) return handleDownload(app, req, res, false);
-    if (std.mem.startsWith(u8, p, "/p/")) return handleDownload(app, req, res, true);
-
-    // Catch-all = OpenList 的 NoRoute（server/router.go:116-118 →
-    // server/static/static.go:213-227）。上游的行为是：
-    //   * 方法不是 GET/POST  ⇒ **405**（`c.Status(405)`，无正文）；
-    //   * 否则               ⇒ 200 + `Content-Type: text/html` + 前端 shell。
-    // 注意 405 这一支是 2026-10-17 读源码时才确认的：早先的注释凭"实测
-    // PUT 也是 200"把它判成未对齐，实际是当时没走到这条分支。
-    //
-    // 2026-10-30 起 `/api/*` 未注册路径改为 **501 JSON**（`noRoute` 内），
-    // 不再回落 HTML 外壳 —— 见 `noRoute` 上的理由。
-    return noRoute(app, req, res, p);
-}
-
-/// Go `static.Static` 里注册进 `e.NoRoute` 的那个 handler，逐条对齐。
-/// 返回给 `handle` / `handleAuthed` 两处共用（未注册路径都落到这里）。
-///
-/// ★ 2026-10-30 引入一处**刻意偏差**：`/api/*` 未注册路径不再回落 HTML 外壳，
-/// 改为 **501 JSON**。理由：上游的 NoRoute 对 `/api/*` 返回 200 + index.html，
-/// 前端会把 HTML 当 JSON 解析后静默降级 —— 网页端上传那次
-/// `multipart init failed: network error`（STATUS §55）就是这么被掩盖的：
-/// 真问题（路由不存在）被包装成了"网络错误"。宁可明说"没实现"。
-/// `/api/` 之外（前端 SPA 路由、静态资源）维持上游行为不变。
-pub fn noRoute(app: *App, req: *http.Request, res: *http.Response, p: []const u8) !void {
-    if (std.mem.startsWith(u8, p, "/api/")) {
-        const msg = std.fmt.allocPrint(
-            res.arena,
-            "not implemented: {s} {s}",
-            .{ req.method, p },
-        ) catch "not implemented";
-        // 注意用**真实** HTTP 501，不能走 `jsonError` —— 后者对齐 Go 的
-        // `c.JSON(200, …)` 恒回 HTTP 200（见 http.zig jsonError 注释），
-        // 而这里恰恰要让状态码本身说明问题（curl/脚本一眼可见，前端 axios
-        // 走错误分支也能拿到 message）。
-        res.status = 501;
-        try res.set("Content-Type", "application/json; charset=utf-8");
-        try res.buf.append("{\"code\":501,\"message\":");
-        try json.writeString(&res.buf, msg);
-        try res.buf.append(",\"data\":null}");
-        return;
-    }
-    if (!std.mem.eql(u8, req.method, "GET") and !std.mem.eql(u8, req.method, "POST")) {
-        res.setStatus(405);
-        return;
-    }
-    // 上游是 `c.Header("Content-Type", "text/html")` —— **不带** charset
-    // （shell 自带 `<meta charset="utf-8">`）。
-    try res.set("Content-Type", "text/html");
-    try res.write(app.frontend.htmlFor(p));
-}
-
-/// 该路径是否为**已注册的**受保护 API 端点（≈ Go 的 gin 路由表）。
-/// 未注册 → `noRoute`：2026-10-30 起对 `/api/*` 返回 **501 JSON**（见
-/// `noRoute` 的注释），`/api/` 之外仍是前端 shell（200 HTML）。
-/// ⚠ 新增端点时必须同步这里（以及下面的 dispatch），否则未登录访问新
-/// 端点会拿到 501。块级粒度（`admin/storage/` 的内部子操作由
-/// handler 自己校验），比 gin 的逐路由粒度略粗，边角差异见 STATUS §35。
-fn isRegisteredAuthedPath(p: []const u8) bool {
-    const exact = [_][]const u8{
-        "/api/fs/list",           "/api/fs/get",            "/api/fs/dirs",
-        "/api/fs/mkdir",          "/api/fs/rename",         "/api/fs/move",
-        "/api/fs/copy",           "/api/fs/remove",         "/api/fs/put",
-        "/api/fs/archive/list",   "/api/me",                "/api/me/update",
-        "/api/auth/logout",       "/api/admin/storage",     "/api/admin/driver/names",
-        "/api/admin/driver/list", "/api/admin/driver/info",
-    };
-    for (exact) |e| {
-        if (std.mem.eql(u8, p, e)) return true;
-    }
-    // 分片上传（init/chunk/complete/status/abort）。
-    if (std.mem.startsWith(u8, p, "/api/fs/multipart/")) return true;
-    if (std.mem.startsWith(u8, p, "/api/admin/storage/")) return true;
-    if (std.mem.startsWith(u8, p, "/api/admin/setting/")) return true;
-    if (std.mem.startsWith(u8, p, "/api/admin/config/")) return true;
-    if (std.mem.startsWith(u8, p, "/api/task/")) return true;
-    return false;
-}
-
-/// The authenticated API surface. Reached only through `handle`, which has
-/// already dealt with the frontend and the public endpoints.
-fn handleAuthed(app: *App, req: *http.Request, res: *http.Response) !void {
-    const p = req.path;
-
-    // Go 的 NoRoute（gin）：未注册的路径（含"前缀像已注册、端点不存在"）
-    // 直接回落前端 shell —— 实测生产实例 `POST /api/nonexistent` 是 200 +
-    // index.html，**不看登录状态**（NoRoute 挂在路由表外）。
-    // ⚠ 2026-10-30 起对 `/api/*` 刻意偏差为 501 JSON（HTML 外壳会把真问题
-    // 掩盖成"network error"，见 STATUS §55）；`/api/` 之外维持上游行为。
-    if (!isRegisteredAuthedPath(p)) return noRoute(app, req, res, p);
-
-    // The download routes also accept a per-file sign rather than a token; see
-    // `checkAuth` and docs/STATUS.md.
-    var authed = try checkAuth(app, req);
-    // N1：显式开启 `zig.guest_browse` 且请求**完全没有带令牌**时，只读端点
-    // 按游客放行（对齐 Go `Auth(true)` 的 guest 分支）。
-    if (!authed and isGuestReadRequest(app, req, p)) authed = true;
-    // 文案对齐 Go 鉴权中间件（server/middlewares/auth.go:41）——
-    // "Guest user is disabled, login please"（实测生产匿名请求逐字）。
-    if (!authed) return res.jsonError(401, "Guest user is disabled, login please");
-
-    if (std.mem.eql(u8, p, "/api/fs/list")) return handleFsList(app, req, res);
-    if (std.mem.eql(u8, p, "/api/fs/get")) return handleFsGet(app, req, res);
-    if (std.mem.eql(u8, p, "/api/fs/dirs")) return handleFsDirs(app, req, res);
-    if (std.mem.eql(u8, p, "/api/fs/mkdir")) return handleFsMkdir(app, req, res);
-    if (std.mem.eql(u8, p, "/api/fs/rename")) return handleFsRename(app, req, res);
-    if (std.mem.eql(u8, p, "/api/fs/move")) return handleFsMove(app, req, res);
-    if (std.mem.eql(u8, p, "/api/fs/copy")) return handleFsCopy(app, req, res);
-    if (std.mem.eql(u8, p, "/api/fs/remove")) return handleFsRemove(app, req, res);
-    if (std.mem.eql(u8, p, "/api/fs/put")) return handleFsPut(app, req, res);
-    if (std.mem.startsWith(u8, p, "/api/fs/multipart/")) return multipart.handleMultipart(app, req, res, p);
-    if (std.mem.eql(u8, p, "/api/fs/archive/list")) return handleFsArchiveList(app, req, res);
-
-    // Admin surface (single-admin build: every authenticated user is the admin).
-    if (std.mem.eql(u8, p, "/api/me")) return handleMe(app, req, res);
-    // Profile 页的「修改资料」表单（改用户名 / 改密码）。
-    // 对齐 Go `server/router.go:76` 的 `auth.POST("/me/update", handles.UpdateCurrent)`
-    // —— 之前漏了，前端 Profile 页点保存会 404。
-    if (std.mem.eql(u8, p, "/api/me/update")) return handleMeUpdate(app, req, res);
-    // 管理页的登出。对齐 Go `auth.GET("/auth/logout", handles.LogOut)`。
-    if (std.mem.eql(u8, p, "/api/auth/logout")) return handleLogout(app, req, res);
-    // 存储管理面：`/api/admin/storage`（=list）与 `/list|/get|/create|/update|/delete|/enable|/disable|/load_all`
-    // 共用前缀分发。对齐 Go `server/router.go:140-148` 的路由表。
-    if (std.mem.eql(u8, p, "/api/admin/storage") or std.mem.startsWith(u8, p, "/api/admin/storage/")) {
-        return storage_admin.handleAdminStorageRoute(app, req, res, p["/api/admin/storage".len..]);
-    }
-    if (std.mem.eql(u8, p, "/api/admin/config/export")) return handleConfigExport(app, req, res);
-    if (std.mem.eql(u8, p, "/api/admin/config/import")) return handleConfigImport(app, req, res);
-    if (std.mem.eql(u8, p, "/api/admin/driver/names")) return handleDriverNames(req, res);
-    if (std.mem.eql(u8, p, "/api/admin/driver/list")) return handleDriverList(req, res);
-    if (std.mem.eql(u8, p, "/api/admin/driver/info")) return handleDriverInfo(req, res);
-    if (std.mem.startsWith(u8, p, "/api/admin/setting/")) return handleSettingRoute(app, req, res, p["/api/admin/setting/".len..]);
-    if (std.mem.startsWith(u8, p, "/api/task/")) return handleTaskRoute(req, res, p["/api/task/".len..]);
-
-    if (std.mem.startsWith(u8, p, "/d/")) return handleDownload(app, req, res, false);
-    if (std.mem.startsWith(u8, p, "/p/")) return handleDownload(app, req, res, true);
-
-    // 不可达（`isRegisteredAuthedPath` 已过滤）；保险起见仍回落 shell，
-    // 保证"新增端点忘了同步清单"时给出可诊断的行为而不是 404。
-    return noRoute(app, req, res, p);
-}
-
-/// Serve one of the four frontend asset prefixes, either from `dist_dir` or by
-/// redirecting to the CDN. See `frontend.zig` for the branch selection.
-fn handleAsset(app: *App, req: *http.Request, res: *http.Response) !void {
-    if (!std.mem.eql(u8, req.method, "GET") and !std.mem.eql(u8, req.method, "HEAD")) {
-        res.setStatus(405);
-        return;
-    }
-    // M03：传请求级 arena，别让静态资源请求往进程级 arena 里堆东西。
-    switch (app.frontend.asset(req.arena, req.path, req.target)) {
-        .redirect => |to| {
-            res.setStatus(302);
-            try res.set("Location", to);
-        },
-        .local => |f| {
-            const file = std.Io.Dir.cwd().openFile(rt.io(), f.path, .{}) catch |e| {
-                log.warn("frontend: cannot open {s}: {s}", .{ f.path, @errorName(e) });
-                return res.jsonError(404, "not found");
-            };
-            try res.set("Content-Type", mimeFor(f.path));
-            // Six months, as upstream sets for these four prefixes: the
-            // frontend build content-hashes the filenames.
-            try res.set("Cache-Control", "public, max-age=15552000");
-            res.sendFile(file, f.size);
-        },
-        // No `dist_dir` and no `cdn`: nothing backs these prefixes. Returning
-        // the shell here would turn a missing asset into an HTML parse error
-        // buried in the browser console, so say what is wrong instead.
-        .missing => {
-            res.setStatus(404);
-            try res.set("Content-Type", "text/plain; charset=utf-8");
-            try res.write("no frontend build available: set dist_dir or cdn in config.json\n");
-        },
-    }
-}
-
-fn handleManifest(app: *App, res: *http.Response) !void {
-    try res.set("Content-Type", "application/json");
-    try res.set("Cache-Control", "public, max-age=3600");
-    try res.write(app.frontend.manifest_json);
-}
-
-/// CORS 响应头（Go `server/router.go:255-260` 的 gin cors 中间件）。
-///
-/// 默认（`cors.allow_*` 缺省 / 全 `["*"]`）：维持通配行为 —— origin 发 `*`，
-/// method/header 发固定列表（前端跨域预检一直这么工作，不改）。
-/// 用户在 config.json 显式配了列表 → 按列表来：
-///   * origin 不含 `*`：仅当请求 Origin 命中才回显它（+ `Vary: Origin`），
-///     否则不加头（浏览器拒绝）—— 与 gin-contrib/cors 同语义；
-///   * method / header 不含 `*`：逗号 join 成响应值。
-fn setCors(req: *http.Request, res: *http.Response) !void {
-    const a = req.arena;
-    const cfg = config.getOpt();
-
-    const origins: []const []const u8 = if (cfg) |c| c.cors_allow_origins else &[_][]const u8{"*"};
-    if (listHas(origins, "*")) {
-        try res.set("Access-Control-Allow-Origin", "*");
-    } else if (req.header("Origin")) |org| {
-        if (listHas(origins, org)) {
-            try res.set("Access-Control-Allow-Origin", org);
-            try res.set("Vary", "Origin");
-        }
-    }
-
-    // M15（审计）：Go 的三项默认都是 `["*"]`（`internal/conf/config.go:227-231`），
-    // 而 gin-contrib/cors v1.7.7 只是 `strings.Join(normalize(list), ",")`
-    // （utils.go:29-43）⇒ 默认值下发的是**字面的 `*`**，不是展开的列表。
-    //
-    // 以前这里把 `*` 展开成固定列表：Methods 缺 PATCH/HEAD；Allow-Headers 只有
-    // 4 个，浏览器 WebDAV 预检带的 `Depth` / `Destination` / `Overwrite`
-    // 直接被拒 ⇒ 浏览器里的 WebDAV 客户端用不了。现在照抄上游：列表本身
-    // 原样 join，`["*"]` 就输出 `*`。
-    //
-    // 附带对齐 `convert(..., strings.ToUpper)`：Methods 值转大写。
-    const methods: []const []const u8 = if (cfg) |c| c.cors_allow_methods else &[_][]const u8{"*"};
-    try res.set("Access-Control-Allow-Methods", try joinListUpper(a, methods));
-
-    const headers: []const []const u8 = if (cfg) |c| c.cors_allow_headers else &[_][]const u8{"*"};
-    try res.set("Access-Control-Allow-Headers", try joinList(a, headers));
-}
-
-/// 逗号 join，方法名转大写（gin-contrib `convert(normalize(list), strings.ToUpper)`）。
-fn joinListUpper(a: std.mem.Allocator, list: []const []const u8) ![]const u8 {
-    var b = Buf.init(a);
-    for (list, 0..) |s, i| {
-        if (i > 0) try b.appendByte(',');
-        const up = try a.alloc(u8, s.len);
-        for (s, 0..) |c, j| up[j] = std.ascii.toUpper(c);
-        try b.append(up);
-    }
-    return b.toOwned();
-}
-
-fn listHas(list: []const []const u8, needle: []const u8) bool {
-    for (list) |s| if (std.mem.eql(u8, s, needle)) return true;
-    return false;
-}
-
-fn joinList(a: std.mem.Allocator, list: []const []const u8) ![]const u8 {
-    var b = Buf.init(a);
-    for (list, 0..) |s, i| {
-        if (i > 0) try b.appendByte(',');
-        try b.append(s);
-    }
-    return b.toOwned();
-}
-
-fn handlePing(res: *http.Response) !void {
-    try res.set("Content-Type", "text/plain");
-    try res.write("pong");
-}
 
 // ---------------------------------------------------------------------------
 // Public settings / auth
@@ -997,7 +658,7 @@ fn publicSettingValue(app: *const App, item: PublicSetting) []const u8 {
 /// 之前只返回 10 个自造字段（`initial_done`/`api`/`cdn`/`token_expires_in`…），
 /// 前端真正读的 30 多个键一个都没有 —— 表现就是首页 `logo` 拿到空串、
 /// `<img src="">`。现在按 Go 的字段集补齐。
-fn handlePublicSettings(app: *App, res: *http.Response) !void {
+pub fn handlePublicSettings(app: *App, res: *http.Response) !void {
     const a = res.arena;
     var b = Buf.init(a);
     try b.append("{\"code\":200,\"message\":\"success\",\"data\":{");
@@ -1022,7 +683,7 @@ fn handlePublicSettings(app: *App, res: *http.Response) !void {
 /// 而这个请求的**失败回调在源码里被注释掉了**（静默吞错），`initialized` 于是
 /// 保持 `createSignal(true)` 的默认值 —— 端点缺失（404）时前端**永远不会**引导
 /// 注册，表现就是"没有注册入口，只能用已有账号登录"。
-fn handleInitStatus(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleInitStatus(app: *App, req: *http.Request, res: *http.Response) !void {
     if (!std.mem.eql(u8, req.method, "GET") and !std.mem.eql(u8, req.method, "POST")) {
         return res.jsonError(405, "method not allowed");
     }
@@ -1040,7 +701,7 @@ fn handleInitStatus(app: *App, req: *http.Request, res: *http.Response) !void {
 /// `POST /api/public/init/setup` —— 对齐 Go `server/handles/setup.go:37`。
 /// 只在未初始化时可调；成功后**不签发 token**（Go 只回 `data:null`，前端注册完
 /// 会自己再走一次登录）。
-fn handleInitSetup(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleInitSetup(app: *App, req: *http.Request, res: *http.Response) !void {
     if (!std.mem.eql(u8, req.method, "POST")) return res.jsonError(405, "method not allowed");
     // 已初始化 ⇒ 拒绝（Go：`system has already been initialized`）。此读在
     // 闸门之前：闸门只管「hash 为空」的竞速窗口；两个并发请求都见到空以后，
@@ -1129,7 +790,7 @@ fn handleInitSetup(app: *App, req: *http.Request, res: *http.Response) !void {
 /// （路由见 `server/router.go:136`），由 CLI 在改完管理员凭据后调用，让在线
 /// 服务丢掉内存里的凭据副本、无需重启。认证用 `zig.token`
 /// （`openlist admin token` 可查看），语义对齐 Go 用 settings 表里的 token。
-fn handleDelUserCache(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleDelUserCache(app: *App, req: *http.Request, res: *http.Response) !void {
     if (!std.mem.eql(u8, req.method, "POST")) return res.jsonError(405, "method not allowed");
     const cfg = config.get();
     const expected = if (cfg.raw("zig.token")) |v| (v.asStr() orelse "") else "";
@@ -1146,7 +807,7 @@ fn handleDelUserCache(app: *App, req: *http.Request, res: *http.Response) !void 
 }
 
 /// `POST /api/auth/login` —— 收**明文**口令（Go 里标了 Deprecated 但仍可用）。
-fn handleLogin(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleLogin(app: *App, req: *http.Request, res: *http.Response) !void {
     return loginCommon(app, req, res, false);
 }
 
@@ -1156,7 +817,7 @@ fn handleLogin(app: *App, req: *http.Request, res: *http.Response) !void {
 ///
 /// ⚠️ 这个端点曾经缺失，导致前端登录恒失败 —— curl 直接打 `/auth/login`
 /// 是通的，所以「用 curl 验证过」并不等于「前端能登录」。
-fn handleLoginHash(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleLoginHash(app: *App, req: *http.Request, res: *http.Response) !void {
     return loginCommon(app, req, res, true);
 }
 
@@ -1272,7 +933,7 @@ fn isAdminApiToken(req: *http.Request) bool {
 ///   * **只认「完全没带令牌」**。带了 Authorization / `?token=` 却校验失败的
 ///     是"凭据错误"，不是"匿名访问"，照旧 401 —— 否则过期令牌比匿名更好用。
 ///   * **只放开只读端点**（列目录 / 取详情）。游客身份下任何写操作仍 401。
-fn isGuestReadRequest(app: *const App, req: *http.Request, p: []const u8) bool {
+pub fn isGuestReadRequest(app: *const App, req: *http.Request, p: []const u8) bool {
     _ = app;
     if (req.header("Authorization") != null) return false;
     if (req.queryGet("token") != null) return false;
@@ -1286,7 +947,7 @@ fn isGuestReadRequest(app: *const App, req: *http.Request, p: []const u8) bool {
 
 /// Accepts either `Authorization: Bearer <jwt>` or a `?token=` query param
 /// (the browser needs the latter for `<video src>`).
-fn checkAuth(app: *App, req: *http.Request) !bool {
+pub fn checkAuth(app: *App, req: *http.Request) !bool {
     // M13（审计）：Go 鉴权中间件的**第一分支**是 admin token
     // （server/middlewares/auth.go:19-31）—— `Authorization` 头**整体**（不剥
     // `Bearer `）与 `setting.GetStr(conf.Token)` 做常量时间比较，命中即视为
@@ -1369,7 +1030,7 @@ fn checkAuth(app: *App, req: *http.Request) !bool {
 ///     不是 `{"content":[...]}`。
 ///   * 根路径的 name/modified 与 `fs/list` 根条目同源（挂载路径 / 存储的
 ///     modified —— Go `getStorageVirtualFilesByPath` 用 `Storage.Modified`）。
-fn handleFsDirs(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleFsDirs(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const v = try parseBodyJson(a, req, res) orelse return;
     const raw_path = v.strAt("path") orelse "/";
@@ -1408,7 +1069,7 @@ fn handleFsDirs(app: *App, req: *http.Request, res: *http.Response) !void {
     try res.jsonOkRaw(b.slice());
 }
 
-fn handleFsList(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleFsList(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const v = try parseBodyJson(a, req, res) orelse return;
     const raw_path = v.strAt("path") orelse "/";
@@ -1566,7 +1227,7 @@ fn trimOneSlash(s: []const u8) []const u8 {
     return if (std.mem.endsWith(u8, s, "/")) s[0 .. s.len - 1] else s;
 }
 
-fn handleFsGet(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleFsGet(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const v = try parseBodyJson(a, req, res) orelse return;
     const raw_path = v.strAt("path") orelse "/";
@@ -1730,7 +1391,7 @@ fn isPlainFileName(name: []const u8) bool {
         std.mem.indexOfScalar(u8, name, '\\') == null;
 }
 
-fn handleFsMkdir(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleFsMkdir(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const v = try parseBodyJson(a, req, res) orelse return;
     const path = v.strAt("path") orelse return res.jsonError(400, "path is required");
@@ -1742,7 +1403,7 @@ fn handleFsMkdir(app: *App, req: *http.Request, res: *http.Response) !void {
 
 /// `POST /api/fs/copy` —— 与 `move` 同形，但把条目**复制**到目标目录（保留原名）。
 /// 驱动没有 copy 能力时返回 501（`NotSupported`）。
-fn handleFsCopy(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleFsCopy(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const v = try parseBodyJson(a, req, res) orelse return;
     const src_dir = v.strAt("src_dir") orelse return res.jsonError(400, "src_dir is required");
@@ -1768,7 +1429,7 @@ fn handleFsCopy(app: *App, req: *http.Request, res: *http.Response) !void {
     try res.jsonOk("null");
 }
 
-fn handleFsRename(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleFsRename(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const v = try parseBodyJson(a, req, res) orelse return;
     const path = v.strAt("path") orelse return res.jsonError(400, "path is required");
@@ -1782,7 +1443,7 @@ fn handleFsRename(app: *App, req: *http.Request, res: *http.Response) !void {
     try res.jsonOk("null");
 }
 
-fn handleFsMove(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleFsMove(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const v = try parseBodyJson(a, req, res) orelse return;
     const src_dir = v.strAt("src_dir") orelse return res.jsonError(400, "src_dir is required");
@@ -1809,7 +1470,7 @@ fn handleFsMove(app: *App, req: *http.Request, res: *http.Response) !void {
     try res.jsonOk("null");
 }
 
-fn handleFsRemove(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleFsRemove(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const v = try parseBodyJson(a, req, res) orelse return;
     const dir = v.strAt("dir") orelse return res.jsonError(400, "dir is required");
@@ -1836,7 +1497,7 @@ fn handleFsRemove(app: *App, req: *http.Request, res: *http.Response) !void {
 
 /// `PUT /api/fs/put` with the target in the `File-Path` header and the bytes
 /// as the raw body — this is the shape OpenList's frontend uses.
-fn handleFsPut(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleFsPut(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const raw_path = req.header("File-Path") orelse return res.jsonError(400, "File-Path header is required");
     const path = urlmod.decode(a, raw_path) catch return res.jsonError(400, "bad File-Path");
@@ -1890,7 +1551,7 @@ pub const ArchiveFileSource = struct {
 /// 512-byte headers by offset. Remote archives are rejected until the upstream
 /// client has a response-stream API (buffering a large archive is unsafe on the
 /// router's 128 MiB RAM budget).
-fn handleFsArchiveList(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleFsArchiveList(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     const v = try parseBodyJson(a, req, res) orelse return;
     const path = v.strAt("path") orelse return res.jsonError(400, "path is required");
@@ -1966,7 +1627,7 @@ fn handleFsArchiveList(app: *App, req: *http.Request, res: *http.Response) !void
 /// `otp_secret` 和一个 User 里根本不存在的 `token`。缺字段会让上游前端的 JS
 /// 读到 `undefined` 后抛错 —— 表现为**登录成功后一直转圈**，而服务端日志一切正常。
 /// 这种"契约字段缺失"光看 HTTP 状态码（全是 200）是发现不了的。
-fn handleMe(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleMe(app: *App, req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     var b = Buf.init(a);
     try b.append("{\"code\":200,\"message\":\"success\",\"data\":{");
@@ -2003,7 +1664,7 @@ fn handleMe(app: *App, req: *http.Request, res: *http.Response) !void {
 ///   * SSO 绑定校验（`req.SsoID`）本构建没有，跳过。
 ///   * 改密会推进 `admin_pwd_ts` ⇒ `checkAuth` 拒绝旧令牌（见其 A03 注释），
 ///     等价于 Go 的 `user.PwdTS` 比对。
-fn handleMeUpdate(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleMeUpdate(app: *App, req: *http.Request, res: *http.Response) !void {
     if (!std.mem.eql(u8, req.method, "POST")) return res.jsonError(405, "method not allowed");
     const a = req.arena;
     const v = try parseBodyJson(a, req, res) orelse return;
@@ -2087,7 +1748,7 @@ fn handleMeUpdate(app: *App, req: *http.Request, res: *http.Response) !void {
 ///     所有旧令牌立即被拒），比"只撤销当前这一个"更强；
 ///   * 撤销表需要一张有界容器 + 过期清理，为一个 48h 窗口引入这套不成比例。
 /// 前端登出后本就清掉本地 token，用户视角的登出是完整的。
-fn handleLogout(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleLogout(app: *App, req: *http.Request, res: *http.Response) !void {
     _ = app;
     if (!std.mem.eql(u8, req.method, "GET")) return res.jsonError(405, "method not allowed");
     // M14（审计）：Go 的 `LogOut` 会真的让令牌失效 ——
@@ -2194,7 +1855,7 @@ fn writeItemDefaultAsString(b: *Buf, v: ?*const json.Value) !void {
 /// **形状已修正**（2026-10-15）：此前返回的是裸 addition_schema 对象，前端
 /// AddOrEdit 取 `drivers()[name].common` 会得到 undefined，「添加存储」表单
 /// 根本渲染不出来。现在逐字段对齐 Go 的 `op.GetDriverInfoMap()`。
-fn handleDriverList(req: *http.Request, res: *http.Response) !void {
+pub fn handleDriverList(req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     var b = Buf.init(a);
     try b.append("{\"code\":200,\"message\":\"success\",\"data\":{");
@@ -2211,7 +1872,7 @@ fn handleDriverList(req: *http.Request, res: *http.Response) !void {
 
 /// `GET /api/admin/driver/info?driver=X` —— 单驱动的表单元数据（编辑存储用）。
 /// 未知驱动回 404，文案对齐 Go `handles.GetDriverInfo`（driver.go:19-28）。
-fn handleDriverInfo(req: *http.Request, res: *http.Response) !void {
+pub fn handleDriverInfo(req: *http.Request, res: *http.Response) !void {
     if (!std.mem.eql(u8, req.method, "GET")) return res.jsonError(405, "method not allowed");
     // ⚠ 必须用**解码后**的值：Go `c.Query("driver")`（driver.go:20）会做
     // 一次百分号解码，而 `115 Cloud`（带空格）经前端 axios 编码后是
@@ -2231,7 +1892,7 @@ fn handleDriverInfo(req: *http.Request, res: *http.Response) !void {
 }
 
 /// `GET /api/admin/driver/names` — keys for the storage driver's selector.
-fn handleDriverNames(req: *http.Request, res: *http.Response) !void {
+pub fn handleDriverNames(req: *http.Request, res: *http.Response) !void {
     const a = req.arena;
     var b = Buf.init(a);
     try b.appendByte('[');
@@ -2305,7 +1966,7 @@ fn handleSettingResetToken(app: *App, req: *http.Request, res: *http.Response) !
     try res.jsonOk(try std.fmt.allocPrint(a, "\"{s}\"", .{gen}));
 }
 
-fn handleSettingRoute(app: *App, req: *http.Request, res: *http.Response, action: []const u8) !void {
+pub fn handleSettingRoute(app: *App, req: *http.Request, res: *http.Response, action: []const u8) !void {
     if (std.mem.eql(u8, action, "list") and std.mem.eql(u8, req.method, "GET")) {
         return renderSettingItems(req, res, false, null);
     }
@@ -2542,7 +2203,7 @@ fn writeBackupSettingsJson(b: *Buf, cfg: *const config.Config) !void {
     }
 }
 
-fn handleConfigExport(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleConfigExport(app: *App, req: *http.Request, res: *http.Response) !void {
     _ = app;
     if (!std.mem.eql(u8, req.method, "GET")) return res.jsonError(405, "method not allowed");
     const a = req.arena;
@@ -2591,7 +2252,7 @@ fn importAddition(a: std.mem.Allocator, row: *const json.Value) !?[]const u8 {
     return storage_admin.additionStringFrom(a, node);
 }
 
-fn handleConfigImport(app: *App, req: *http.Request, res: *http.Response) !void {
+pub fn handleConfigImport(app: *App, req: *http.Request, res: *http.Response) !void {
     if (!std.mem.eql(u8, req.method, "POST")) return res.jsonError(405, "method not allowed");
     const a = req.arena;
     const root = try parseBodyJson(a, req, res) orelse return;
@@ -2886,7 +2547,7 @@ fn handleConfigImport(app: *App, req: *http.Request, res: *http.Response) !void 
 /// This binary has no background task manager (and deliberately does not add
 /// offline-download workers). Returning the real empty-list envelope lets the
 /// stock task-centre view render accurately; task actions are not advertised.
-fn handleTaskRoute(req: *http.Request, res: *http.Response, suffix: []const u8) !void {
+pub fn handleTaskRoute(req: *http.Request, res: *http.Response, suffix: []const u8) !void {
     var it = std.mem.splitScalar(u8, suffix, '/');
     const kind = it.next() orelse return res.jsonError(404, "task route not found");
     const action = it.next() orelse return res.jsonError(404, "task route not found");
@@ -4097,7 +3758,7 @@ test "raw_url from fs/get is directly playable: carries sign and a media content
     };
     const res = try a.create(http.Response);
     res.* = http.Response.init(a);
-    try handle(&app, &req, res);
+    try router_mod.handle(&app, &req, res);
     try testing.expectEqual(@as(u16, 200), res.status);
     const parsed = try json.parse(a, res.buf.slice());
     const data = parsed.getPath("data").?;
@@ -4123,7 +3784,7 @@ test "raw_url from fs/get is directly playable: carries sign and a media content
     };
     const play_res = try a.create(http.Response);
     play_res.* = http.Response.init(a);
-    try handle(&app, &play, play_res);
+    try router_mod.handle(&app, &play, play_res);
     try testing.expectEqual(@as(u16, 206), play_res.status);
     var ctype: ?[]const u8 = null;
     for (play_res.headers.slice()) |h| {
@@ -4231,7 +3892,7 @@ fn doRequest(app: *App, a: std.mem.Allocator, method: []const u8, path: []const 
     var req = http.Request{ .arena = a, .method = method, .path = path, .target = path };
     const res = try a.create(http.Response);
     res.* = http.Response.init(a);
-    try handle(app, &req, res);
+    try router_mod.handle(app, &req, res);
     return res;
 }
 
@@ -4241,7 +3902,7 @@ pub fn doRequestWith(app: *App, a: std.mem.Allocator, method: []const u8, path: 
     var req = http.Request{ .arena = a, .method = method, .path = path, .query = query, .target = path, .headers = headers };
     const res = try a.create(http.Response);
     res.* = http.Response.init(a);
-    try handle(app, &req, res);
+    try router_mod.handle(app, &req, res);
     return res;
 }
 
@@ -4251,7 +3912,7 @@ pub fn doRequestJson(app: *App, a: std.mem.Allocator, method: []const u8, path: 
     var req = http.Request{ .arena = a, .method = method, .path = path, .target = path, .headers = headers, .body = .{ .memory = body } };
     const res = try a.create(http.Response);
     res.* = http.Response.init(a);
-    try handle(app, &req, res);
+    try router_mod.handle(app, &req, res);
     return res;
 }
 
@@ -4260,7 +3921,7 @@ fn doRequestJsonQuery(app: *App, a: std.mem.Allocator, method: []const u8, path:
     var req = http.Request{ .arena = a, .method = method, .path = path, .query = query, .target = path, .headers = headers, .body = .{ .memory = body } };
     const res = try a.create(http.Response);
     res.* = http.Response.init(a);
-    try handle(app, &req, res);
+    try router_mod.handle(app, &req, res);
     return res;
 }
 
@@ -4392,7 +4053,7 @@ test "routing: a configured CDN redirects assets and keeps the query" {
     };
     const res = try a.create(http.Response);
     res.* = http.Response.init(a);
-    try handle(&app, &req, res);
+    try router_mod.handle(&app, &req, res);
 
     try testing.expectEqual(@as(u16, 302), res.status);
     var found: ?[]const u8 = null;
@@ -4479,7 +4140,7 @@ test "local download Range streams only the requested byte window" {
     var req = http.Request{ .arena = a, .method = "GET", .path = "/d/local/bytes.txt", .target = "/d/local/bytes.txt", .headers = range_headers };
     const res = try a.create(http.Response);
     res.* = http.Response.init(a);
-    try handle(&app, &req, res);
+    try router_mod.handle(&app, &req, res);
     try testing.expectEqual(@as(u16, 206), res.status);
     try testing.expectEqual(@as(u64, 4), res.stream.?.len.?);
 
@@ -4493,7 +4154,7 @@ test "local download Range streams only the requested byte window" {
     var bad_req = http.Request{ .arena = a, .method = "GET", .path = "/d/local/bytes.txt", .target = "/d/local/bytes.txt", .headers = range_headers };
     const bad_res = try a.create(http.Response);
     bad_res.* = http.Response.init(a);
-    try handle(&app, &bad_req, bad_res);
+    try router_mod.handle(&app, &bad_req, bad_res);
     try testing.expectEqual(@as(u16, 416), bad_res.status);
     var unsatisfied: ?[]const u8 = null;
     for (bad_res.headers.slice()) |h| if (std.ascii.eqlIgnoreCase(h.name, "Content-Range")) {
@@ -4509,7 +4170,7 @@ test "local download Range streams only the requested byte window" {
     var full_req = http.Request{ .arena = a, .method = "GET", .path = "/d/local/bytes.txt", .target = "/d/local/bytes.txt", .headers = auth_only };
     const full_res = try a.create(http.Response);
     full_res.* = http.Response.init(a);
-    try handle(&app, &full_req, full_res);
+    try router_mod.handle(&app, &full_req, full_res);
     try testing.expectEqual(@as(u16, 200), full_res.status);
     var got_cd: ?[]const u8 = null;
     var got_ct: ?[]const u8 = null;
@@ -4621,7 +4282,7 @@ test "routing: authed admin endpoints return data, unauthed is 401" {
         var req = http.Request{ .arena = a, .method = "GET", .path = "/api/me", .target = "/api/me", .headers = hdrs };
         const res = try a.create(http.Response);
         res.* = http.Response.init(a);
-        try handle(&app, &req, res);
+        try router_mod.handle(&app, &req, res);
         try testing.expectEqual(@as(u16, 200), res.status);
         try testing.expect(std.mem.indexOf(u8, res.buf.slice(), app.admin_user) != null);
     }
@@ -4631,7 +4292,7 @@ test "routing: authed admin endpoints return data, unauthed is 401" {
         var req = http.Request{ .arena = a, .method = "GET", .path = "/api/admin/storage", .target = "/api/admin/storage", .headers = hdrs };
         const res = try a.create(http.Response);
         res.* = http.Response.init(a);
-        try handle(&app, &req, res);
+        try router_mod.handle(&app, &req, res);
         try testing.expectEqual(@as(u16, 200), res.status);
         const body = res.buf.slice();
         try testing.expect(std.mem.indexOf(u8, body, "\"total\":0") != null);
@@ -4643,7 +4304,7 @@ test "routing: authed admin endpoints return data, unauthed is 401" {
         var req = http.Request{ .arena = a, .method = "GET", .path = "/api/admin/driver/list", .target = "/api/admin/driver/list", .headers = hdrs };
         const res = try a.create(http.Response);
         res.* = http.Response.init(a);
-        try handle(&app, &req, res);
+        try router_mod.handle(&app, &req, res);
         try testing.expectEqual(@as(u16, 200), res.status);
         const body = res.buf.slice();
         try testing.expect(std.mem.indexOf(u8, body, "Local") != null);
@@ -4662,7 +4323,7 @@ test "routing: authed admin endpoints return data, unauthed is 401" {
         var req = http.Request{ .arena = a, .method = "GET", .path = "/api/task/upload/undone", .target = "/api/task/upload/undone", .headers = hdrs };
         const res = try a.create(http.Response);
         res.* = http.Response.init(a);
-        try handle(&app, &req, res);
+        try router_mod.handle(&app, &req, res);
         try testing.expectEqual(@as(u16, 200), res.status);
         try testing.expect(std.mem.indexOf(u8, res.buf.slice(), "\"data\":[]") != null);
     }
@@ -4672,7 +4333,7 @@ test "routing: authed admin endpoints return data, unauthed is 401" {
         var req = http.Request{ .arena = a, .method = "GET", .path = "/api/me", .target = "/api/me" };
         const res = try a.create(http.Response);
         res.* = http.Response.init(a);
-        try handle(&app, &req, res);
+        try router_mod.handle(&app, &req, res);
         try expectApiCode(res, 401);
     }
 }
@@ -4689,7 +4350,7 @@ test "public settings body is strict JSON (regression: stray closing brace)" {
     var req = http.Request{ .arena = a, .method = "GET", .path = "/api/public/settings", .target = "/api/public/settings" };
     const res = try a.create(http.Response);
     res.* = http.Response.init(a);
-    try handle(&app, &req, res);
+    try router_mod.handle(&app, &req, res);
     try testing.expectEqual(@as(u16, 200), res.status);
 
     // 回归：收尾的 `append("}}}")` 是笔误。`append` 写**原始字节**，不做 `print`
@@ -5085,7 +4746,7 @@ test "init_status drives the first-run wizard and init/setup creates the admin" 
         };
         const res = try a.create(http.Response);
         res.* = http.Response.init(a);
-        try handle(&app, &req, res);
+        try router_mod.handle(&app, &req, res);
         try testing.expectEqual(@as(u16, 200), res.status);
         try testing.expect(app.admin_hash.len > 0);
         try testing.expectEqualStrings("admin", app.admin_user);
@@ -5102,7 +4763,7 @@ test "init_status drives the first-run wizard and init/setup creates the admin" 
         };
         const res = try a.create(http.Response);
         res.* = http.Response.init(a);
-        try handle(&app, &req, res);
+        try router_mod.handle(&app, &req, res);
         try expectApiCode(res, 400);
     }
 
@@ -5253,7 +4914,7 @@ test "login/hash accepts the static hash the frontend actually sends" {
             var req = http.Request{ .arena = a_, .method = "POST", .path = path, .target = path, .body = .{ .memory = body } };
             const res = try a_.create(http.Response);
             res.* = http.Response.init(a_);
-            try handle(app_, &req, res);
+            try router_mod.handle(app_, &req, res);
             return res;
         }
     }.call;
@@ -5320,7 +4981,7 @@ test "fs/get / returns the virtual root like Go" {
     };
     const res = try a.create(http.Response);
     res.* = http.Response.init(a);
-    try handle(&app, &req, res);
+    try router_mod.handle(&app, &req, res);
     try testing.expectEqual(@as(u16, 200), res.status);
     const parsed = try json.parse(a, res.buf.slice());
     try testing.expectEqualStrings("root", parsed.getPath("data.name").?.asStr().?);
@@ -5970,7 +5631,7 @@ test "sign: signPath 读 link_expiration（Strm withSign 与上游同形）" {
 fn doRequestRaw(app: *App, a: std.mem.Allocator, req: *http.Request) !*http.Response {
     const res = try a.create(http.Response);
     res.* = http.Response.init(a);
-    try handle(app, req, res);
+    try router_mod.handle(app, req, res);
     return res;
 }
 
@@ -6817,7 +6478,7 @@ test "M12: fs/dirs returns a bare array of subdirectories (Go DirResp shape)" {
     var req = http.Request{ .arena = a, .method = "POST", .path = "/api/fs/dirs", .target = "/api/fs/dirs", .headers = hdrs, .body = .{ .memory = "{\"path\":\"/m\"}" } };
     const res = try a.create(http.Response);
     res.* = http.Response.init(a);
-    try handle(&app, &req, res);
+    try router_mod.handle(&app, &req, res);
     try testing.expectEqual(@as(u16, 200), res.status);
     const parsed = try json.parse(a, res.buf.slice());
     const data = parsed.getPath("data") orelse return error.TestFailed;
@@ -6833,7 +6494,7 @@ test "M12: fs/dirs returns a bare array of subdirectories (Go DirResp shape)" {
     var req2 = http.Request{ .arena = a, .method = "POST", .path = "/api/fs/dirs", .target = "/api/fs/dirs", .headers = hdrs, .body = .{ .memory = "{\"path\":\"/\"}" } };
     const res2 = try a.create(http.Response);
     res2.* = http.Response.init(a);
-    try handle(&app, &req2, res2);
+    try router_mod.handle(&app, &req2, res2);
     const parsed2 = try json.parse(a, res2.buf.slice());
     const arr2 = parsed2.getPath("data").?.asArray() orelse return error.TestFailed;
     try testing.expectEqual(@as(usize, 1), arr2.len);
@@ -6873,7 +6534,7 @@ test "M9: fs/list items carry hashinfo string and hash_info object" {
     var req = http.Request{ .arena = a, .method = "POST", .path = "/api/fs/list", .target = "/api/fs/list", .headers = hdrs, .body = .{ .memory = "{\"path\":\"/m\"}" } };
     const res = try a.create(http.Response);
     res.* = http.Response.init(a);
-    try handle(&app, &req, res);
+    try router_mod.handle(&app, &req, res);
     const parsed = try json.parse(a, res.buf.slice());
     const items = parsed.getPath("data.content").?.asArray() orelse return error.TestFailed;
 
@@ -6924,7 +6585,7 @@ test "M15: CORS defaults emit a literal '*', as gin-contrib/cors does" {
     try testing.expectEqualStrings("*", resHeader(res, "Access-Control-Allow-Headers").?);
 
     // 显式配了列表 ⇒ 原样 join，方法转大写（gin-contrib 的 convert/ToUpper）。
-    const m = try joinListUpper(a, &[_][]const u8{ "get", "post" });
+    const m = try router_mod.joinListUpper(a, &[_][]const u8{ "get", "post" });
     try testing.expectEqualStrings("GET,POST", m);
 }
 

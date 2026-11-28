@@ -24,6 +24,7 @@ const http = @import("http.zig");
 const api = @import("api.zig");
 const auth_mod = @import("auth.zig");
 const mounts_mod = @import("mounts.zig");
+const router_mod = @import("router.zig");
 const client = @import("client.zig");
 const cookiejar = @import("cookiejar.zig");
 const List = @import("util/buf.zig").List;
@@ -319,7 +320,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn handleRequest(ctx: *anyopaque, req: *http.Request, res: *http.Response) anyerror!void {
     const app: *api.App = @ptrCast(@alignCast(ctx));
-    return api.handle(app, req, res);
+    return router_mod.handle(app, req, res);
 }
 
 // ---------------------------------------------------------------------------
