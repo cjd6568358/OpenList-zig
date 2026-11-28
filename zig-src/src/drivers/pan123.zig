@@ -663,7 +663,7 @@ fn makeDir(ptr: *anyopaque, ctx: *driver.Ctx, dir: []const u8) anyerror!void {
     const a = ctx.alloc;
     // dir = "/a/b/newdir" → parent = "/a/b"，name = "newdir"。
     const parent_path = pathParent(dir) orelse return Error.InvalidPath;
-    const name = pathBase(dir) orelse return Error.InvalidPath;
+    const name = driver.pathBase(dir) orelse return Error.InvalidPath;
     const parent = try resolveEntry(self, a, parent_path, &ctx.err_detail);
     const body = try std.fmt.allocPrint(a, "{{\"driveId\":0,\"etag\":\"\",\"fileName\":{s},\"parentFileId\":{d},\"size\":0,\"type\":1}}", .{ try jsonQuote(a, name), parent.id });
     _ = try self.post(a, ep_upload_request, body, &ctx.err_detail);
@@ -740,15 +740,6 @@ fn decodeBase64(a: std.mem.Allocator, s: []const u8) ![]const u8 {
     try dec.decode(out, s);
     return out;
 }
-
-fn pathBase(path: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trimEnd(u8, path, "/\\");
-    if (trimmed.len == 0) return null;
-    const slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse
-        std.mem.lastIndexOfScalar(u8, trimmed, '\\') orelse return trimmed;
-    return trimmed[slash + 1 ..];
-}
-
 fn pathParent(path: []const u8) ?[]const u8 {
     const trimmed = std.mem.trimEnd(u8, path, "/\\");
     const slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse
@@ -773,7 +764,7 @@ fn put(ptr: *anyopaque, ctx: *driver.Ctx, dst: []const u8, src: model.Source) an
     const a = ctx.alloc;
     const size = src.size();
     if (size < 0) return Error.InvalidPath;
-    const name = pathBase(dst) orelse return Error.InvalidPath;
+    const name = driver.pathBase(dst) orelse return Error.InvalidPath;
     const parent = try resolveEntry(self, a, pathParent(dst) orelse return Error.InvalidPath, &ctx.err_detail);
 
     // 1) 整文件 MD5（小写 hex）= upload_request 的 etag。
@@ -1456,10 +1447,10 @@ test "T2: list page JSON parses PascalCase file entries" {
 }
 
 test "T2: pathBase/pathParent split the way the vtable promises" {
-    try testing.expectEqualStrings("newdir", pathBase("/a/b/newdir").?);
-    try testing.expectEqualStrings("newdir", pathBase("newdir").?);
-    try testing.expectEqualStrings("newdir", pathBase("/a/b/newdir/").?);
-    try testing.expect(pathBase("/") == null);
+    try testing.expectEqualStrings("newdir", driver.pathBase("/a/b/newdir").?);
+    try testing.expectEqualStrings("newdir", driver.pathBase("newdir").?);
+    try testing.expectEqualStrings("newdir", driver.pathBase("/a/b/newdir/").?);
+    try testing.expect(driver.pathBase("/") == null);
     try testing.expectEqualStrings("/a/b", pathParent("/a/b/newdir").?);
     try testing.expectEqualStrings("/", pathParent("/a").?);
     try testing.expect(pathParent("newdir") == null);

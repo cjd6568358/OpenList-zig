@@ -951,7 +951,7 @@ fn save(self: *AliyundriveOpen) void {
 
         const name = lastSegment(dir);
         if (name.len == 0) return Error.InvalidPath;
-        const parent = try self.resolveEntry(a, parentOf(dir), &ctx.err_detail);
+        const parent = try self.resolveEntry(a, driver.parentOf(dir), &ctx.err_detail);
 
         var b = Buf.init(a);
         var w = ObjWriter{ .b = &b };
@@ -1209,7 +1209,7 @@ fn save(self: *AliyundriveOpen) void {
 
         const name = lastSegment(dst);
         if (name.len == 0) return Error.InvalidPath;
-        const dst_dir = try self.resolveEntry(a, parentOf(dst), &ctx.err_detail);
+        const dst_dir = try self.resolveEntry(a, driver.parentOf(dst), &ctx.err_detail);
         if (!dst_dir.is_dir) return Error.InvalidPath;
 
         const size = src.size();
@@ -1338,15 +1338,6 @@ fn lastSegment(path: []const u8) []const u8 {
     while (it.next()) |seg| last = seg;
     return last;
 }
-
-fn parentOf(path: []const u8) []const u8 {
-    const trimmed = std.mem.trimEnd(u8, path, "/\\");
-    if (trimmed.len == 0) return "/";
-    const idx = std.mem.lastIndexOfAny(u8, trimmed, "/\\") orelse return "/";
-    if (idx == 0) return "/";
-    return trimmed[0..idx];
-}
-
 /// 复现 `utils.Ext(name) == "livp"`（小写、不带点）。
 fn isLivp(name: []const u8) bool {
     const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
@@ -1837,10 +1828,10 @@ test "isLivp / lastSegment / parentOf" {
     try testing.expectEqualStrings("", lastSegment("/"));
     try testing.expectEqualStrings("", lastSegment(""));
 
-    try testing.expectEqualStrings("/a/b", parentOf("/a/b/c"));
-    try testing.expectEqualStrings("/", parentOf("/a"));
-    try testing.expectEqualStrings("/", parentOf("/"));
-    try testing.expectEqualStrings("/", parentOf(""));
+    try testing.expectEqualStrings("/a/b", driver.parentOf("/a/b/c"));
+    try testing.expectEqualStrings("/", driver.parentOf("/a"));
+    try testing.expectEqualStrings("/", driver.parentOf("/"));
+    try testing.expectEqualStrings("/", driver.parentOf(""));
 }
 
 test "replaceInternal rewrites only the known CDN prefix" {

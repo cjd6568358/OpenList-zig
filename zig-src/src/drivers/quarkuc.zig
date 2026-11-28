@@ -563,7 +563,7 @@ fn linkResult(
 fn makeDir(ptr: *anyopaque, ctx: *driver.Ctx, dir: []const u8) anyerror!void {
     const self = as(ptr);
     const a = ctx.alloc;
-    const name = pathBase(dir) orelse return Error.InvalidPath;
+    const name = driver.pathBase(dir) orelse return Error.InvalidPath;
     const pp = pathParent(dir) orelse return Error.InvalidPath;
     const parent = try resolveEntry(self, a, pp, &ctx.err_detail);
     const body = try std.fmt.allocPrint(a, "{{\"dir_init_lock\":false,\"dir_path\":\"\",\"file_name\":{s},\"pdir_fid\":{s}}}", .{ try jsonQuote(a, name), try jsonQuote(a, parent.id) });
@@ -633,15 +633,6 @@ fn jsonQuote(a: std.mem.Allocator, s: []const u8) ![]const u8 {
     try json.writeString(&b, s);
     return b.toOwned();
 }
-
-fn pathBase(path: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trimEnd(u8, path, "/\\");
-    if (trimmed.len == 0) return null;
-    const slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse
-        std.mem.lastIndexOfScalar(u8, trimmed, '\\') orelse return trimmed;
-    return trimmed[slash + 1 ..];
-}
-
 fn pathParent(path: []const u8) ?[]const u8 {
     const trimmed = std.mem.trimEnd(u8, path, "/\\");
     const slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse
@@ -675,7 +666,7 @@ fn put(ptr: *anyopaque, ctx: *driver.Ctx, dst: []const u8, src: model.Source) an
     const a = ctx.alloc;
     const size = src.size();
     if (size < 0) return Error.InvalidPath;
-    const name = pathBase(dst) orelse return Error.InvalidPath;
+    const name = driver.pathBase(dst) orelse return Error.InvalidPath;
     const pp = pathParent(dst) orelse return Error.InvalidPath;
     const parent = try resolveEntry(self, a, pp, &ctx.err_detail);
 

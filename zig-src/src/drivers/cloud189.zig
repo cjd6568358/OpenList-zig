@@ -350,15 +350,6 @@ fn lastSegment(path: []const u8) []const u8 {
     while (it.next()) |seg| last = seg;
     return last;
 }
-
-fn parentOf(path: []const u8) []const u8 {
-    const trimmed = std.mem.trimEnd(u8, path, "/\\");
-    if (trimmed.len == 0) return "/";
-    const idx = std.mem.lastIndexOfAny(u8, trimmed, "/\\") orelse return "/";
-    if (idx == 0) return "/";
-    return trimmed[0..idx];
-}
-
 // ---------------------------------------------------------------------------
 // 驱动
 // ---------------------------------------------------------------------------
@@ -899,7 +890,7 @@ pub const Cloud189 = struct {
 
         const name = lastSegment(dir);
         if (name.len == 0) return Error.InvalidPath;
-        const parent = try self.resolve(a, parentOf(dir), &ctx.err_detail);
+        const parent = try self.resolve(a, driver.parentOf(dir), &ctx.err_detail);
 
         var q = urlmod.Query.init(a);
         try q.add("parentFolderId", parent.id);
@@ -1229,7 +1220,7 @@ pub const Cloud189 = struct {
 
         const name = lastSegment(dst);
         if (name.len == 0) return Error.InvalidPath;
-        const dir = try self.resolve(a, parentOf(dst), &ctx.err_detail);
+        const dir = try self.resolve(a, driver.parentOf(dst), &ctx.err_detail);
         if (!dir.is_dir) return Error.InvalidPath;
 
         try self.newUpload(a, dir, name, src, ctx);
@@ -1523,9 +1514,9 @@ test "lastSegment and parentOf split paths the way the vtable promises" {
     try testing.expectEqualStrings("c.txt", lastSegment("/a/b/c.txt"));
     try testing.expectEqualStrings("c.txt", lastSegment("/a/b/c.txt/"));
     try testing.expectEqualStrings("", lastSegment("/"));
-    try testing.expectEqualStrings("/a/b", parentOf("/a/b/c.txt"));
-    try testing.expectEqualStrings("/", parentOf("/c.txt"));
-    try testing.expectEqualStrings("/", parentOf("/"));
+    try testing.expectEqualStrings("/a/b", driver.parentOf("/a/b/c.txt"));
+    try testing.expectEqualStrings("/", driver.parentOf("/c.txt"));
+    try testing.expectEqualStrings("/", driver.parentOf("/"));
 }
 
 test "H1: dupeStr copies into the caller's allocator, not the scratch arena" {

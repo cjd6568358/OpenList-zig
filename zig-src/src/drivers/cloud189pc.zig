@@ -469,15 +469,6 @@ fn lastSegment(path: []const u8) []const u8 {
     while (it.next()) |seg| last = seg;
     return last;
 }
-
-fn parentOf(path: []const u8) []const u8 {
-    const trimmed = std.mem.trimEnd(u8, path, "/\\");
-    if (trimmed.len == 0) return "/";
-    const idx = std.mem.lastIndexOfAny(u8, trimmed, "/\\") orelse return "/";
-    if (idx == 0) return "/";
-    return trimmed[0..idx];
-}
-
 fn queryPart(u: []const u8) []const u8 {
     const q = std.mem.indexOfScalar(u8, u, '?') orelse return "";
     const rest = u[q + 1 ..];
@@ -1801,7 +1792,7 @@ fn save(self: *Cloud189PC) void {
 
         const name = lastSegment(dir);
         if (name.len == 0) return Error.InvalidPath;
-        const parent = try self.resolve(a, parentOf(dir), &ctx.err_detail);
+        const parent = try self.resolve(a, driver.parentOf(dir), &ctx.err_detail);
 
         const url = if (self.isFamily())
             API_URL ++ "/family/file/createFolder.action"
@@ -2324,7 +2315,7 @@ fn save(self: *Cloud189PC) void {
 
         const name = lastSegment(dst);
         if (name.len == 0) return Error.InvalidPath;
-        const dir = try self.resolve(a, parentOf(dst), &ctx.err_detail);
+        const dir = try self.resolve(a, driver.parentOf(dst), &ctx.err_detail);
         if (!dir.is_dir) return Error.InvalidPath;
 
         // `rapid` 先算 MD5 好秒传；`stream` 遇到 0 字节文件也只能走 fast ——

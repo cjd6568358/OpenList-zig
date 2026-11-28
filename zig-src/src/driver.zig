@@ -251,6 +251,31 @@ pub fn dupeOr(alloc: std.mem.Allocator, v: ?[]const u8, fallback: []const u8) ![
     return alloc.dupe(u8, v orelse fallback);
 }
 
+/// AUDIT-2026-11-27 #16：pathBase —— 取路径最后一段（trimEnd 尾部斜杠后
+/// 按最近的 `/` 或 `\` 切）。空/全分隔符路径返回 null（调用方用于「整条
+/// 都是目录」判定）；无分隔符返回整串。pan115/pan123/quarkuc 三家私有
+/// 副本逐行相同收敛；thunder 变体（trim 双侧、末位分隔符判 null）语义
+/// 不同保持独立。
+pub fn pathBase(path: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trimEnd(u8, path, "/\\");
+    if (trimmed.len == 0) return null;
+    const slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse
+        std.mem.lastIndexOfScalar(u8, trimmed, '\\') orelse return trimmed;
+    return trimmed[slash + 1 ..];
+}
+
+/// AUDIT-2026-11-27 #16：parentOf —— 取父目录（trimEnd 尾部斜杠后按最近
+/// 的 `/` 或 `\` 切前段）。空路径/根/无分隔符都返回 "/"。123open/
+/// aliyundrive/cloud189/cloud189pc/quark 五家私有副本逐行相同收敛。
+pub fn parentOf(path: []const u8) []const u8 {
+    const trimmed = std.mem.trimEnd(u8, path, "/\\");
+    if (trimmed.len == 0) return "/";
+    const idx = std.mem.lastIndexOfAny(u8, trimmed, "/\\") orelse return "/";
+    if (idx == 0) return "/";
+    return trimmed[0..idx];
+}
+
+
 
 /// AUDIT-2026-11-27 #10：persist-if-changed —— 会话类驱动（token/cookie 滚动
 /// 刷新回写配置）的落盘去重公共层。

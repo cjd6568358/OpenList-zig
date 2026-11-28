@@ -784,7 +784,7 @@ fn save(self: *Open123) void {
         const self = as(ptr);
         const a = ctx.alloc;
 
-        const parent_path = parentOf(dir);
+        const parent_path = driver.parentOf(dir);
         const name = lastSegment(dir);
         if (name.len == 0) return Error.InvalidPath;
 
@@ -909,7 +909,7 @@ fn save(self: *Open123) void {
 
         const name = lastSegment(dst);
         if (name.len == 0) return Error.InvalidPath;
-        const dst_dir = try self.resolveEntry(a, parentOf(dst));
+        const dst_dir = try self.resolveEntry(a, driver.parentOf(dst));
 
         const size = src.size();
         if (size < 0) return Error.InvalidPath;
@@ -1110,14 +1110,6 @@ fn lastSegment(path: []const u8) []const u8 {
 }
 
 /// 去掉最后一段，保留前导 `/`。`/a/b/c` → `/a/b`，`/a` → `/`，`/` → `/`。
-fn parentOf(path: []const u8) []const u8 {
-    const trimmed = std.mem.trimEnd(u8, path, "/\\");
-    if (trimmed.len == 0) return "/";
-    const idx = std.mem.lastIndexOfAny(u8, trimmed, "/\\") orelse return "/";
-    if (idx == 0) return "/";
-    return trimmed[0..idx];
-}
-
 fn objFromJson(item: *const json.Value) model.Obj {
     const name = item.strAt("filename") orelse "";
     const type_ = item.intAt("type") orelse 0;
@@ -1420,13 +1412,13 @@ test "path helpers" {
     try testing.expectEqualStrings("", lastSegment("/"));
     try testing.expectEqualStrings("", lastSegment(""));
 
-    try testing.expectEqualStrings("/a/b", parentOf("/a/b/c"));
-    try testing.expectEqualStrings("/", parentOf("/a"));
-    try testing.expectEqualStrings("/", parentOf("/"));
-    try testing.expectEqualStrings("/", parentOf(""));
-    try testing.expectEqualStrings("/a", parentOf("/a/b/"));
+    try testing.expectEqualStrings("/a/b", driver.parentOf("/a/b/c"));
+    try testing.expectEqualStrings("/", driver.parentOf("/a"));
+    try testing.expectEqualStrings("/", driver.parentOf("/"));
+    try testing.expectEqualStrings("/", driver.parentOf(""));
+    try testing.expectEqualStrings("/a", driver.parentOf("/a/b/"));
     // 顶层文件名的父目录是根
-    try testing.expectEqualStrings("/", parentOf("/top.txt"));
+    try testing.expectEqualStrings("/", driver.parentOf("/top.txt"));
 }
 
 test "signUrl matches the upstream algorithm" {

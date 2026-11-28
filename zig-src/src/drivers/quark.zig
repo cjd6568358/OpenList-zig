@@ -697,7 +697,7 @@ fn save(self: *QuarkOpen) void {
 
         const name = lastSegment(dir);
         if (name.len == 0) return Error.InvalidPath;
-        const parent = try self.resolveEntry(a, parentOf(dir), &ctx.err_detail);
+        const parent = try self.resolveEntry(a, driver.parentOf(dir), &ctx.err_detail);
 
         var b = Buf.init(a);
         var w = ObjWriter{ .b = &b };
@@ -772,7 +772,7 @@ fn save(self: *QuarkOpen) void {
 
         const name = lastSegment(dst);
         if (name.len == 0) return Error.InvalidPath;
-        const dst_dir = try self.resolveEntry(a, parentOf(dst), &ctx.err_detail);
+        const dst_dir = try self.resolveEntry(a, driver.parentOf(dst), &ctx.err_detail);
         const size = src.size();
         if (size < 0) return Error.InvalidPath;
 
@@ -960,15 +960,6 @@ fn lastSegment(path: []const u8) []const u8 {
     while (it.next()) |seg| last = seg;
     return last;
 }
-
-fn parentOf(path: []const u8) []const u8 {
-    const trimmed = std.mem.trimEnd(u8, path, "/\\");
-    if (trimmed.len == 0) return "/";
-    const idx = std.mem.lastIndexOfAny(u8, trimmed, "/\\") orelse return "/";
-    if (idx == 0) return "/";
-    return trimmed[0..idx];
-}
-
 /// 时间戳是**毫秒**（`time.UnixMilli`），不是秒。
 fn objFromJson(item: *const json.Value) model.Obj {
     const ms_to_s = struct {
@@ -1351,9 +1342,9 @@ test "path helpers" {
     try testing.expectEqualStrings("c", lastSegment("/a/b/c"));
     try testing.expectEqualStrings("c", lastSegment("/a/b/c/"));
     try testing.expectEqualStrings("", lastSegment("/"));
-    try testing.expectEqualStrings("/a/b", parentOf("/a/b/c"));
-    try testing.expectEqualStrings("/", parentOf("/a"));
-    try testing.expectEqualStrings("/", parentOf(""));
+    try testing.expectEqualStrings("/a/b", driver.parentOf("/a/b/c"));
+    try testing.expectEqualStrings("/", driver.parentOf("/a"));
+    try testing.expectEqualStrings("/", driver.parentOf(""));
 }
 
 test "mimeFor covers the common video/archive types" {

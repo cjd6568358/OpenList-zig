@@ -631,7 +631,7 @@ fn link(ptr: *anyopaque, ctx: *driver.Ctx, path: []const u8, args: driver.LinkAr
 fn makeDir(ptr: *anyopaque, ctx: *driver.Ctx, dir: []const u8) anyerror!void {
     const self = as(ptr);
     const a = ctx.alloc;
-    const name = pathBase(dir) orelse return Error.InvalidPath;
+    const name = driver.pathBase(dir) orelse return Error.InvalidPath;
     const parent_id = try resolveId(self, a, pathParent(dir) orelse return Error.InvalidPath);
     const body = try self.postForm(a, api_dir_add, &.{
         .{ "pid", parent_id },
@@ -706,15 +706,6 @@ fn space(ptr: *anyopaque, ctx: *driver.Ctx) anyerror!driver.DiskUsage {
         .used = numAt(&v, "data.space_info.all_use.size") orelse 0,
     };
 }
-
-fn pathBase(path: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trimEnd(u8, path, "/\\");
-    if (trimmed.len == 0) return null;
-    const slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse
-        std.mem.lastIndexOfScalar(u8, trimmed, '\\') orelse return trimmed;
-    return trimmed[slash + 1 ..];
-}
-
 fn pathParent(path: []const u8) ?[]const u8 {
     const trimmed = std.mem.trimEnd(u8, path, "/\\");
     const slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse
@@ -1347,7 +1338,7 @@ fn put(ptr: *anyopaque, ctx: *driver.Ctx, dst: []const u8, src: model.Source) an
     const a = ctx.alloc;
     const size = src.size();
     if (size < 0) return Error.InvalidPath;
-    const name = pathBase(dst) orelse return Error.InvalidPath;
+    const name = driver.pathBase(dst) orelse return Error.InvalidPath;
     const dir_id = try resolveId(self, a, pathParent(dst) orelse return Error.InvalidPath);
 
     const meta = try ensureUploadAvailable(self, a);
@@ -1669,11 +1660,11 @@ test "T2: digest computes the 128KB pre-hash and the whole-file hash" {
 }
 
 test "T2: pathBase/pathParent split the way the vtable promises" {
-    try testing.expectEqualStrings("c.txt", pathBase("/a/b/c.txt").?);
+    try testing.expectEqualStrings("c.txt", driver.pathBase("/a/b/c.txt").?);
     try testing.expectEqualStrings("/a/b", pathParent("/a/b/c.txt").?);
     try testing.expectEqualStrings("/", pathParent("/x").?);
     try testing.expect(pathParent("/") == null);
-    try testing.expect(pathBase("/") == null);
+    try testing.expect(driver.pathBase("/") == null);
 }
 
 test "T2: xmlValue pulls UploadId out of an OSS MPU response" {
