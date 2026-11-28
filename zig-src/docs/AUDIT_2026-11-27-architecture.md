@@ -262,7 +262,8 @@ response; a streaming response reader remains a known follow-up"（** README
 > **P2 已开工（2026-11-28）：#15 六步拆分全部完成（§60.46）——multipart/
 > auth/storage_admin/mounts/router/download 六模块均纯搬运、产物与生产逐字
 > 节不变（六连），api↔webdav 解环闭环，api.zig 9,898→5,870 行（-40.7%）；
-> M5b 路由四表收敛单独排期；#16 推进中；#17 单独排期未动。**
+> M5b 路由四表收敛单独排期；#16 机械收敛项已落地（persist/dupeOr/pathBase/
+> parentOf，§60.46），SigV4 等语义级合并与 #17 另行排期。**
 > 测试侧两处踩坑（config 单例 prev 必须在 load 前取、mp_sessions 桶数组
 > 测试需显式 deinit）也已记入 §60.43。
 
@@ -283,7 +284,7 @@ response; a streaming response reader remains a known follow-up"（** README
 | 13 | thunder 分片重试 | P1 | 0.5 天 | ✅ 已落地（§60.44 #13） | 单传 PUT / CreateMultipartUpload / 分片 PUT / Complete 四操作全部 3 次退避（1s·2ⁿ，对齐 Go 侧 aws sdk 默认 retryer）；网络错误与非 2xx 皆重试，确定性失败不重试 |
 | 14 | 打包机产物对账（88 B 漂移） | P1 | 0.5 天 | ✅ 已落地（2026-11-28，§60.44 对账小节） | build_remote.py 复跑：Linux 原生 574/574（0 跳过）；权威产物 1,455,088 B / `62878FDD`，本机 §5 配方复现逐字节相同；环境漂移排除，+88 B = 真实代码增量 + std 口径差，结论已回写 STATUS 基线行 |
 | 15 | api.zig 拆分 | P2 | 3-5 天 | ✅ 已落地（六步全部完成，§60.46） | multipart.zig ✅ auth.zig ✅ storage_admin.zig ✅ mounts.zig ✅ router.zig ✅ download.zig ✅（均纯搬运、产物逐字节不变六连）；api↔webdav 解环闭环；api.zig 9,898→5,870；尾项 M5b 路由四表收敛单独排期 |
-| 16 | drivers/common 机械重复收敛 | P2 | 2-3 天 | 未动 | ~600 行（dupeOr/ObjWriter/SigV4/并发框架/persist 模式） |
+| 16 | drivers/common 机械重复收敛 | P2 | 2-3 天 | 🔧 进行中（机械项全部落地，§60.46） | persist×8 ✅（含 itvsh 增益去重）+ dupeOr×10 ✅ + pathBase×3/parentOf×5 ✅（均逐行对拍后统一至 driver.zig，净 -91 行）；SigV4×2/OSS V1×2/ObjWriter/并发框架×3 为语义级合并单独排期 |
 | 17 | client 流式出口 | P2 | 3-5 天 | 未动 | 价值最高、工作量最大，单独排期；#4 的 256MiB 闸已把该路径从 OOM 收口为明确 507 |
 
 **P0 合计 ≈ 4-5 人日（实际一轮完成）；P1 ≈ 6-7 人日（实际一轮完成；#12 记档未修码；#14 11-28 闭环）；P2 按季度节奏。**

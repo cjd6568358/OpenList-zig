@@ -6252,4 +6252,32 @@ P1 六卡提交后推送 `f223f0d6`，连续完成打包机复跑与对账：
 * `driver.zig` 模块头：`handleMultipart` 的指向自 api.zig 改为
   multipart.zig（#15-M1 搬迁随记）。
 
+### #16（drivers/common 机械重复收敛，三批落地，2026-11-28）
+
+按「先逐行对拍、语义等价才收敛」的纪律分批执行（提交 edd1365f /
+e02f312e / 1dcf6cf3，CI #68 绿）：
+
+* **persist×7（M1，提交 edd1365f）**：aliyundrive/123open/wopan/115open/
+  cloud189pc/quark 六家标准形（去重比对 + free 旧值 + dupe 自持 +
+  persist 五步手工序列 → `persistIfChanged` 一行调用）+ **itvsh 迁移即
+  增强**（原实现无去重，公共层带来按内容去重——flash 磨损/IO 放大收敛；
+  deinit 补释放 last_saved 对齐公共层所有权）；#10 埋的「8 家私有副本」
+  全部收敛完毕；
+* **dupeOr×10（M2a，提交 e02f312e）**：十家两形态（`v orelse fallback`
+  与提前 return）逐行对拍确认语义等价后统一到 `driver.dupeOr`，93 处
+  调用改指；
+* **pathBase×3 + parentOf×5（M2b，提交 1dcf6cf3）**：pathBase 三家
+  （pan115/pan123/quarkuc）与 parentOf 五家（123open/aliyundrive/
+  cloud189/cloud189pc/quark）各逐行相同，38 处调用改指；**thunder 的
+  pathBase 变体（trim 双侧、末位分隔符判 null）与 strm 的 baseName
+  语义不同，明确保持独立不合并**（防误并记录在案）；
+* 每批验证：574 总逐字不变；三卡合计净 -91 行（11+10+9 文件）。
+
+**#16 未收敛项（明确挂起，语义级合并另行排期）**：SigV4（pan123/
+thunder 两家签名密钥链同构但 session_token 分支语义有差——thunder
+token 为空时省略 x-amz-security-token 头，pan123 恒带）、OSS V1 签名
+（pan115/115open 各自实现）、ObjWriter 与 pan123/itvsh/cloud189pc 三家
+分片并发框架——均非逐行相同，需跨驱动对拍差异后设计公共层（会改行为
+面），与 #15 纯搬运不同质，不与机械收敛混卡。
+
 > AI生成
