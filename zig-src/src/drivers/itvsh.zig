@@ -324,6 +324,9 @@ pub const Itvsh = struct {
         self.client.deinit();
         self.jar.deinit();
         self.alloc.destroy(self.jar);
+        // AUDIT #16：persistIfChanged 持有的去重基准拷贝（迁移前旧实现
+        // 每次直接换指针不持有、deinit 无从释放；公共层持有后必须释放）。
+        if (self.last_saved.len > 0) self.alloc.free(@constCast(self.last_saved));
     }
 
     // -----------------------------------------------------------------------
@@ -423,11 +426,13 @@ pub const Itvsh = struct {
     }
 
     /// 把当前 addition 落库。forwardUrl 与 cookies 都靠它存活到下次启动。
+    /// 2026-11-28（AUDIT #16）：迁移到 driver.persistIfChanged 公共层 ——
+    /// 顺带获得此前没有的按内容去重（itvsh 是 8 家里唯一没去重的，
+    /// 每次刷 forwardUrl/cookies 都全量落盘；公共层行为见 driver.zig）。
     fn persist(self: *Itvsh) void {
         const text = self.cfg.toJson(self.alloc) catch return;
-        if (self.last_saved.len > 0) self.alloc.free(@constCast(self.last_saved));
-        self.last_saved = text;
-        driver.persist(self.storage_id, text);
+        defer self.alloc.free(text);
+        driver.persistIfChanged(&self.last_saved, self.alloc, self.storage_id, text);
     }
 
     /// Init 时把上次存的 cookie 回填进 jar。内容损坏时静默清空，退化为重新登录。

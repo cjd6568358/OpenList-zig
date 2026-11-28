@@ -277,13 +277,11 @@ pub const Wopan = struct {
         return last;
     }
 
-    fn save(self: *Wopan) void {
+fn save(self: *Wopan) void {
         if (self.storage_id == 0) return;
         const text = self.cfg.toJson(self.alloc) catch return;
-        if (text.len == self.last_saved.len and std.mem.eql(u8, text, self.last_saved)) return;
-        if (self.last_saved.len > 0) self.alloc.free(self.last_saved);
-        self.last_saved = self.alloc.dupe(u8, text) catch return;
-        driver.persist(self.storage_id, self.last_saved);
+        driver.persistIfChanged(&self.last_saved, self.alloc, self.storage_id, text);
+        self.alloc.free(text);
     }
 
     fn initPhone(self: *Wopan, a: std.mem.Allocator) !void {

@@ -652,16 +652,11 @@ pub const Open115 = struct {
         self.save();
     }
 
-    fn save(self: *Open115) void {
+fn save(self: *Open115) void {
         if (self.storage_id == 0) return;
         const text = self.cfg.toJson(self.alloc) catch return;
-        if (text.len == self.last_saved.len and std.mem.eql(u8, text, self.last_saved)) {
-            self.alloc.free(text);
-            return;
-        }
-        if (self.last_saved.len > 0) self.alloc.free(self.last_saved);
-        self.last_saved = text;
-        driver.persist(self.storage_id, self.last_saved);
+        driver.persistIfChanged(&self.last_saved, self.alloc, self.storage_id, text);
+        self.alloc.free(text);
     }
 
     // -----------------------------------------------------------------------
