@@ -6169,7 +6169,7 @@ P1 六卡提交后推送 `f223f0d6`，连续完成打包机复跑与对账：
 
 ---
 
-## 60.46 P2 批次开工（AUDIT 路线图 #15-#17）：M1 multipart.zig 落地
+## 60.46 P2 批次（AUDIT 路线图 #15-#17）：M1 multipart.zig + M2 auth.zig 落地
 
 机主拍板「先部署再动 P2」后执行；本批范围 **#15 全程 + #16**，#17（client
 流式出口）按审计单独排期不启动。
@@ -6192,19 +6192,43 @@ P1 六卡提交后推送 `f223f0d6`，连续完成打包机复跑与对账：
   搬运后机器码一位未变，pub 化不进 codegen；**生产无需再部署**（当前树
   即产物）。
 
+### M2（#15 第二步）：auth/sign 域提取为 auth.zig（提交 3ef6cd36）
+
+* 新建 `src/auth.zig`（**596 行**）：跨协议共享登录限速（LoginThrottle
+  64 桶 LRU + authThrottle* 四入口 + 6 条行为测试随域搬入）、作废令牌表
+  （InvalidatedTokens/g_invalidated_tokens/jwtSignatureOf）、凭据哈希
+  （static_hash_salt/staticHash/hashPwd/twoHashPwd/randomSalt/sha256Hex）、
+  JWT 测试铸币（mintTestToken/mintTestTokenUnique）、下载签名
+  （SignError/signValue/signKey/signPath/signForObj/verifySign/hmacSha256/
+  b64Url/generateDownProxyURL）——八块纯搬运逐行未动；
+* api.zig **8,427 → 7,872 行**；登录 handler（loginCommon/checkAuth/
+  issueToken）与下载鉴权（M6 拆出）留守，经 `auth_mod.*` 调用；
+* 引用面切换：webdav（限速×5/twoHashPwd×2/generateDownProxyURL×1，
+  api↔webdav 反向引用从 17 符号减 8）、sftp_wire（SSH 认证共用限速×6 +
+  twoHashPwd）、main（CLI 凭据哈希×5）、multipart（mintTestToken 别名改指
+  auth）；**完整解环待 M6**；
+* 别名用 `auth_mod`（对齐 client_mod/frontend_mod 惯例）：自然名 `auth`
+  与 14 处测试局部 `const auth = "Bearer …"` 撞名（Zig 禁止 shadow，
+  webdav/multipart/sftp_wire 亦有同名局部）；
+* 可见性纯调整：9 个搬入声明 + LoginThrottle 三方法 + InvalidatedTokens
+  两方法 + `login_throttle` 全局（loginCommon 直用）补 pub；
+* **零行为验证（最强形态）**：574 总逐字不变；产物 **1,455,088 B /
+  `62878FDD` 与生产二进制逐字节相同**；
+* 踩坑记档：批量前缀正则误伤两类文本 —— import 路径字符串（"auth.zig"→
+  "auth_mod.zig"，5 文件复原）与 16 处 Go 源码路径注释（auth.go 被写成
+  auth_mod.go，已复原）；机械替换须限定符号边界并复核 diff。
+
 ### 后续里程碑（已定坐标待执行）
 
-* **M2 sign/auth.zig + 解 api↔webdav 环**：webdav 反向引用面实测比审计
-  摘要宽——`authThrottle*`/`twoHashPwd`/`generateDownProxyURL` 属 M2；
-  `mimeFor`/`contentDisposition`/`etagFor`/`ParsedRange`/`preconditionGate`/
-  `streamRange`/`isWebdavPolicy` 属 M6 download.zig——**完整解环在 M6 闭环**，
-  M2 先收 auth+sign 面（api.zig 现址：signKey 740 / LoginThrottle 1436 /
-  InvalidatedTokens 2548 / staticHash·twoHashPwd 4802 / mintTestToken 5633）；
+* ~~M2 sign/auth.zig~~ **已完成**（提交 3ef6cd36，见上节；signKey/LoginThrottle/
+  InvalidatedTokens/twoHashPwd/mintTestToken 已随域入 auth.zig）；`mimeFor`/
+  `contentDisposition`/`etagFor`/`ParsedRange`/`preconditionGate`/
+  `streamRange`/`isWebdavPolicy` 仍属 M6 download.zig——**完整解环在 M6 闭环**；
 * M3 storage_admin → M4 mounts → M5 router（顺带收敛路由四表手工同步，
   历史 /me/update 404 前科）→ M6 download（707 行 RFC 7232）；
 * #16 drivers/common 收敛：persist×7 机械迁移（thunder 样板已在
   §60.44 #10）+ dupeOr×10 / ObjWriter×7 / SigV4×2 / 并发框架×3 对拍。
 * 本批 DoD 不变：每步测试集零变化 + 574/574 + 交叉编译 + 一步一卡；
-  纯搬运步骤追加「产物逐字节不变」验证（M1 已达成）。
+  纯搬运步骤追加「产物逐字节不变」验证（M1、M2 均已达成）。
 
 > AI生成
