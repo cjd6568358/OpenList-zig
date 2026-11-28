@@ -19,6 +19,7 @@ const multipart = @import("multipart.zig");
 const storage_admin = @import("storage_admin.zig");
 
 const api = @import("api.zig");
+const download_mod = @import("download.zig");
 const App = api.App;
 const handlePublicSettings = api.handlePublicSettings;
 const handleInitStatus = api.handleInitStatus;
@@ -48,8 +49,8 @@ const handleSettingRoute = api.handleSettingRoute;
 const handleConfigExport = api.handleConfigExport;
 const handleConfigImport = api.handleConfigImport;
 const handleTaskRoute = api.handleTaskRoute;
-const handleDownload = api.handleDownload;
-const mimeFor = api.mimeFor;
+const handleDownload = download_mod.handleDownload;
+const mimeFor = download_mod.mimeFor;
 
 pub fn handle(app: *App, req: *http.Request, res: *http.Response) !void {
     // CORS preflight, so the frontend can be served from another origin.

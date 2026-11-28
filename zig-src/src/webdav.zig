@@ -41,6 +41,7 @@ const rt = @import("rt.zig");
 const Buf = @import("util/buf.zig").Buf;
 const List = @import("util/buf.zig").List;
 const api = @import("api.zig");
+const download_mod = @import("download.zig");
 const auth_mod = @import("auth.zig");
 const App = api.App;
 
@@ -66,7 +67,7 @@ pub fn handle(app: *App, req: *http.Request, res: *http.Response) !void {
         // 锁定期内**每个请求**都会走到这里：keep-alive 单连接一秒能刷出成百
         // 上千条日志，而 `log.warn` 每条都要过全局日志锁 + 落 stderr —— 生产
         // 在光猫上由 supervisor 收进闪存，高频扫描日增 GB 级日志能直接写穿
-        // 小容量 flash。锁定**进入**的那一下在 `api.recordFailure` 里告警一次
+        // 小容量 flash。锁定**进入**的那一下在 `auth_mod` 的 recordFailure 里告警一次
         // （带来源），这里只留 debug。
         log.debug("webdav: auth refused — account locked (from {s})", .{
             if (peer.len == 0) "unknown" else peer,
@@ -279,7 +280,7 @@ fn writeObjEntry(a: std.mem.Allocator, out: *Buf, vpath: []const u8, o: model.Ob
     } else {
         try out.append("        <D:resourcetype/>\n");
         try out.print("        <D:getcontentlength>{d}</D:getcontentlength>\n", .{o.size});
-        try out.print("        <D:getcontenttype>{s}</D:getcontenttype>\n", .{api.mimeFor(o.name)});
+        try out.print("        <D:getcontenttype>{s}</D:getcontenttype>\n", .{download_mod.mimeFor(o.name)});
     }
     const mod = cookiejar.httpDate(a, o.modified) catch "Thu, 01 Jan 1970 00:00:00 GMT";
     try out.print("        <D:getlastmodified>{s}</D:getlastmodified>\n", .{mod});
@@ -328,7 +329,7 @@ fn getOrHead(app: *App, req: *http.Request, res: *http.Response, is_head: bool) 
     //   UA、客户端默认 UA 补上 ⇒ 签名对不上 ⇒ **115 的 WebDAV 下载恒 403**。
     const policy = r.mount.storage.webdav_policy;
     var target: ?[]const u8 = null;
-    if (api.isWebdavPolicy(policy, "302_redirect")) {
+    if (download_mod.isWebdavPolicy(policy, "302_redirect")) {
         // 302 直链：不回源、不通流量，交给客户端自己去取。
         // ⚠ `link` 必须按 `redirect=true` 取：部分驱动（189/夸克）在
         // redirect 模式下才会给出可外链的那一份 URL。
@@ -339,7 +340,7 @@ fn getOrHead(app: *App, req: *http.Request, res: *http.Response, is_head: bool) 
             return webdavStatus(res, 500);
         };
         target = lk.url;
-    } else if (api.isWebdavPolicy(policy, "use_proxy_url")) {
+    } else if (download_mod.isWebdavPolicy(policy, "use_proxy_url")) {
         // 302 到存储配置的 `down_proxy_url`。
         // Go `server/webdav/webdav.go:266-272`：
         //   if storage.GetStorage().WebdavProxyURL() {
@@ -385,13 +386,13 @@ fn getOrHead(app: *App, req: *http.Request, res: *http.Response, is_head: bool) 
     // Etag / Last-Modified / 条件请求 / Range（206+416）。
     // 远程直链 ⇒ 透明代理分支（上游头原样透传，不设 Etag）。
     if (lk.local_path != null or lk.text != null) {
-        const ct: []const u8 = if (lk.text != null) "text/plain; charset=utf-8" else api.mimeFor(f.name);
-        const gate = try api.preconditionGate(req, res, a, f, total, ct);
+        const ct: []const u8 = if (lk.text != null) "text/plain; charset=utf-8" else download_mod.mimeFor(f.name);
+        const gate = try download_mod.preconditionGate(req, res, a, f, total, ct);
         if (gate.done) return;
         try res.set("Accept-Ranges", "bytes");
 
-        const r0: api.ParsedRange = if (req.header("Range")) |rh| api.parseRange(rh, total) else .ignore;
-        switch (if (gate.ignore_range) api.ParsedRange.ignore else r0) {
+        const r0: download_mod.ParsedRange = if (req.header("Range")) |rh| download_mod.parseRange(rh, total) else .ignore;
+        switch (if (gate.ignore_range) download_mod.ParsedRange.ignore else r0) {
             .unsatisfiable => {
                 res.setStatus(416);
                 try res.set("Content-Range", try std.fmt.allocPrint(a, "bytes */{d}", .{total}));
@@ -410,7 +411,7 @@ fn getOrHead(app: *App, req: *http.Request, res: *http.Response, is_head: bool) 
                         log.warn("webdav: open {s}: not found", .{lp});
                         return webdavStatus(res, 500);
                     };
-                    api.streamRange(res, a, file, rg.start, rg.end) catch return webdavStatus(res, 500);
+                    download_mod.streamRange(res, a, file, rg.start, rg.end) catch return webdavStatus(res, 500);
                 } else if (lk.text) |txt| {
                     try res.write(txt[rg.start .. rg.end + 1]);
                 }
@@ -493,7 +494,7 @@ fn getOrHead(app: *App, req: *http.Request, res: *http.Response, is_head: bool) 
     // ⚠ 与本地分支相反，这里**不**自己补 `Accept-Ranges`：透明代理的语义是
     //   "上游说什么就是什么"，上游带了就透传过来（koofr 等 WebDAV 上游会
     //   带），上游没带就不带 —— 与 Go 的 `maps.Copy` 一致。
-    try res.set("Content-Disposition", try api.contentDisposition(a, f.name));
+    try res.set("Content-Disposition", try download_mod.contentDisposition(a, f.name));
     try res.write(up.body);
 }
 
@@ -540,7 +541,7 @@ fn put(app: *App, req: *http.Request, res: *http.Response) !void {
     // （drivers/webdav/driver.go:117-119；此前本工程一个 CT 都不发，
     // AUDIT_2026-10-18-drivers.md §4-P1-2）。
     var src = req.body.source();
-    src.mime = req.header("Content-Type") orelse api.mimeFor(std.fs.path.basename(r.rel));
+    src.mime = req.header("Content-Type") orelse download_mod.mimeFor(std.fs.path.basename(r.rel));
     r.mount.driver.put(&ctx, r.rel, src) catch {
         return webdavStatus(res, 405);
     };
@@ -549,7 +550,7 @@ fn put(app: *App, req: *http.Request, res: *http.Response) !void {
     // 头名用 Go 的大小写 `Etag`（`w.Header().Set("Etag", etag)`）—— 有些
     // 客户端（含 litmus）对大小写敏感。
     if (r.mount.driver.details(&ctx, r.rel)) |nf| {
-        try res.set("Etag", try api.etagFor(a, nf, @intCast(@max(nf.size, 0))));
+        try res.set("Etag", try download_mod.etagFor(a, nf, @intCast(@max(nf.size, 0))));
     } else |_| {
         const size = req.body.len();
         const mtime = headerUnix(req, "X-OC-Mtime") orelse rt.nowSeconds();

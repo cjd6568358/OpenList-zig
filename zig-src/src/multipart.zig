@@ -24,6 +24,7 @@ const Buf = @import("util/buf.zig").Buf;
 const List = @import("util/buf.zig").List;
 const rt = @import("rt.zig");
 const api = @import("api.zig");
+const download_mod = @import("download.zig");
 const router_mod = @import("router.zig");
 const auth_mod = @import("auth.zig");
 
@@ -34,7 +35,7 @@ const Mount = api.Mount;
 const Header = api.Header;
 const ArchiveFileSource = api.ArchiveFileSource;
 const noRoute = router_mod.noRoute;
-const mimeFor = api.mimeFor;
+const mimeFor = download_mod.mimeFor;
 const mapDriverError = api.mapDriverError;
 const notifyObjsUpdateAfterWrite = api.notifyObjsUpdateAfterWrite;
 const doRequestWith = api.doRequestWith;

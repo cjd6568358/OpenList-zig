@@ -16,6 +16,7 @@ const rt = @import("rt.zig");
 const Buf = @import("util/buf.zig").Buf;
 
 const api = @import("api.zig");
+const download_mod = @import("download.zig");
 const mounts_mod = @import("mounts.zig");
 const App = api.App;
 const fixAndCleanPath = mounts_mod.fixAndCleanPath;
@@ -25,8 +26,8 @@ const buildMountFromStorage = mounts_mod.buildMountFromStorage;
 const buildMountsFromConfig = mounts_mod.buildMountsFromConfig;
 const republishWithEdit = mounts_mod.republishWithEdit;
 const hasLiveMount = mounts_mod.hasLiveMount;
-const handleDownload = api.handleDownload;
-const normalizeWebdavPolicy = api.normalizeWebdavPolicy;
+const handleDownload = download_mod.handleDownload;
+const normalizeWebdavPolicy = download_mod.normalizeWebdavPolicy;
 const parseBodyJson = api.parseBodyJson;
 
 // ---------------------------------------------------------------------------
